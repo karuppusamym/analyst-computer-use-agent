@@ -93,6 +93,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "status":
         for name, (ok, why) in Router(s).status().items():
             print(f"{name:<15} {'available' if ok else 'unavailable'}  {'' if ok else why}")
+        from .tools.docker_backend import status_line
+
+        print(status_line(s["tiers"]["code"]))
         print(f"\nmodel backend: {s['gateway']['backend']}  gateway: {s['gateway']['base_url']}  token set: {bool(s.gateway_token())}")
         return 0
     if args.cmd == "gateway-check":

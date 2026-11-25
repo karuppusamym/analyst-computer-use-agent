@@ -235,6 +235,36 @@ Run `python samples/make_samples.py` to regenerate the sample ERP/CRM exports an
 
 The guard is defense in depth. Audit hooks can be bypassed by native extension code or crafted bytecode, and the Job Object limits resources, not file or network access. **Production still needs the disposable per-task VM or container.**
 
+#### Docker backend (`tiers.code.backend: "docker"`)
+
+The default backend is `"local"` (the two layers above). With `"docker"`, each `run_python` step runs in its own disposable container, started through the docker CLI (`tools/docker_backend.py`, subprocess only, no SDK):
+
+```
+docker run --rm --name aa-code-<random> --network none --read-only --cap-drop ALL
+  --security-opt no-new-privileges --pids-limit 64 --memory 1024m --memory-swap 1024m --cpus 1
+  --user 65534:65534 --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m --ulimit core=0 --pull never
+  --workdir /work --env HOME=/tmp ... (a fixed allowlist, nothing from the agent's environment)
+  --mount type=bind,source=<input 0>,target=/inputs/0,readonly   (one per input folder)
+  --mount type=bind,source=<stage>/work,target=/work
+  --mount type=bind,source=<stage>/output,target=/output
+  python:3.13-slim python -I -B -X utf8 /work/_bootstrap.py
+```
+
+- **Paths.** `INPUT_DIRS` becomes `["/inputs/0", ...]` and `OUTPUT_DIR` becomes `/output` inside the container. The audit-hook guard still runs inside it (`python_guard`) as a second layer. On Windows, mount sources are written as `C:/dir/sub`. UNC/network paths, relative paths, and paths containing `,` `"` `'` `=` or control characters are refused, and the step fails before anything runs. `docker.path_style` (`auto`/`windows`/`posix`) overrides the detection.
+- **Outputs.** The real `OUTPUT_DIR` is never mounted. A fresh per-step stage folder under the workdir is seeded with copies of the current files in `OUTPUT_DIR`, so a step can read earlier outputs. After the container exits, new or changed files are copied back. Only regular files are copied. Symlinks and junctions/reparse points, special files, names that are unsafe on Windows (`CON`, `a:b`, trailing dots), and anything that would land on a link or outside `OUTPUT_DIR` are refused. Caps apply: `max_output_file_mb` (100), `max_output_total_mb` (500) and `max_output_files` (2000). Refused files are listed in the step result and the audit log. Files deleted inside the container are not deleted from `OUTPUT_DIR`.
+- **Time-out.** At `timeout_s` the agent runs `docker kill <name>`. If the CLI still hasn't exited, it is killed and `docker rm -f` runs. Exit 137 without a time-out is reported as the memory limit.
+- **Image.** The default is `docker.image: "python:3.13-slim"`. **Pin it by digest in production** (`"python:3.13-slim@sha256:<digest>"`, from `docker buildx imagetools inspect python:3.13-slim`) and bake in pandas/openpyxl if steps need them, since the container has no network to `pip install`. `docker.pull: "if-missing"` pulls a missing image before the step, outside the time-out. `"never"` fails closed when the image is missing. The run itself always uses `--pull never`.
+- **Fail closed.** If the CLI is missing, the daemon is unreachable, or the image is missing and can't be pulled, the step fails with an error that says why, and nothing runs. It falls back to the local backend only when `tiers.code.fallback_to_local: true`, and records `code_backend_fallback` in the audit log when it does.
+- **Settings:** `tiers.code.docker_cli` (a path or an argv prefix, default `docker`), `memory_mb` (shared with local), and under `tiers.code.docker`: `image`, `pull`, `cpus`, `pids_limit`, `tmpfs_mb`, the output caps, `control_timeout_s`, `pull_timeout_s`.
+- `python -m analyst_agent status` prints a `code backend:` line: CLI found, daemon reachable, image present.
+
+**Limitations:**
+- Network is always `none`. `allow_network` is ignored, and an egress allowlist is out of scope.
+- `--user 65534` needs the input folders to be readable by that user on Linux hosts. Docker Desktop's bind mounts don't enforce this.
+- Bind mounts name host paths, so `DOCKER_HOST` must point at a daemon on this machine (Docker Desktop or a local engine), not a remote one.
+- On Docker Desktop the container runs in its Linux VM. That isolates it from the Windows host, but it is not a per-task VM. The kernel is shared with other containers in that VM.
+- The live container tests (`tests/test_docker_backend.py`, `Live*`) skip unless `docker info` succeeds, and they have not been run here yet.
+
 ## Testing on this PC without a VM
 
 Windows 11 Home has no Windows Sandbox, so the tests use local targets that are safe to drive:
@@ -254,7 +284,7 @@ To include the live desktop tests, set the variable first. They move the mouse f
 $env:RUN_DESKTOP_TESTS = "1"
 ```
 
-Current result: **196 tests**. Without `RUN_DESKTOP_TESTS`, 193 pass and 3 skip (the live desktop tests; the clipboard test also skips when the clipboard is empty). Offline, the eval run passes all 44 graded tasks and skips 6 (4 `needs_model`, 2 `needs_tier`). On OpenRouter all 48 graded tasks pass.
+Current result: **232 tests**. Without `RUN_DESKTOP_TESTS` and without a running docker daemon, 223 pass and 9 skip: the 3 live desktop tests (the clipboard test also skips when the clipboard is empty) and the 6 live docker container tests. Offline, the eval run passes all 44 graded tasks and skips 6 (4 `needs_model`, 2 `needs_tier`). On OpenRouter all 48 graded tasks pass.
 
 The live desktop end-to-end test runs playbook → approval → router → executor → real pixel tier → test app → verifier.
 
@@ -266,7 +296,7 @@ analyst_agent/
   agents.py     planner, executor (computer batch rules, act-then-look, context resets), verifier
   orchestrator.py  clarify → plan → approve → steps → verify → checkpoint → recover → report
   router.py     tier selection and fallbacks
-  tools/        connectors, code (+ sandbox Job Object, _sandbox_guard audit hook), browser, desktop_uia, computer (+ screen_win ctypes)
+  tools/        connectors, code (+ sandbox Job Object, _sandbox_guard audit hook, docker_backend container per step), browser, desktop_uia, computer (+ screen_win ctypes)
   vault.py      credential vault (DPAPI / env / keyring), {{secret:name}} resolution
   playbook.py checks.py policy.py audit.py checkpoint.py report.py evals.py gateway_check.py
   teach.py      teach mode: drafts from sessions, browser recorder, promote
@@ -292,7 +322,7 @@ tests/          unit, integration and live desktop tests
   - Visibility is per user, not per team. Sharing a session, or limiting reviewers to particular playbooks or approvers, is not built yet.
 - **Later-phase features:** a Guacamole/noVNC interactive desktop is still a Phase 3 item. The credential vault is local only (DPAPI, env or keyring). There is no central secret store, rotation or per-user sharing yet.
 - **Teach recorder:** records the first tab only and has been tested by driving the page in code, not with a person clicking in a headed window.
-- **The code tier is contained, not sandboxed.** The Job Object and the audit-hook guard limit it, but they are not an isolation boundary. Production needs the disposable per-task VM or container from the design, with network egress blocked there, since Windows Home can't block network per process without the firewall.
+- **The code tier container backend is built but not yet run live.** `tiers.code.backend: "docker"` runs each step in a disposable, network-less, read-only, unprivileged container (see Docker backend). Its unit tests use a fake docker CLI. The live container tests skip until a docker daemon is reachable, and they have not run on this PC. The default `local` backend is still contained, not sandboxed: the Job Object and the audit-hook guard are not an isolation boundary. There is no network egress allowlist (the container network is always `none`), and a per-task VM, as opposed to a container, is not built.
 - **Pixel-tier evals.** The 2 approved legacy-ledger entry tasks need the pixel tier, which moves the real mouse, so they have not run with a real model here. Run them on the isolated agent VM with `tiers.desktop_pixels.enabled`.
 
 ## License
