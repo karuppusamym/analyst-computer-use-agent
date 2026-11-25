@@ -8,6 +8,7 @@ from pathlib import Path
 
 from ..config import Settings
 from .auth import ROLES, AuthError, UserStore
+from .teams import Teams
 
 
 def add_parsers(sub) -> None:
@@ -25,6 +26,7 @@ def add_parsers(sub) -> None:
     r = us.add_parser("remove", help="remove a user")
     r.add_argument("name")
     us.add_parser("list", help="list users")
+    us.add_parser("teams", help="show portal.teams (members, reviewers and their limits, SSO groups) and check names against the user store")
 
 
 def users_file(s: Settings) -> Path:
@@ -32,8 +34,33 @@ def users_file(s: Settings) -> Path:
     return s.workspace_root / auth.get("users_file", "portal_users.json")
 
 
+def run_teams_check(s: Settings, store: UserStore) -> int:
+    cfg = s.data.get("portal", {})
+    mode = cfg.get("auth", {}).get("mode", "local")
+    teams = Teams(cfg.get("teams"), groups_of=(lambda _u: []) if mode in ("oidc", "trusted_header") else None)
+    if not teams.configured:
+        print("no portal.teams configured: every reviewer may decide every approval")
+        return 0
+    for line in teams.describe():
+        print(line)
+    warnings = list(teams.warnings)
+    if mode == "local":
+        warnings += teams.unknown_users(store.users().keys())
+        if any(t.sso_groups or t.sso_reviewer_groups for t in teams.teams.values()):
+            warnings.append("sso_groups / sso_reviewer_groups are ignored with portal.auth.mode local")
+    else:
+        print(f"auth mode {mode}: user names come from SSO, so they are not checked against {store.path}")
+    for w in warnings:
+        print(f"warning: {w}")
+    if not warnings:
+        print("ok: no problems found")
+    return 0  # warnings never fail: the portal starts with them too
+
+
 def run_user_cmd(args: argparse.Namespace, s: Settings) -> int:
     store = UserStore(users_file(s))
+    if args.user_cmd == "teams":
+        return run_teams_check(s, store)
     if args.user_cmd == "list":
         users = store.users()
         if not users:
