@@ -430,7 +430,12 @@ class CliTests(unittest.TestCase):
         self.assertIn("monthly", out)
         self.assertIn("next=", out)
         code, out = self.run_cli("schedule", "run-due", "--now", "2026-11-24T10:00:00Z")
-        self.assertEqual((code, out.strip()), (0, "nothing due"))
+        lines = out.strip().splitlines()
+        self.assertEqual((code, lines[-1]), (0, "nothing due"))
+        if not HAVE_TZDATA:  # the only other output is the missing-zone warning
+            self.assertTrue(all("install tzdata" in x for x in lines[:-1]), out)
+        else:
+            self.assertEqual(len(lines), 1, out)
         code, out = self.run_cli("schedule", "remove", "monthly")
         self.assertEqual(code, 0)
         self.assertEqual(json.loads((self.ws.root / "config" / "schedules.json").read_text())["schedules"], [])

@@ -244,22 +244,38 @@ def event_detail(e: dict) -> str:
     return text if len(text) <= 400 else text[:400] + " ..."
 
 
-def approval_card(item, ident: Identity, csrf: str, show_session: bool = True, may: bool | None = None) -> str:
+def approval_card(item, ident: Identity, csrf: str, show_session: bool = True, may=None) -> str:
+    """`may` is a bool (approve and reject alike) or ReviewRights (decide / approve / reason)."""
     r = item.req
     left = max(0, int(item.deadline - time.time()))
     may = ident.can("reviewer") if may is None else may
+    if isinstance(may, bool):
+        can_reject = can_approve = may
+        reason = "" if may else ("your team does not review this playbook" if ident.can("reviewer") else "")
+    else:
+        can_reject, can_approve, reason = may.decide, may.approve, may.reason
+        if not ident.can("reviewer"):
+            reason = ""
+    if not can_reject:
+        why = '<span class="muted">Only reviewers and admins can decide' + (f" ({h(reason)})" if reason else "") + ".</span>"
+    elif not can_approve:
+        why = f'<span class="muted">You can reject but not approve this: {h(reason)}.</span>'
+    else:
+        why = ""
     back = "" if show_session else "<input type=hidden name=back value=session>"
     form = (
         f'<form method="post" action="/approvals/{u(item.id)}">{csrf_input(csrf)}{back}<label for="n-{h(item.id)}">Note (optional)</label>'
-        f'<input type=text id="n-{h(item.id)}" name=note><p class="row"><button type=submit name=decision value=approve {"" if may else "disabled"}>Approve</button>'
-        f'<button type=submit name=decision value=reject class="danger" {"" if may else "disabled"}>Reject</button>'
-        + ("" if may else '<span class="muted">Only reviewers and admins can decide' + (" (your team does not review this playbook)" if ident.can("reviewer") else "") + ".</span>")
+        f'<input type=text id="n-{h(item.id)}" name=note><p class="row"><button type=submit name=decision value=approve {"" if can_approve else "disabled"}>Approve</button>'
+        f'<button type=submit name=decision value=reject class="danger" {"" if can_reject else "disabled"}>Reject</button>'
+        + why
         + "</p></form>"
     )
     sess = f'<div>Session <a href="/sessions/{u(item.session_id)}">{h(item.session_id)}</a> &middot; started by {h(item.requested_by)}</div>' if show_session else ""
     return (
         f'<div class="card"><div class="row"><strong>{h(r.summary)}</strong>{badge("waiting")}</div>{sess}'
-        f'<div class="muted">Step {h(r.step_id)} &middot; action <strong>{h(r.action_class)}</strong> &middot; requested {h(ts(item.created_at))} &middot; '
+        f'<div class="muted">Step {h(r.step_id)} &middot; action <strong>{h(r.action_class)}</strong>'
+        + (f' &middot; amount <strong>{h(r.amount)}</strong>' if getattr(r, "amount", None) not in (None, "") else "")
+        + f' &middot; requested {h(ts(item.created_at))} &middot; '
         f'declined automatically in {left // 60} min {left % 60} s</div>'
         + (f"<pre>{h(r.preview)}</pre>" if r.preview else "")
         + form + "</div>"

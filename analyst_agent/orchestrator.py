@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
@@ -20,12 +20,26 @@ from .checkpoint import CheckpointStore
 from .config import Settings
 from .model import ModelClient, ModelError
 from .playbook import Playbook, Step
-from .policy import ApprovalRequest, Approver, ConsoleApprover, PolicyEngine
+from .policy import ApprovalDecision, ApprovalRequest, Approver, ConsoleApprover, PolicyEngine
 from .report import write_report
 from .router import RouteError, Router
 from .takeover import HUMAN_KINDS, PAUSE_FILE, human_note, pause_info
 from .tools.base import ToolContext, ToolOutput
 from .tools.code import run_python
+
+
+class _StepAmountApprover:
+    """Gives in-step tool approvals (browser submit, desktop press, upload) the amount the
+    playbook step declared, so a reviewer's amount limit also applies to them."""
+
+    def __init__(self, inner: Approver, amounts: dict[str, str]):
+        self.inner = inner
+        self.amounts = amounts
+
+    def request(self, req: ApprovalRequest) -> "ApprovalDecision":
+        if req.amount is None and self.amounts.get(req.step_id):
+            req = replace(req, amount=self.amounts[req.step_id])
+        return self.inner.request(req)
 
 
 @dataclass
@@ -86,7 +100,7 @@ class Orchestrator:
         return "\n\n".join(p.read_text(encoding="utf-8")[:6000] for p in sorted(self.knowledge_dir.glob("*.md")))
 
     def _approve(self, audit: AuditLog, approvals: list, req: ApprovalRequest) -> bool:
-        audit.event("approval_requested", step=req.step_id, action_class=req.action_class, summary=req.summary)
+        audit.event("approval_requested", step=req.step_id, action_class=req.action_class, summary=req.summary, **({"amount": req.amount} if req.amount is not None else {}))
         decision = self.approver.request(req)
         audit.event("approval_decided", step=req.step_id, approved=decision.approved, by=decision.by, note=decision.note)
         approvals.append({"step": req.step_id, "action": req.action_class, "approved": decision.approved, "by": decision.by})
@@ -188,10 +202,11 @@ class Orchestrator:
         params.update(plan.params)
 
         policy = PolicyEngine(s, playbook.permissions if playbook else None)
-        ctx = ToolContext(s, policy, audit, self.approver, workdir=audit.dir / "scratch", params=params)
+        amounts = {st.id: st.approval_amount for st in plan.steps if st.approval_amount}
+        ctx = ToolContext(s, policy, audit, _StepAmountApprover(self.approver, amounts) if amounts else self.approver, workdir=audit.dir / "scratch", params=params)
 
         if self.require_plan_approval:
-            preview = "\n".join(f"{i + 1}. [{st.tier}] {st.intent}" + ("  (needs approval)" if st.approval == "required" or policy.needs_approval(st.action_class) else "") for i, st in enumerate(plan.steps))
+            preview = "\n".join(f"{i + 1}. [{st.tier}] {st.intent}" + (("  (needs approval" + (f", amount {st.approval_amount}" if st.approval_amount else "") + ")") if st.approval == "required" or policy.needs_approval(st.action_class) else "") for i, st in enumerate(plan.steps))
             if not self._approve(audit, approvals, ApprovalRequest("plan", "plan", f"Plan for: {request}", preview)):
                 return TaskResult("rejected", audit.session_id, [], message="plan was not approved", usage=self._usage(), approvals=approvals)
 
@@ -336,7 +351,7 @@ class Orchestrator:
         audit.event("step_started", step=step.id, intent=step.intent, tier=step.tier)
         if step.approval == "required" or policy.needs_approval(step.action_class):
             preview = json.dumps(step.script or {"instructions": step.instructions}, indent=1)[:3000]
-            if not self._approve(audit, approvals, ApprovalRequest(step.id, step.action_class or "approval", f"Step: {step.intent}", preview)):
+            if not self._approve(audit, approvals, ApprovalRequest(step.id, step.action_class or "approval", f"Step: {step.intent}", preview, amount=step.approval_amount)):
                 rec.status = "rejected"
                 last = approvals[-1]
                 rec.summary = f"not approved (decided by {last['by']}); nothing was done"

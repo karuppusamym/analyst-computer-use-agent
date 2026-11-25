@@ -47,6 +47,7 @@ class ApprovalRequest:
     summary: str
     preview: str = ""
     approver: str = ""
+    amount: str | None = None  # optional amount the request is about (playbook step "approval_amount"); reviewer limits compare it
 
 
 @dataclass

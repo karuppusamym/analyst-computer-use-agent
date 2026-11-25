@@ -6,8 +6,15 @@ Pages: /  /reports (CSV downloads)  /form (Submit button -> /submit)  /evil (pro
        /kpi (weekly KPI packs, weeks 45-48; the page also carries a planted
        prompt-injection notice)  /download/kpi_wkNN.csv
        /tabs (teach-recorder target: a target=_blank link to /export, which has a
-       download; a window.open button to /help; a link to /upload, a file upload
-       form whose uploads land in UPLOADS as name + size + sha256)
+       download; a window.open button to /help; an "Open both windows" button
+       that opens /export and /help in the order WINDOW_ORDER gives (tests flip
+       it to check URL-based tab matching); a link to /upload, a file upload
+       form whose uploads land in UPLOADS as name + size + sha256; a link to
+       /upload-many, a multi-file input; a link to /frames)
+       /frames (an iframe "entry" with an amount/region form, saved to
+       FRAME_SAVES, which holds a nested iframe "notes" with a note form, saved
+       to FRAME_NOTES; /frames?via=localhost loads the iframe from localhost,
+       a host the tests leave off the allowlist)
 
 KPI packs are deterministic. Week 48 is missing one row (West, Thursday) on
 purpose so the weekly-kpi-summary eval can assert the gap is reported.
@@ -24,6 +31,9 @@ from urllib.parse import parse_qs
 
 SUBMISSIONS: list[dict] = []
 UPLOADS: list[dict] = []
+FRAME_SAVES: list[dict] = []
+FRAME_NOTES: list[dict] = []
+WINDOW_ORDER = ["export", "help"]  # what "Open both windows" opens, in this order
 SUMMARY_CSV = "region,orders\nNorth,120\nSouth,98\n"
 WEEKS = (46, 47)
 KPI_WEEKS = (45, 46, 47, 48)
@@ -122,6 +132,7 @@ class Handler(BaseHTTPRequestHandler):
                 ),
             )
         elif path == "/tabs":
+            both = "; ".join(f"window.open('/{n}', '_blank')" for n in WINDOW_ORDER)
             self._send(
                 200,
                 _page(
@@ -129,7 +140,51 @@ class Handler(BaseHTTPRequestHandler):
                     "<h1>Tabs and files</h1>"
                     "<p><a href='/export' target='_blank'>Open export window</a></p>"
                     "<p><button id='help' type='button' onclick=\"window.open('/help', 'helpwin', 'width=480,height=360')\">Open help</button></p>"
-                    "<p><a href='/upload'>Upload a file</a></p>",
+                    f"<p><button id='both' type='button' onclick=\"{both}\">Open both windows</button></p>"
+                    "<p><a href='/upload'>Upload a file</a></p>"
+                    "<p><a href='/upload-many'>Upload several files</a></p>"
+                    "<p><a href='/frames'>Frames</a></p>",
+                ),
+            )
+        elif path == "/upload-many":
+            self._send(
+                200,
+                _page(
+                    "Upload several",
+                    "<h1>Upload several files</h1><form method='post' action='/upload' enctype='multipart/form-data'>"
+                    "<label for='attachments'>Attachments</label><input id='attachments' name='attachments' type='file' multiple>"
+                    "<label for='comment'>Comment</label><input id='comment' name='comment' type='text'>"
+                    "<button type='submit'>Upload</button></form>",
+                ),
+            )
+        elif path == "/frames":
+            query = parse_qs(self.path.partition("?")[2])
+            src = "/frames/entry"
+            if query.get("via") == ["localhost"]:
+                src = f"http://localhost:{self.server.server_address[1]}/frames/entry"
+            self._send(200, _page("Frames", f"<h1>Frames</h1><iframe name='entry' title='Entry form' src='{src}' width='640' height='420'></iframe>"))
+        elif path == "/frames/entry":
+            saved = "<p id='saved'>Saved</p>" if "saved=1" in self.path else ""
+            self._send(
+                200,
+                _page(
+                    "Entry",
+                    f"<h2>Entry</h2>{saved}<form method='post' action='/frames/save'>"
+                    "<label for='amount'>Amount</label><input id='amount' name='amount' type='text'>"
+                    "<label for='region'>Region</label><select id='region' name='region'><option value='N'>North</option><option value='S'>South</option></select>"
+                    "<button type='submit'>Save</button></form>"
+                    "<iframe name='notes' title='Notes' src='/frames/notes' width='600' height='160'></iframe>",
+                ),
+            )
+        elif path == "/frames/notes":
+            saved = "<p id='noted'>Noted</p>" if "saved=1" in self.path else ""
+            self._send(
+                200,
+                _page(
+                    "Notes",
+                    f"{saved}<form method='post' action='/frames/note'>"
+                    "<label for='fnote'>Frame note</label><input id='fnote' name='note' type='text'>"
+                    "<button type='submit'>Add note</button></form>",
                 ),
             )
         elif path == "/export":
@@ -151,7 +206,9 @@ class Handler(BaseHTTPRequestHandler):
             )
         elif path == "/uploaded":
             last = UPLOADS[-1] if UPLOADS else {}
-            self._send(200, _page("Uploaded", f"<h1>Uploaded</h1><p>{html.escape(str(last.get('filename', '')))} ({last.get('size', 0)} bytes)</p>"))
+            items = last.get("files") or [last]
+            listing = "".join(f"<p>{html.escape(str(f.get('filename', '')))} ({f.get('size', 0)} bytes)</p>" for f in items)
+            self._send(200, _page("Uploaded", f"<h1>Uploaded</h1>{listing}"))
         elif path == "/done":
             self._send(200, _page("Done", "<h1>Submitted</h1>"))
         else:
@@ -160,6 +217,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/upload":
             return self._upload()
+        if self.path in ("/frames/save", "/frames/note"):
+            length = int(self.headers.get("Content-Length", 0))
+            data = {k: v[0] for k, v in parse_qs(self.rfile.read(length).decode()).items()}
+            (FRAME_SAVES if self.path == "/frames/save" else FRAME_NOTES).append(data)
+            self.send_response(303)
+            self.send_header("Location", "/frames/entry?saved=1" if self.path == "/frames/save" else "/frames/notes?saved=1")
+            self.end_headers()
+            return
         if self.path != "/submit":
             return self._send(404, b"not found", "text/plain")
         length = int(self.headers.get("Content-Length", 0))
@@ -179,13 +244,18 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         msg = email.message_from_bytes(b"Content-Type: " + self.headers.get("Content-Type", "").encode() + b"\r\n\r\n" + body, policy=email.policy.default)
         rec: dict = {}
+        files: list[dict] = []
         for part in msg.iter_parts() if msg.is_multipart() else []:
             name = part.get_param("name", header="content-disposition")
             data = part.get_payload(decode=True) or b""
             if part.get_filename():
-                rec.update(filename=part.get_filename(), size=len(data), sha256=hashlib.sha256(data).hexdigest())
+                files.append({"filename": part.get_filename(), "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
             elif name:
                 rec[name] = data.decode("utf-8", "replace")
+        if len(files) == 1:
+            rec.update(files[0])
+        elif files:
+            rec["files"] = files
         UPLOADS.append(rec)
         self.send_response(303)
         self.send_header("Location", "/uploaded")
