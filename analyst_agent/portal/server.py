@@ -33,7 +33,7 @@ from .playbooks import ReviewError, approve_draft, find_entry, list_playbooks, r
 from .runs import RunManager, append_session_event, read_events, safe_child, valid_session_id
 from .state import ORPHAN_BY, ORPHAN_NOTE, PendingStore
 from .takeover import TakeoverError, TakeoverManager
-from .teams import Teams
+from .teams import ReviewRights, SsoGroupDirectory, Teams
 
 MAX_BODY = 1_000_000
 USER_NAME_RE = re.compile(r"^[A-Za-z0-9_.@+-]{1,100}$")
@@ -119,13 +119,36 @@ class PortalApp:
         self.inbox = ApprovalInbox(on_decided=self._approval_logged, store=self.state)
         self.questions = QuestionBox(store=self.state)
         self.runs = RunManager(settings, self.playbooks_dir, Path(knowledge_dir) if knowledge_dir else None, self.inbox, self.questions, client_factory, router_factory, on_event=self._event)
-        self.teams = Teams(self.cfg.get("teams"))
+        # Team membership from SSO groups only when the groups come from the IdP or the trusted proxy.
+        self.sso_groups = SsoGroupDirectory(settings.workspace_root / "portal_sso_groups.json") if self.auth.mode in ("oidc", "trusted_header") else None
+        self.teams = Teams(self.cfg.get("teams"), groups_of=self.sso_groups.get if self.sso_groups else None)
+        self.auth.session_groups = self.teams.known_groups()
+        self.team_warnings = self._check_teams()
         self.takeover = TakeoverManager(settings, self.runs, self.audit, tier_factory=desktop_factory, capture=capture)
         allowed = self.cfg.get("allowed_hosts") or []
         self.allowed_hosts = {h.lower() for h in allowed} or (LOOPBACK_NAMES | {host.lower()} if is_loopback(host) else set())
         self._close_orphans()
         self.state.prune()
         self.inbox.load_history(self.state.records("approval"))
+
+    def _check_teams(self) -> list[str]:
+        """Config problems and (local sign-in) team names missing from the user store. Warnings only."""
+        warnings = list(self.teams.warnings)
+        if self.auth.mode == "local":
+            warnings += self.teams.unknown_users(self.auth.users.users().keys())
+            if self.teams.known_groups():
+                warnings.append("sso_groups / sso_reviewer_groups are ignored with portal.auth.mode local")
+        for w in warnings:
+            self.audit.event("teams_config_warning", warning=w)
+            if not self.quiet:
+                print(f"warning: portal.teams: {w}", file=sys.stderr)
+        return warnings
+
+    def _record_groups(self, ident: Identity | None) -> None:
+        if self.sso_groups is not None and ident is not None and ident.source in ("oidc", "trusted_header"):
+            known = self.teams.known_groups()
+            if self.sso_groups.record(ident.name, [g for g in ident.groups if g in known], ident.source):
+                self.audit.event("sso_groups_seen", by=ident.name, source=ident.source, groups=sorted(g for g in ident.groups if g in known), teams=self.teams.teams_of(ident.name, ident.groups))
 
     def _close_orphans(self) -> None:
         """Requests left pending by a previous portal: their run thread is gone, so decline them."""
@@ -159,7 +182,7 @@ class PortalApp:
             return True
         if (self.takeover.active(sid) or {}).get("by") == ident.name:
             return True  # the person holding a takeover keeps the session until they hand back
-        if owner is not None and self.teams.share_team(ident.name, owner):
+        if owner is not None and self.teams.share_team(ident.name, owner, ident.groups):
             return True
         if ident.can("reviewer"):
             return owner is None or (bool(self.inbox.pending(sid)) and self.may_decide(ident, sid))
@@ -171,7 +194,16 @@ class PortalApp:
             return False
         if ident.can("admin"):
             return True
-        return self.teams.may_review(ident.name, self.runs.playbook_of(sid))
+        return self.teams.may_review(ident.name, self.runs.playbook_of(sid), ident.groups)
+
+    def rights(self, ident: Identity | None, item) -> ReviewRights:
+        """What this person may do with one pending approval: the role, the team's playbooks,
+        then the reviewer's limits by action class and amount. Checked again on every POST."""
+        if ident is None or not ident.can("reviewer"):
+            return ReviewRights(False, False, "only reviewers and admins can decide")
+        if ident.can("admin"):
+            return ReviewRights(True, True)
+        return self.teams.rights(ident.name, self.runs.playbook_of(item.session_id), item.req.action_class, item.req.amount, ident.groups)
 
     def may_share(self, ident: Identity, sid: str) -> bool:
         return ident.can("admin") or self.runs.owner(sid) == ident.name
@@ -191,7 +223,8 @@ class PortalApp:
 
     def _approval_logged(self, item) -> None:
         d = item.decision
-        self.audit.event("approval_decided", session=item.session_id, step=item.req.step_id, action_class=item.req.action_class, summary=item.req.summary, approved=d.approved, by=d.by, note=d.note)
+        extra = {"amount": item.req.amount} if item.req.amount is not None else {}
+        self.audit.event("approval_decided", session=item.session_id, step=item.req.step_id, action_class=item.req.action_class, summary=item.req.summary, approved=d.approved, by=d.by, note=d.note, **extra)
 
     # ------------------------------------------------------------------ plumbing
     def _host_ok(self, host_header: str | None) -> bool:
@@ -231,6 +264,8 @@ class PortalApp:
             cookies: list[str] = []
             peer = hd.client_address[0]
             ident = self.auth.resolve(sent, hd.headers, peer)
+            if ident is not None and ident.source == "trusted_header":
+                self._record_groups(ident)
             if ident and self.auth.mode in ("trusted_header", "dev") and (not sent or sent.get("u") != ident.name):
                 tok = self.auth.new_session(ident)
                 session = self.auth.signer.unsign(tok)
@@ -449,7 +484,8 @@ class PortalApp:
         except AuthError as e:
             self.audit.event("login_failed", source="oidc", reason=str(e), peer=ctx.peer)
             return self._error(ctx, 401, f"sign-in failed: {e}")
-        self.audit.event("login", by=ident.name, role=ident.role, source="oidc", peer=ctx.peer)
+        self.audit.event("login", by=ident.name, role=ident.role, source="oidc", peer=ctx.peer, teams=self.teams.teams_of(ident.name, ident.groups))
+        self._record_groups(ident)
         ctx.cookies[:] = [self.auth.cookie_header(SESSION_COOKIE, self.auth.new_session(ident)), self.auth.cookie_header(OIDC_COOKIE, "", max_age=0, samesite="Lax")]
         # A same-site navigation from this page, so the SameSite=Strict cookie is sent on the next request.
         body = '<!doctype html><meta charset=utf-8><meta http-equiv="refresh" content="0;url=/"><title>Signed in</title><p>Signed in. <a href="/">Continue</a></p>'
@@ -517,7 +553,7 @@ class PortalApp:
             return self._error(ctx, 404, "no such session")
         info = self.runs.session_info(sid)
         events = read_events(self.settings.audit_dir / sid)
-        body = V.session_page(info, events, ctx.ident, ctx.csrf, self.inbox.pending(sid), self.questions.get(sid), may_decide=lambda item: self.may_decide(ctx.ident, item.session_id),
+        body = V.session_page(info, events, ctx.ident, ctx.csrf, self.inbox.pending(sid), self.questions.get(sid), may_decide=lambda item: self.rights(ctx.ident, item),
                               viewers=self.runs.viewers(sid), may_share=self.may_share(ctx.ident, sid))
         return self._page(ctx, 200, f"Session {sid}", body, "sessions", poll=f"/api/sessions/{quote(sid)}/state")
 
@@ -694,7 +730,7 @@ class PortalApp:
         history = self.inbox.history()
         if not ctx.ident.can("reviewer"):
             history = [x for x in history if self.can_see(ctx.ident, x.session_id)]
-        return self._page(ctx, 200, "Approvals", V.approvals_page(self._visible_pending(ctx.ident), history, ctx.ident, ctx.csrf, may_decide=lambda item: self.may_decide(ctx.ident, item.session_id)), "approvals", poll="/api/state")
+        return self._page(ctx, 200, "Approvals", V.approvals_page(self._visible_pending(ctx.ident), history, ctx.ident, ctx.csrf, may_decide=lambda item: self.rights(ctx.ident, item)), "approvals", poll="/api/state")
 
     def r_decide(self, ctx: Ctx, aid: str) -> Response:
         decision = ctx.form.get("decision", "")
@@ -706,9 +742,15 @@ class PortalApp:
         if pending is not None and pending.decision is None:
             if not self._visible(ctx, pending.session_id):
                 return self._error(ctx, 404, "no such approval")
-            if not self.may_decide(ctx.ident, pending.session_id):
-                self.audit.event("approval_forbidden", session=pending.session_id, step=pending.req.step_id, by=ctx.ident.name, playbook=self.runs.playbook_of(pending.session_id))
-                return self._error(ctx, 403, "your team does not review this playbook")
+            rights = self.rights(ctx.ident, pending)
+            if not (rights.approve if decision == "approve" else rights.decide):
+                reason = rights.reason or "not allowed"
+                info = dict(step=pending.req.step_id, action_class=pending.req.action_class, decision=decision, by=ctx.ident.name, role=ctx.ident.role,
+                            playbook=self.runs.playbook_of(pending.session_id), reason=reason, **({"amount": pending.req.amount} if pending.req.amount is not None else {}))
+                self.audit.event("approval_forbidden", session=pending.session_id, request_id=aid, **info)
+                if valid_session_id(pending.session_id):
+                    append_session_event(self.settings.audit_dir / pending.session_id, "approval_forbidden", ctx.ident.name, **info)
+                return self._error(ctx, 403, f"you may not {decision} this request: {reason}")
         item = self.inbox.decide(aid, decision == "approve", ctx.ident.name, full_note)
         if item is None:
             return self._redirect("/approvals?m=gone")

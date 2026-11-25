@@ -34,6 +34,7 @@ class Step:
     action_class: str | None = None  # send / submit / delete / upload_external / ...
     mode: str = "guided"  # "scripted" when script is set and proven
     no_check_reason: str = ""  # reviewed exception to "no check, no step" (e.g. an intermediate UI action)
+    approval_amount: str | None = None  # e.g. "{amount}": carried on this step's approval requests for reviewer amount limits
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items() if v not in (None, [], {}, "")}
@@ -188,6 +189,7 @@ def playbook_from_dict(data: dict, source_path: str = "") -> Playbook:
                 action_class=raw.get("action_class"),
                 mode=raw.get("mode", "scripted" if raw.get("script") else "guided"),
                 no_check_reason=raw.get("no_check_reason", ""),
+                approval_amount=None if raw.get("approval_amount") in (None, "") else str(raw["approval_amount"]),
             )
         )
     return Playbook(

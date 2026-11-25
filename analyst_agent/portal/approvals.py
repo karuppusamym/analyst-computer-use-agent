@@ -65,6 +65,7 @@ class ApprovalInbox:
                 self.store.open("approval", item.id, {
                     "session_id": session_id, "requested_by": requested_by, "created_at": item.created_at, "timeout_s": item.timeout_s,
                     "step_id": req.step_id, "action_class": req.action_class, "summary": req.summary, "preview": req.preview, "approver": req.approver,
+                    **({"amount": req.amount} if req.amount is not None else {}),
                 })
             except OSError as e:  # fail closed: a request that cannot be recorded is declined
                 item.decision = ApprovalDecision(False, "portal", f"could not record the request ({e}); declined")
@@ -139,7 +140,7 @@ class ApprovalInbox:
         for r in records:
             if r.get("kind") != "approval" or r.get("status") != "closed":
                 continue
-            req = ApprovalRequest(str(r.get("step_id", "")), str(r.get("action_class", "")), str(r.get("summary", "")), str(r.get("preview", "")), str(r.get("approver", "")))
+            req = ApprovalRequest(str(r.get("step_id", "")), str(r.get("action_class", "")), str(r.get("summary", "")), str(r.get("preview", "")), str(r.get("approver", "")), None if r.get("amount") is None else str(r.get("amount")))
             d = ApprovalDecision(bool(r.get("approved")), str(r.get("by", "")), str(r.get("note", "")), float(r.get("decided_at") or 0))
             items.append(PendingApproval(r["id"], str(r.get("session_id", "")), str(r.get("requested_by", "")), req, float(r.get("created_at") or 0), float(r.get("timeout_s") or 0), d, str(r.get("outcome", ""))))
         items.sort(key=lambda i: i.decision.decided_at)

@@ -169,8 +169,15 @@ python -m analyst_agent portal --host 127.0.0.1 --port 8765
 
 ```json
 "teams": {
-  "finance": {"members": ["alice", "bob"], "reviewers": ["rita"], "playbooks": ["erp-crm-reconciliation", "budget-*"]},
-  "audit":   {"members": [], "reviewers": ["rhea"], "playbooks": ["*"]}
+  "finance": {
+    "members": ["alice", "bob"],
+    "reviewers": ["rita", {"name": "rob", "action_classes": ["plan", "submit"], "max_amount": 5000}],
+    "playbooks": ["erp-crm-reconciliation", "budget-*", "vendor-*"],
+    "sso_groups": ["fin-analysts"],
+    "sso_reviewer_groups": ["fin-approvers"],
+    "reviewer_limits": {"action_classes": ["plan"], "max_amount": 1000}
+  },
+  "audit": {"members": [], "reviewers": ["rhea"], "playbooks": ["*"]}
 }
 ```
 
@@ -178,7 +185,26 @@ python -m analyst_agent portal --host 127.0.0.1 --port 8765
 - With teams configured, a reviewer may decide an approval only if the session's playbook matches (fnmatch) a `playbooks` entry of a team that lists them under `reviewers`. `"*"` means any playbook, including planner-built sessions with no playbook; nothing else matches those. A reviewer listed in no team's `reviewers` decides nothing. Admins are not limited.
 - Approvals a reviewer may not decide don't make the session visible to them. If they can see it anyway (team, share), the inbox shows the request with disabled buttons, and a POST gets **403** and is logged as `approval_forbidden`.
 - With no teams configured, every reviewer may decide every approval, as before.
-- Team names are not checked against the user store; with SSO they are the names from the proxy or the ID token.
+
+*Teams from SSO groups* (`trusted_header` and `oidc` sign-in only):
+
+- A user is a member of a team if the config lists them under `members`, **or** one of their SSO groups is in the team's `sso_groups`. They are a reviewer of the team if listed under `reviewers` or one of their groups is in `sso_reviewer_groups`. Deciding still needs the `reviewer` role (from `group_roles` / `user_roles`).
+- OIDC: groups come from the ID token claim `oidc.groups_claim` (default `groups`), are read once at sign-in, and are kept in the signed session cookie. Only groups that the team config mentions are kept, at most 100. A changed group takes effect at the next sign-in.
+- Trusted header: groups come from `trusted_header.groups_header` (for example `X-Forwarded-Groups`, comma- or semicolon-separated) on every request, and only from the addresses in `proxy_ips`. There is no default header; make sure the proxy strips any client-sent copy.
+- Groups are never read from a form, a query string or a JSON body.
+- To find the teams of *another* user (for example the owner of a session), the portal uses that user's groups as last seen at their sign-in or proxied request, stored in `workspace/portal_sso_groups.json`. A change is logged as `sso_groups_seen`.
+- Local (PBKDF2) users keep config-only membership. `sso_groups` and `sso_reviewer_groups` are ignored, with a start-up warning.
+
+*Reviewer limits by approval type and amount:*
+
+- A reviewer entry can be a name or a dict: `{"name": ..., "action_classes": [...], "max_amount": ...}`. Plain names and reviewers who come in through `sso_reviewer_groups` get the team's `reviewer_limits`. A dict entry overrides the team's limits key by key. No limits means unlimited, as before.
+- `action_classes` lists the approval types the reviewer may **approve**: the request's `action_class`, which is `plan` for the plan, a step's `action_class` (`send`, `submit`, `delete`, `upload_external`, ...; `approval` when the step has none), or `submit` / `upload` for in-step browser and desktop prompts. A reviewer without `plan` in their list can't approve plans.
+- `max_amount` applies to requests that carry an amount. A playbook step declares one with `"approval_amount": "{amount}"` (any parameter placeholder). The value is put on the step's approval request and on the in-step tool approvals of that step, shown in the plan preview and the inbox, and saved in `portal_state` and the audit logs. It is compared as an absolute value. `12,500.00` and `12 500` are read as numbers. An amount that isn't a number is refused for any reviewer with an amount limit. Requests with no amount are not limited by `max_amount`.
+- A reviewer may decide in any team that covers the playbook. If their limits allow the request in one of those teams, they may approve it.
+- These limits are enforced on the server when the decision is POSTed. A reviewer outside their limits gets **403** for Approve, but can still Reject. The inbox shows the reason and disables only the Approve button. Every refusal is logged as `approval_forbidden` (who, the decision, the action class, the amount and the reason), both in `workspace/portal_audit/` and in the session's audit log.
+- A limit that is invalid in the config (for example a `max_amount` that is not a number) approves nothing and gives a start-up warning. Admins are not limited by teams or limits.
+
+*Checking the config against the user store:* with `local` sign-in, the portal warns on start-up, logging `teams_config_warning`, about every team member or reviewer who is not in `workspace/portal_users.json`, and it starts anyway. `python -m analyst_agent portal-user teams` prints each team, its reviewers with their limits and its SSO groups, plus the same warnings. It exits 0 even when there are warnings. With SSO, user names are not checked, because they come from the IdP.
 
 **Share** (session page, owner or admin only): adds or removes individual viewers by user name. They are stored as `viewers` in `portal_meta.json` and logged as `session_shared` / `session_unshared` in the session's audit log and `workspace/portal_audit/`. Viewers get the same access as a team member: they can see the session and use its kill switch and Resume, but they cannot share it further or decide approvals unless their role and team allow it.
 
@@ -205,7 +231,7 @@ python -m analyst_agent portal --host 127.0.0.1 --port 8765
 
 | Mode | How it works |
 | --- | --- |
-| `local` (default) | Users and roles live in `workspace/portal_users.json`. Passwords are PBKDF2-SHA256 hashes (600,000 iterations). Manage them with `portal-user add/remove/list`. |
+| `local` (default) | Users and roles live in `workspace/portal_users.json`. Passwords are PBKDF2-SHA256 hashes (600,000 iterations). Manage them with `portal-user add/remove/list`; `portal-user teams` checks `portal.teams` against them. |
 | `trusted_header` | Behind an SSO reverse proxy. The user comes from `trusted_header.header` (default `X-Forwarded-User`), and groups optionally come from `groups_header`. Both are accepted **only** from the addresses in `proxy_ips`. Roles come from `user_roles` / `group_roles` / `default_role`. |
 | `oidc` | Authorization-code flow with PKCE against `oidc.issuer`, using stdlib `urllib`. The ID token's RS256 signature is checked against the issuer's JWKS in pure Python, then `iss`, `aud`, `exp` and `nonce`. The client secret, if any, is read from the env var `client_secret_env`. |
 
@@ -352,7 +378,7 @@ To include the live desktop tests, set the variable first. They move the mouse f
 $env:RUN_DESKTOP_TESTS = "1"
 ```
 
-Current result: **297 tests**. Without `RUN_DESKTOP_TESTS` and without a running Docker daemon, 287 pass and 10 skip: the live desktop tests (including live takeover), the 6 live container tests, and the clipboard test when the clipboard is empty. Offline, the eval run passes all 44 graded tasks and skips 6 (4 `needs_model`, 2 `needs_tier`). On OpenRouter all 48 graded tasks pass. CI (`.github/workflows/tests.yml`) runs the suite on Windows with and without the optional packages.
+Current result: **315 tests**. Without `RUN_DESKTOP_TESTS` and without a running Docker daemon, 305 pass and 10 skip: the live desktop tests (including live takeover), the 6 live container tests, and the clipboard test when the clipboard is empty. Offline, the eval run passes all 44 graded tasks and skips 6 (4 `needs_model`, 2 `needs_tier`). On OpenRouter all 48 graded tasks pass. CI (`.github/workflows/tests.yml`) runs the suite on Windows with and without the optional packages.
 
 The live desktop end-to-end test runs playbook → approval → router → executor → real pixel tier → test app → verifier.
 
@@ -387,11 +413,12 @@ tests/          unit, integration and live desktop tests
 ## Not done yet
 
 - **Not yet tested on your office gateway.** It has been tested on OpenRouter only (see above). Run `gateway-check` on your gateway first.
-- **Portal is a first version.** Task chat, sessions, approval inbox, playbook review, SSO (trusted header / OIDC), a polling live view with human takeover, pending requests that survive a restart (with Resume), team and per-owner session visibility, sharing, and team-limited reviewers are in place (see Portal). Still missing or limited:
+- **Portal is a first version.** Task chat, sessions, approval inbox, playbook review, SSO (trusted header / OIDC), a polling live view with human takeover, pending requests that survive a restart (with Resume), team and per-owner session visibility, sharing, teams from SSO groups, and reviewers limited by playbook, approval type and amount are in place (see Portal). Still missing or limited:
   - Takeover is polled PNG frames plus single inputs, not a streaming remote desktop. Expect about a second of lag, and no drag, key-hold or clipboard. The screen is the primary monitor of the machine the portal runs on, so the portal and the agent must share a desktop. Frames and typed text are not redacted; don't type secrets during a takeover.
   - A takeover holds only within one portal process. After a restart the run thread is gone, a leftover `PAUSE` file blocks Resume until someone hands back, and the task time-out keeps running while a person holds the session.
   - A restart can't reconnect a waiting run. Its pending requests are declined as orphaned, and the session has to be resumed from its last checkpoint. The plan is approved again, and an unverified step that was in progress runs again.
-  - Teams come from the config file only, not from SSO groups, and team membership isn't checked against the user store. Reviewers are limited by playbook, not by approval type or amount.
+  - SSO team membership is only as current as the last sign-in. OIDC groups are fixed at sign-in, and other users' groups are used as last seen, so a session owner removed from a group still counts as a member until they sign in again. Group overage claims (for example Azure AD `_claim_names` when a user has too many groups) are not resolved; put the groups in the token or use the proxy header. With `local` sign-in, a team member who is missing from the user store gets a warning, not an error.
+  - Amount limits cover only amounts a playbook step declares (`approval_amount`). Planner-built steps carry no amount, because a model-chosen amount can't be trusted, and nothing reads amounts off the screen. A step that declares an amount needs `approval: "required"` (or an action class the policy gates) to be reviewed at all. Admins have no limits. Reviewer limits exist only inside `portal.teams`. With no teams configured, every reviewer is unlimited, as before.
 - **Later-phase features:** a Guacamole/noVNC desktop with streaming video is still a Phase 3 item, for VMs the portal does not run on. The central vault backends (HashiCorp Vault, Azure Key Vault) have been tested only against local fake servers that mimic their APIs, not against a real Vault or Key Vault. Rotation is manual (`vault rotate`). Nothing changes the password on the target system itself. Sharing is per user, not per portal group or team.
 - **Teach recorder:** has been tested by driving the page in code (`tests/test_teach.py`, against the `/tabs` page of the test portal), not with a person clicking in a headed window. Still limited:
   - A link that downloads straight into a new tab (`target=_blank` on an attachment) is reported as a warning, not replayed, because the download belongs to a tab that closes itself.
