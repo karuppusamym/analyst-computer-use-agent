@@ -74,6 +74,8 @@ DEFAULTS: dict[str, Any] = {
     },
     "connectors": {"databases": {}},
     "audit": {"dir": "./workspace/audit"},
+    # Scheduled unattended runs (scheduler.py): definitions file and run state/history folder.
+    "schedules": {"path": "./config/schedules.json", "state_dir": "./workspace/schedules", "lock_stale_s": 7200},
 }
 
 
