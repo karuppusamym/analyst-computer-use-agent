@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from ..audit import redact
 from ..policy import ApprovalRequest, PolicyViolation, wrap_untrusted
 from ..vault import has_placeholder, resolve_secrets
 from .base import Tier, Tool, ToolContext, ToolOutput, schema
@@ -44,10 +45,13 @@ _SNAPSHOT_JS = r"""
       const l = document.querySelector('label[for="' + el.id + '"]');
       if (l) label = l.innerText;
     }
-    const name = (label || el.innerText || el.value || el.getAttribute('placeholder') || el.getAttribute('name') || el.getAttribute('title') || '').trim().slice(0, 120);
+    // A form field's typed value is never its name (a password field with no label would show the password).
+    const isField = el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT';
+    const shown = (el.tagName === 'INPUT' && ['button', 'submit', 'reset'].includes(el.type)) ? el.value : '';
+    const name = (label || (isField ? '' : el.innerText) || shown || el.getAttribute('placeholder') || el.getAttribute('name') || el.getAttribute('title') || '').trim().slice(0, 4000);
     out.push({ref, tag: el.tagName.toLowerCase(), role: el.getAttribute('role') || el.type || '', name,
                value: el.type === 'password' ? (el.value ? '********' : '') :
-                      (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') ? String(el.value).slice(0, 120) : '',
+                      isField ? String(el.value).slice(0, 4000) : '',
                href: el.getAttribute('href') || ''});
   }
   return {title: document.title, url: location.href, elements: out, text: (document.body ? document.body.innerText : '')};
@@ -66,6 +70,7 @@ class BrowserTier(Tier):
         self._page = None
         self._pages: list = []  # every page of the context in open order; index = tab number
         self._checked: tuple[bool, str] | None = None
+        self._ctx: ToolContext | None = None  # the step whose policy the request filter applies
 
     # ---------------------------------------------------------------- lifecycle
     def available(self) -> tuple[bool, str]:
@@ -89,12 +94,16 @@ class BrowserTier(Tier):
         return self._checked
 
     def _ensure(self, ctx: ToolContext):
+        self._ctx = ctx
         if self._page is None:
             from playwright.sync_api import sync_playwright
 
             self._pw = sync_playwright().start()
             self._browser = self._pw.chromium.launch(headless=self.settings["tiers"]["browser"].get("headless", True))
             context = self._browser.new_context(accept_downloads=True)
+            # Every request (navigation, redirect, popup, image, fetch) is checked against the host
+            # allowlist before it leaves the browser. The after-the-fact page check stays as a second line.
+            context.route("**/*", self._filter_request)
             self._pages = []
             context.on("page", lambda pg: pg not in self._pages and self._pages.append(pg))
             self._page = context.new_page()
@@ -113,6 +122,27 @@ class BrowserTier(Tier):
             self._pages = []
 
     # ---------------------------------------------------------------- helpers
+    def _filter_request(self, route, request) -> None:
+        url = request.url
+        if url.startswith(("data:", "blob:", "about:")):
+            route.continue_()
+            return
+        ctx = self._ctx
+        nav = request.is_navigation_request()
+        if not nav and self.settings["tiers"]["browser"].get("allow_offlist_subresources", False):
+            route.continue_()
+            return
+        try:
+            if ctx is None:
+                raise PolicyViolation("no active step")
+            ctx.policy.check_url(url)
+        except PolicyViolation as e:
+            if ctx is not None:
+                ctx.audit.event("browser_request_blocked", step=ctx.step_id, url=url[:500], navigation=nav, reason=str(e)[:300])
+            route.abort("blockedbyclient")
+            return
+        route.continue_()
+
     def _guard_host(self, page, ctx: ToolContext) -> str | None:
         """After navigation, refuse pages that left the allowlist."""
         url = page.url
@@ -205,12 +235,18 @@ class BrowserTier(Tier):
         page = self._ensure(ctx)
         data = page.evaluate(_SNAPSHOT_JS)
         lines = [f"title: {data['title']}", f"url: {data['url']}", "interactive elements (use the ref):"]
+        # Redact vault values on the full strings first, then shorten and quote. Cutting or
+        # repr-escaping first leaves a fragment or an escaped form the redactor cannot match.
+        def clean(v: str, n: int) -> str:
+            return str(redact(str(v or ""), ctx.audit))[:n]
+
         for e in data["elements"]:
-            extra = f" value={e['value']!r}" if e["value"] else ""
-            extra += f" href={e['href']}" if e["href"] else ""
-            lines.append(f"  [{e['ref']}] {e['tag']}{('/' + e['role']) if e['role'] else ''} {e['name']!r}{extra}")
+            value = clean(e["value"], 120)
+            extra = f" value={value!r}" if value else ""
+            extra += f" href={clean(e['href'], 500)}" if e["href"] else ""
+            lines.append(f"  [{e['ref']}] {e['tag']}{('/' + e['role']) if e['role'] else ''} {clean(e['name'], 120)!r}{extra}")
         lines.append("visible text:")
-        lines.append(data["text"][:8000])
+        lines.append(clean(data["text"], 8000))
         ctx.audit.event("browser_action", step=ctx.step_id, action="snapshot", url=data["url"], elements=len(data["elements"]))
         return ToolOutput(wrap_untrusted(data["url"], "\n".join(lines), 12000))
 

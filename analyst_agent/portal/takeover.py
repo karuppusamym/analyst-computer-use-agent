@@ -30,6 +30,8 @@ from .auth import Identity
 
 CLICKS = {"click": "left_click", "double_click": "double_click", "right_click": "right_click"}
 ACTIONS = set(CLICKS) | {"type", "key", "scroll", "move"}
+WIN_VKS = {0x5B, 0x5C}  # VK_LWIN, VK_RWIN
+CLICK_MODIFIER_VKS = {0x10, 0x11, 0x12}  # shift, ctrl, alt
 FORBIDDEN_KEYS = re.compile(r"(^|\+)\s*(win|super|meta|cmd|lwin|rwin)\s*(\+|$)", re.I)
 
 
@@ -221,16 +223,25 @@ class TakeoverManager:
             inp["text"] = text
         if action == "key":
             combo = form.get("text", "").strip()
-            if FORBIDDEN_KEYS.search(combo):
-                return self._refuse(hud, member, {"text": combo}, "Windows-key combinations are not allowed during a takeover")
             try:
-                sw.parse_combo(combo)
+                vks = sw.parse_combo(combo)
             except ValueError as e:
                 raise TakeoverError(str(e), 400) from None
+            # Check the parsed keys, not the spelling: every alias of the Windows key maps to the same code.
+            if FORBIDDEN_KEYS.search(combo) or WIN_VKS & set(vks):
+                return self._refuse(hud, member, {"text": combo}, "Windows-key combinations are not allowed during a takeover")
             inp["text"] = combo
             inp["repeat"] = max(1, min(20, int(form.get("repeat", "1") or 1)))
         if action in CLICKS and form.get("modifiers"):
-            inp["text"] = form["modifiers"]  # e.g. "shift" or "ctrl+shift", as for the agent
+            mods = form["modifiers"].strip()
+            try:
+                mod_vks = sw.parse_combo(mods)
+            except ValueError as e:
+                raise TakeoverError(str(e), 400) from None
+            # A click may hold shift, ctrl or alt only; anything else (Windows key, letters) is refused.
+            if not set(mod_vks) <= CLICK_MODIFIER_VKS:
+                return self._refuse(hud, member, {"modifiers": mods}, "a click may only hold shift, ctrl or alt during a takeover")
+            inp["text"] = mods  # e.g. "shift" or "ctrl+shift", as for the agent
         perms = None
         pb_name = self.runs.playbook_of(sid) if hasattr(self.runs, "playbook_of") else None
         if pb_name:

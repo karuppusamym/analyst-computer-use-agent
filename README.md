@@ -127,7 +127,14 @@ python -m analyst_agent eval compare -2 -1
 - `eval history` prints a trend table: pass/fail/skip counts, success rate and its change from the run before, unapproved outbound actions, cost per success and the pilot gate.
 - `eval compare <A> <B>` lists tasks that **regressed** (pass to fail) or **improved** (fail to pass), tasks newly skipped or newly graded, status changes, changed models and changed pilot metrics. Name a run by its id, a unique prefix of it, or a negative index (`-1` is the latest). It exits with 1 when anything regressed, so CI can gate on it.
 - `--unattended` declines every approval and reports it. Nothing is ever auto-approved.
-- `--resume <session>` continues from the last checkpoint.
+- `--resume <session>` continues from the last checkpoint. It refuses when the request, the parameters or a verified step's content differ from the checkpointed run, so a step is never skipped because only its id matches.
+- **Guard rails added by the 25 Nov 2026 safety review:**
+  - File tools can't read or write the agent's own control files: the vault, `portal_secret.key`, `portal_users.json`, `portal_state/`, `portal_audit/`, schedule state and the audit folder. Only each session's `audit/<session>/scratch` folder stays open.
+  - `action_class` is lower-cased and common synonyms are mapped (`email` becomes `send`). Any class that is neither `none` nor a known class needs approval.
+  - The kill switch is checked between the calls of a scripted sequence, after an approval, and before each tool call in a batch.
+  - A replanned set of steps goes to plan approval again.
+  - The browser checks every request against the host allowlist before it is sent: navigations, redirects, popups and, unless `tiers.browser.allow_offlist_subresources` is true, images, scripts and fetches too.
+  - URLs with a backslash, a space or control character, a user-name part, or a scheme other than http/https are refused.
 - Each run writes its audit log, screenshots, checkpoint and a "what I checked" report to `workspace/audit/<session>/`. Outputs go to `workspace/output/`.
 
 Run `python samples/make_samples.py` to regenerate the sample data (ERP/CRM, budget and GL actuals, PO/receipt/invoice, payments and vendor master, customer master exports, and `warehouse.sqlite`). It is seeded and plants issues with known counts, so the eval graders assert exact numbers; the original pilot files come out byte-identical.

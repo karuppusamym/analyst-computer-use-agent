@@ -59,7 +59,7 @@ DEFAULTS: dict[str, Any] = {
                  "backend": "local", "fallback_to_local": False, "docker_cli": "docker",
                  "docker": {"image": "python:3.13-slim", "pull": "if-missing", "cpus": 1.0, "pids_limit": 64, "tmpfs_mb": 64,
                             "max_output_file_mb": 100, "max_output_total_mb": 500, "max_output_files": 2000}},
-        "browser": {"enabled": True, "headless": True},
+        "browser": {"enabled": True, "headless": True, "allow_offlist_subresources": False},  # False: images, scripts and fetches to hosts off the allowlist are blocked too
         "desktop_uia": {"enabled": False},
         # Pixel control drives a real mouse and keyboard. Only enable it inside
         # an isolated agent workspace VM, never on an employee laptop.

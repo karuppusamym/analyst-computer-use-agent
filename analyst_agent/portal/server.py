@@ -692,8 +692,10 @@ class PortalApp:
     # ------------------------------------------------------------------ approvals
     def r_approvals(self, ctx: Ctx) -> Response:
         history = self.inbox.history()
-        if not ctx.ident.can("reviewer"):
-            history = [x for x in history if self.can_see(ctx.ident, x.session_id)]
+        if not ctx.ident.can("admin"):
+            # A decision is listed only to someone who can see its session or could have decided it
+            # (team-limited reviewers see their teams' playbooks only; with no teams, every reviewer).
+            history = [x for x in history if self.can_see(ctx.ident, x.session_id) or self.may_decide(ctx.ident, x.session_id)]
         return self._page(ctx, 200, "Approvals", V.approvals_page(self._visible_pending(ctx.ident), history, ctx.ident, ctx.csrf, may_decide=lambda item: self.may_decide(ctx.ident, item.session_id)), "approvals", poll="/api/state")
 
     def r_decide(self, ctx: Ctx, aid: str) -> Response:

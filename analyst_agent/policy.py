@@ -21,6 +21,25 @@ class PolicyViolation(PermissionError):
     pass
 
 
+ACTION_CLASSES = ("send", "submit", "delete", "pay", "upload_external", "change_settings")
+_ACTION_ALIASES = {
+    "email": "send", "send_email": "send", "mail": "send", "reply": "send", "post": "send", "publish": "send", "message": "send",
+    "submit_form": "submit", "form": "submit", "approve": "submit", "confirm": "submit", "save": "submit",
+    "remove": "delete", "erase": "delete", "purge": "delete",
+    "payment": "pay", "transfer": "pay", "purchase": "pay", "buy": "pay",
+    "upload": "upload_external", "external_upload": "upload_external", "share": "upload_external",
+    "settings": "change_settings", "configure": "change_settings", "setting": "change_settings",
+}
+
+
+def normalize_action_class(action_class: str | None) -> str | None:
+    """Lower-case, trim and map common synonyms; None for no action ('', 'none', 'read')."""
+    cls = (action_class or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if cls in ("", "none", "null", "no", "n/a", "read", "read_only"):
+        return None
+    return _ACTION_ALIASES.get(cls, cls)
+
+
 @dataclass
 class ApprovalRequest:
     step_id: str
@@ -91,12 +110,35 @@ class PolicyEngine:
         self.write_roots = [settings.workspace_root, settings.output_dir]
         self.data_class = perms.get("data_class", "internal")
         self.base_dir = settings.base_dir
-        # The vault folder is never readable or writable through file tools.
-        self.deny_roots = [settings.path(settings.data.get("vault", {}).get("path", "./workspace/vault"))]
+        # The agent's own control files are never readable or writable through file tools:
+        # the vault, the portal's signing key, users and pending requests, schedule state,
+        # and the audit folder (logs, checkpoints, PAUSE/STOP). Only each session's
+        # audit/<session>/scratch work folder is open, because the code tier writes there.
+        ws = settings.workspace_root
+        portal = settings.data.get("portal", {})
+        auth = portal.get("auth", {})
+        self.deny_roots = [
+            settings.path(settings.data.get("vault", {}).get("path", "./workspace/vault")),
+            ws / auth.get("secret_file", "portal_secret.key"),
+            ws / auth.get("users_file", "portal_users.json"),
+            ws / portal.get("state_dir", "portal_state"),
+            ws / "portal_audit",
+            settings.path(settings.data.get("schedules", {}).get("state_dir", "./workspace/schedules")),
+        ]
+        self.audit_root = settings.audit_dir
 
     # ---- allowlists
     def check_url(self, url: str) -> None:
-        host = (urlparse(url).hostname or "").lower()
+        # Browsers and urlparse disagree on some spellings: 'https://evil.com\@allowed.com/' is
+        # allowed.com to urlparse but evil.com to Chromium. Refuse anything ambiguous outright.
+        if any(c == "\\" or ord(c) < 0x21 or ord(c) == 0x7F for c in url):
+            raise PolicyViolation(f"URL has a backslash, space or control character: {url!r}")
+        parsed = urlparse(url)
+        if parsed.scheme.lower() not in ("http", "https"):
+            raise PolicyViolation(f"only http and https URLs are allowed: {url}")
+        if "@" in parsed.netloc:
+            raise PolicyViolation(f"URLs with a user name or password part are not allowed: {url}")
+        host = (parsed.hostname or "").lower()
         if not host:
             raise PolicyViolation(f"not a valid URL: {url}")
         if not any(fnmatch.fnmatch(host, pat.lower()) for pat in self.allowed_hosts):
@@ -112,7 +154,12 @@ class PolicyEngine:
         # Roots are resolved here, not only at start-up: a folder created after the engine
         # (the workspace) only resolves its 8.3 short name to the long name once it exists.
         if any(p == d or d in p.parents for d in (r.resolve() for r in self.deny_roots)):
-            raise PolicyViolation(f"may not access {p}: the credential vault folder is off limits")
+            raise PolicyViolation(f"may not access {p}: the agent's credential and control files are off limits")
+        audit = self.audit_root.resolve()
+        if p == audit or audit in p.parents:
+            rel = p.relative_to(audit).parts
+            if not (len(rel) >= 2 and rel[1].lower() == "scratch"):
+                raise PolicyViolation(f"may not access {p}: audit logs and checkpoints are off limits (only a session's scratch folder is open)")
         roots = [r.resolve() for r in (self.write_roots if write else self.read_roots + self.write_roots)]
         if not any(p == r or r in p.parents for r in roots):
             kind = "write to" if write else "read"
@@ -121,7 +168,13 @@ class PolicyEngine:
 
     # ---- approvals
     def needs_approval(self, action_class: str | None) -> bool:
-        return bool(action_class) and action_class in self.approval_required
+        """Fails closed: a class that is not 'none' and not a known class is treated as risky."""
+        cls = normalize_action_class(action_class)
+        if cls is None:
+            return False
+        if cls in self.approval_required:
+            return True
+        return cls not in ACTION_CLASSES  # known classes a config deliberately left out stay ungated
 
 
 UNTRUSTED_NOTE = (
