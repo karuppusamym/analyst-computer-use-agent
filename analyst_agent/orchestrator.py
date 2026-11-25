@@ -214,7 +214,12 @@ class Orchestrator:
             missing = [k for k, spec in playbook.parameters.items() if spec.get("required", True) and k not in params and "default" not in spec]
             if missing:
                 # Let the planner read parameter values out of the request text.
-                plan = self.planner.plan(request, self.router.available_names(), playbook=playbook.to_dict(), knowledge=self._knowledge())
+                try:
+                    plan = self.planner.plan(request, self.router.available_names(), playbook=playbook.to_dict(), knowledge=self._knowledge())
+                except ModelError as e:
+                    # No model to read the request: ask for the values instead of failing.
+                    audit.event("planner_unavailable", error=str(e)[:500])
+                    return Plan([], [], [f"Please give a value for '{k}'" for k in missing], {}, "playbook")
                 params.update({k: v for k, v in plan.params.items() if k in playbook.parameters})
                 still = [k for k in missing if k not in params]
                 if still:
@@ -286,11 +291,25 @@ class Orchestrator:
         script = step.script or {}
         kind = script.get("kind", "python")
         ctx.audit.event("scripted_step", step=step.id, kind=kind)
-        if kind == "python":
-            out = run_python(script["code"], ctx)
-        elif kind == "tool":
-            out = tier.execute({"name": script["tool"], "input": script.get("input", {})}, ctx)
-        else:
-            out = ToolOutput(f"Error: unknown script kind {kind}", is_error=True)
+        try:
+            if kind == "python":
+                out = run_python(script["code"], ctx)
+            elif kind == "tool":
+                out = tier.execute({"name": script["tool"], "input": script.get("input", {})}, ctx)
+            elif kind == "tools":  # a fixed sequence of tool calls on one tier; stops at the first error
+                texts, written, failed = [], [], False
+                for call in script.get("calls", []):
+                    o = tier.execute({"name": call["tool"], "input": call.get("input", {})}, ctx)
+                    texts.append(f"{call['tool']}: {o.text}")
+                    written += o.files
+                    if o.is_error:
+                        failed = True
+                        break
+                out = ToolOutput("\n".join(texts), is_error=failed, files=written)
+            else:
+                out = ToolOutput(f"Error: unknown script kind {kind}", is_error=True)
+        except Exception as e:  # a policy refusal or tool crash fails the step; it never crashes the task
+            ctx.audit.event("scripted_step_error", step=step.id, error=f"{type(e).__name__}: {str(e)[:500]}")
+            out = ToolOutput(f"Error: {type(e).__name__}: {str(e)[:1000]}", is_error=True)
         files = list(out.files) + [c["path"] for c in step.checks if c.get("type") == "file_exists"]
         return StepRun("failed" if out.is_error else "done", redact(out.text, ctx.audit), files)

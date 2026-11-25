@@ -1,0 +1,160 @@
+{
+  "name": "duplicate-payments",
+  "version": 1,
+  "owner": "ap-operations",
+  "backup_owner": "internal-audit",
+  "approver": "ap-manager",
+  "workflow": "duplicate vendor payment detection recovery audit",
+  "description": "Find duplicate vendors in the vendor master (same tax id or bank account) and duplicate payments in a period (same vendor, invoice number and amount, including re-typed invoice numbers and payments to duplicate vendor records), total the amount to recover and draft the recovery list for the AP manager.",
+  "permissions": {
+    "data_class": "confidential",
+    "apps": [],
+    "hosts": []
+  },
+  "parameters": {
+    "period": {
+      "type": "string",
+      "required": true,
+      "description": "YYYY-MM"
+    },
+    "recipient": {
+      "type": "string",
+      "default": "ap-manager@example.com"
+    }
+  },
+  "steps": [
+    {
+      "id": "profile-inputs",
+      "intent": "Check the payment run export for {period} and the vendor master exist with the expected columns",
+      "tier": "code",
+      "script": {
+        "kind": "python",
+        "code": "import csv, json, os\nperiod = PARAMS['period']\nsrc = INPUT_DIRS[0]\nneed = {f'payments_{period}.csv': {'payment_id', 'vendor_id', 'invoice_ref', 'amount', 'paid_date'},\n        'vendor_master.csv': {'vendor_id', 'vendor_name', 'tax_id', 'bank_last4'}}\nprofile = {'ok': True, 'period': period, 'files': {}}\nfor name, cols in need.items():\n    p = os.path.join(src, name)\n    if not os.path.exists(p):\n        profile['ok'] = False; profile['files'][name] = 'missing'; continue\n    with open(p, newline='', encoding='utf-8-sig') as f:\n        r = csv.DictReader(f); rows = list(r)\n    missing = sorted(cols - set(r.fieldnames or []))\n    profile['files'][name] = {'rows': len(rows), 'missing_columns': missing}\n    if missing or not rows: profile['ok'] = False\nopen(os.path.join(OUTPUT_DIR, f'input_profile_payments_{period}.json'), 'w').write(json.dumps(profile, indent=1))\nprint(json.dumps(profile))\n"
+      },
+      "checks": [
+        {
+          "type": "file_exists",
+          "path": "output/input_profile_payments_{period}.json"
+        },
+        {
+          "type": "json_field_equals",
+          "path": "output/input_profile_payments_{period}.json",
+          "field": "ok",
+          "value": true
+        }
+      ]
+    },
+    {
+      "id": "duplicate-vendors",
+      "intent": "List vendor master records that share a tax id or bank account",
+      "tier": "code",
+      "script": {
+        "kind": "python",
+        "code": "import csv, json, os\nsrc = INPUT_DIRS[0]\nwith open(os.path.join(src, 'vendor_master.csv'), newline='', encoding='utf-8-sig') as f:\n    vendors = list(csv.DictReader(f))\npairs = []\nfor i, a in enumerate(vendors):\n    for b in vendors[i + 1:]:\n        if a['tax_id'] == b['tax_id']:\n            pairs.append([a['vendor_id'], b['vendor_id'], a['vendor_name'], b['vendor_name'], 'same_tax_id'])\n        elif a['bank_last4'] == b['bank_last4']:\n            pairs.append([a['vendor_id'], b['vendor_id'], a['vendor_name'], b['vendor_name'], 'same_bank_account'])\nwith open(os.path.join(OUTPUT_DIR, 'duplicate_vendors.csv'), 'w', newline='', encoding='utf-8') as f:\n    w = csv.writer(f); w.writerow(['vendor_id', 'duplicate_vendor_id', 'vendor_name', 'duplicate_name', 'reason']); w.writerows(pairs)\nsummary = {'vendors': len(vendors), 'duplicate_pairs': len(pairs), 'by_reason': {}}\nfor p in pairs: summary['by_reason'][p[4]] = summary['by_reason'].get(p[4], 0) + 1\nopen(os.path.join(OUTPUT_DIR, 'duplicate_vendors.json'), 'w').write(json.dumps(summary, indent=1))\nprint(json.dumps(summary))\n"
+      },
+      "checks": [
+        {
+          "type": "file_exists",
+          "path": "output/duplicate_vendors.csv"
+        },
+        {
+          "type": "csv_has_columns",
+          "path": "output/duplicate_vendors.csv",
+          "columns": [
+            "vendor_id",
+            "duplicate_vendor_id",
+            "reason"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "duplicate-payments",
+      "intent": "Find payments in {period} that pay the same invoice twice",
+      "tier": "code",
+      "script": {
+        "kind": "python",
+        "code": "import csv, json, os, re\nperiod = PARAMS['period']\nsrc = INPUT_DIRS[0]\nwith open(os.path.join(src, 'vendor_master.csv'), newline='', encoding='utf-8-sig') as f:\n    tax = {r['vendor_id']: r['tax_id'] for r in csv.DictReader(f)}\nwith open(os.path.join(src, f'payments_{period}.csv'), newline='', encoding='utf-8-sig') as f:\n    pays = sorted(csv.DictReader(f), key=lambda r: (r['paid_date'], r['payment_id']))\ngroups = {}\nfor p in pays:\n    # Same legal vendor (tax id), same invoice number ignoring punctuation and case, same amount.\n    key = (tax.get(p['vendor_id'], p['vendor_id']), re.sub(r'\\D', '', p['invoice_ref']), p['amount'])\n    groups.setdefault(key, []).append(p)\nout = []\nfor g in groups.values():\n    first = g[0]\n    for p in g[1:]:\n        if p['vendor_id'] != first['vendor_id']:\n            kind = 'cross_vendor'\n        elif p['invoice_ref'] == first['invoice_ref']:\n            kind = 'exact'\n        else:\n            kind = 'likely'\n        out.append([p['payment_id'], first['payment_id'], p['vendor_id'], first['vendor_id'], p['invoice_ref'], first['invoice_ref'], p['amount'], p['paid_date'], kind])\nout.sort()\nwith open(os.path.join(OUTPUT_DIR, f'duplicate_payments_{period}.csv'), 'w', newline='', encoding='utf-8') as f:\n    w = csv.writer(f)\n    w.writerow(['payment_id', 'original_payment_id', 'vendor_id', 'original_vendor_id', 'invoice_ref', 'original_invoice_ref', 'amount', 'paid_date', 'type'])\n    w.writerows(out)\nsummary = {'period': period, 'payments': len(pays), 'duplicate_payments': len(out), 'by_type': {},\n           'amount_at_risk': round(sum(float(r[6]) for r in out), 2)}\nfor r in out: summary['by_type'][r[8]] = summary['by_type'].get(r[8], 0) + 1\nopen(os.path.join(OUTPUT_DIR, f'duplicate_summary_{period}.json'), 'w').write(json.dumps(summary, indent=1))\nprint(json.dumps(summary))\n"
+      },
+      "checks": [
+        {
+          "type": "file_exists",
+          "path": "output/duplicate_payments_{period}.csv"
+        },
+        {
+          "type": "csv_has_columns",
+          "path": "output/duplicate_payments_{period}.csv",
+          "columns": [
+            "payment_id",
+            "original_payment_id",
+            "amount",
+            "type"
+          ]
+        },
+        {
+          "type": "file_exists",
+          "path": "output/duplicate_summary_{period}.json"
+        }
+      ]
+    },
+    {
+      "id": "write-note",
+      "intent": "Write the duplicate payment note for {period}",
+      "tier": "code",
+      "script": {
+        "kind": "python",
+        "code": "import json, os\nperiod = PARAMS['period']\ns = json.load(open(os.path.join(OUTPUT_DIR, f'duplicate_summary_{period}.json')))\nv = json.load(open(os.path.join(OUTPUT_DIR, 'duplicate_vendors.json')))\nlabels = {'exact': 'paid twice (same invoice number)', 'likely': 'invoice number typed differently', 'cross_vendor': 'paid to a duplicate vendor record'}\nlines = [f'# Duplicate payment review, {period}', '',\n         f\"{s['duplicate_payments']} likely duplicate payments out of {s['payments']}; {s['amount_at_risk']:,.2f} to recover.\", '']\nlines += [f'- {labels.get(k, k)}: {n}' for k, n in sorted(s['by_type'].items())]\nlines += ['', f\"Vendor master: {v['duplicate_pairs']} duplicate vendor pairs to merge or block (see duplicate_vendors.csv).\",\n          '', f'Details: duplicate_payments_{period}.csv']\nopen(os.path.join(OUTPUT_DIR, f'duplicate_note_{period}.md'), 'w', encoding='utf-8').write('\\n'.join(lines))\nprint('\\n'.join(lines))\n"
+      },
+      "checks": [
+        {
+          "type": "file_exists",
+          "path": "output/duplicate_note_{period}.md"
+        },
+        {
+          "type": "text_contains",
+          "path": "output/duplicate_note_{period}.md",
+          "text": [
+            "duplicate payments",
+            "to recover"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "draft-email",
+      "intent": "Draft an email to {recipient} with the recovery list",
+      "tier": "connector",
+      "approval": "required",
+      "action_class": "send",
+      "script": {
+        "kind": "tool",
+        "tool": "draft_email",
+        "input": {
+          "to": [
+            "{recipient}"
+          ],
+          "subject": "Duplicate payments to recover {period}",
+          "body": "Hi,\n\nThe duplicate payment review for {period} is attached, with the amount to recover and the duplicate vendor records to merge. Summary: duplicate_note_{period}.md.\n\nThis draft was prepared by the analyst agent and checked before sending.",
+          "attachments": [
+            "workspace/output/duplicate_payments_{period}.csv",
+            "workspace/output/duplicate_vendors.csv",
+            "workspace/output/duplicate_note_{period}.md"
+          ],
+          "name": "duplicates-email-{period}"
+        }
+      },
+      "checks": [
+        {
+          "type": "file_exists",
+          "path": "output/outbox/duplicates-email-{period}.eml"
+        }
+      ]
+    }
+  ],
+  "final_checks": [
+    {
+      "type": "file_exists",
+      "path": "output/duplicate_payments_{period}.csv"
+    }
+  ]
+}

@@ -245,7 +245,15 @@ class BrowserTier(Tier):
     def _download(self, inp: dict, ctx: ToolContext) -> ToolOutput:
         page = self._ensure(ctx)
         try:
-            el = self._locate(page, inp)
+            if inp.get("link_text") and not inp.get("ref"):
+                # Scripted replay passes ref "" and names the link by its exact visible text
+                # (refs are assigned per snapshot, so a recorded ref would be brittle).
+                loc = page.get_by_role("link", name=inp["link_text"], exact=True)
+                if loc.count() == 0:
+                    raise ValueError(f"no link named {inp['link_text']!r} on {page.url}")
+                el = loc.first
+            else:
+                el = self._locate(page, inp)
         except ValueError as e:
             return ToolOutput(f"Error: {e}", is_error=True)
         refusal = self._approve_if_risky(el, ctx, "click")

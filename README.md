@@ -105,9 +105,12 @@ python -m analyst_agent vault remove portal-pw
 ```
 
 - `run` without `--playbook` either matches a playbook from the request or has the planner build the steps. The planner needs the model.
+- `eval` runs `evals/tasks.json` (50 tasks: 5 per workflow for all 10 workflows, 3 tune / 2 holdout each, at least one safety task per workflow). Without a gateway token it runs offline: fully scripted playbooks run for real, and tasks that need the model are reported as `needs_model` (or `needs_tier` when a scripted tier such as the browser is missing) and left out of the pilot-gate math. `--split holdout` runs one split.
 - `--unattended` declines every approval and reports it. Nothing is ever auto-approved.
 - `--resume <session>` continues from the last checkpoint.
 - Each run writes its audit log, screenshots, checkpoint and a "what I checked" report to `workspace/audit/<session>/`. Outputs go to `workspace/output/`.
+
+Run `python samples/make_samples.py` to regenerate the sample data (ERP/CRM, budget and GL actuals, PO/receipt/invoice, payments and vendor master, customer master exports, and `warehouse.sqlite`). It is seeded and plants issues with known counts, so the eval graders assert exact numbers; the original pilot files come out byte-identical.
 
 ## Portal
 
@@ -159,7 +162,7 @@ python -m analyst_agent teach promote recon-taught --reviewer finance-team-lead
 ```
 
 - `from-session` reads a finished session's audit log and keeps only the verified steps. Scripted steps keep their script. A guided step whose tool calls can be replayed (`run_python`, connector calls, browser actions, UIA calls) becomes a scripted step; browser refs are turned into element descriptions (role + name, label, text). Pixel actions stay guided, with the recorded actions as hints. Values that repeat from the run's parameters or the request (e.g. `2026-10`) become `{period}`-style parameters. Checks carry over. A `provenance` block records the source session, `created_at` and `created_by`.
-- `record` opens a browser window (Playwright; it reports *unavailable* without it) on an allowlisted host (`policy.allowed_hosts`) and records clicks, fills, selects and navigations with robust targets (role + name, label, `data-testid`, then CSS). Close the window or press Ctrl+C to write the draft. Steps replay with the browser tier tools. Password fields are stored only as `{{secret:<field>}}`; the value never leaves the page, and the browser tier refuses to type a placeholder.
+- `record` opens a browser window (Playwright; it reports *unavailable* without it) on an allowlisted host (`policy.allowed_hosts`) and records clicks, fills, selects and navigations with robust targets (role + name, label, `data-testid`, then CSS). Close the window or press Ctrl+C to write the draft. Steps replay with the browser tier tools. Password fields are stored only as `{{secret:<field>}}`; the value never leaves the page. At replay the browser tier fills it from the credential vault (`vault set <field> --allow-host <host>`), and refuses if no allowed secret exists.
 - Drafts go to `playbooks/drafts/` with `"status": "draft"`. `playbooks`, `run` and matching never use a draft.
 - `promote` checks the schema and that every step has a tier and a check (or an explicit `no_check_reason`), declares every `{param}` it uses, then moves the draft into `playbooks/`, bumps the version and records the reviewer.
 
@@ -207,7 +210,7 @@ The guard is defense in depth. Audit hooks can be bypassed by native extension c
 
 Windows 11 Home has no Windows Sandbox, so the tests use local targets that are safe to drive:
 
-- `test_targets/portal.py`: a localhost web portal with report downloads, a submit form for approval tests, and a prompt-injection page.
+- `test_targets/portal.py`: a localhost web portal with report downloads, weekly KPI packs (`/kpi`), a submit form for approval tests, and prompt-injection text (`/evil`, and a notice on `/kpi`).
 - `test_targets/legacy_app.py`: the "Legacy Ledger - TEST" tkinter window for the pixel tier.
 - **Pixel tier guard:** every click or keystroke is refused unless the window in front matches `allowed_window_titles` or an allowed app. It can only act on the test app, and refusals are logged. `--dry-run-desktop` logs actions without sending them.
 - **Mock model:** a scripted model client tests the planner, executor and verifier loop without a gateway.
@@ -222,7 +225,9 @@ To include the live desktop tests, set the variable first. They move the mouse f
 $env:RUN_DESKTOP_TESTS = "1"
 ```
 
-Current result: see the end of the Testing section (updated after all branches merge).
+Current result: **183 tests**. Without `RUN_DESKTOP_TESTS`, 179 pass and 4 skip: the 3 live desktop tests, plus the clipboard test when the clipboard is empty. The offline eval run passes all 44 graded tasks and skips 6 (4 `needs_model`, 2 `needs_tier` for the pixel tier).
+
+The live desktop end-to-end test runs playbook → approval → router → executor → real pixel tier → test app → verifier.
 
 ## Layout
 
@@ -238,9 +243,12 @@ analyst_agent/
   teach.py      teach mode: drafts from sessions, browser recorder, promote
   scheduler.py  cron parser, schedules, unattended run-due
   portal/       web portal: server, views, auth (local / SSO header / OIDC), WebApprover inbox, runs, playbook review
-playbooks/      4 pilot playbooks (reconciliation, warehouse question, portal download, legacy entry); drafts/ for teach-mode drafts
 config/schedules.json  schedule definitions (an example, disabled)
-evals/tasks.json  eval set with graders, tune/holdout split
+playbooks/      10 pilot playbooks (drafts/ holds teach-mode drafts): ERP/CRM reconciliation, warehouse region question, portal report download,
+                legacy ledger entry, budget-vs-actuals variance, three-way match, churn cohorts,
+                duplicate payments, data-quality check, weekly KPI summary (scripted browser tier)
+evals/tasks.json  50 eval tasks (5 per workflow) with exact-output graders, tune/holdout split, safety tasks
+samples/        seeded sample data + make_samples.py (planted issues with known counts)
 knowledge/      team knowledge injected into the planner
 test_targets/   local portal + Legacy Ledger test app
 tests/          unit, integration and live desktop tests
@@ -255,5 +263,5 @@ tests/          unit, integration and live desktop tests
   - Every signed-in user can see every session.
 - **Later-phase features:** a Guacamole/noVNC interactive desktop is still a Phase 3 item. The credential vault is local only (DPAPI, env or keyring). There is no central secret store, rotation or per-user sharing yet.
 - **Teach recorder:** records the first tab only and has been tested by driving the page in code, not with a person clicking in a headed window.
-- **Two eval tasks per workflow** for two workflows. The design calls for five per workflow across all ten.
 - **The code tier is contained, not sandboxed.** The Job Object and the audit-hook guard limit it, but they are not an isolation boundary. Production needs the disposable per-task VM or container from the design, with network egress blocked there, since Windows Home can't block network per process without the firewall.
+- **Evals with a real model.** All 10 workflows have 5 eval tasks each, but offline only the scripted ones run: the 4 guided portal-download tasks need the model, and the 2 approved legacy-ledger entries need the model plus the pixel tier. Their graders have not been run.

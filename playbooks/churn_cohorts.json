@@ -1,0 +1,98 @@
+{
+  "name": "churn-cohorts",
+  "version": 1,
+  "owner": "customer-analytics",
+  "backup_owner": "sales-analytics",
+  "workflow": "customer churn retention cohort table signup month warehouse",
+  "description": "Build a customer retention cohort table from the warehouse: customers per signup month and how many are still active 1, 2 and 3 months later, excluding internal test accounts, plus a short summary.",
+  "permissions": {
+    "data_class": "internal"
+  },
+  "parameters": {
+    "start_month": {
+      "type": "string",
+      "required": true,
+      "description": "first signup month, YYYY-MM"
+    },
+    "end_month": {
+      "type": "string",
+      "required": true,
+      "description": "last signup month, YYYY-MM, inclusive"
+    },
+    "region": {
+      "type": "string",
+      "default": "all",
+      "description": "North, South, East, West or all"
+    },
+    "label": {
+      "type": "string",
+      "default": "range",
+      "description": "short name used in the output file names"
+    }
+  },
+  "steps": [
+    {
+      "id": "query-cohorts",
+      "intent": "Pull signup cohorts {start_month} to {end_month} (region {region}) with month 1-3 retention",
+      "tier": "connector",
+      "script": {
+        "kind": "tool",
+        "tool": "sql_query",
+        "input": {
+          "database": "warehouse",
+          "sql": "with c as (select signup_month, case when churn_month is null then 999 else (cast(substr(churn_month, 1, 4) as integer) * 12 + cast(substr(churn_month, 6, 2) as integer)) - (cast(substr(signup_month, 1, 4) as integer) * 12 + cast(substr(signup_month, 6, 2) as integer)) end as churn_offset from customers where plan <> 'internal_test' and signup_month between '{start_month}' and '{end_month}' and ('{region}' = 'all' or region = '{region}')) select signup_month as cohort_month, count(*) as customers, sum(churn_offset > 1) as retained_m1, sum(churn_offset > 2) as retained_m2, sum(churn_offset > 3) as retained_m3, round(100.0 * sum(churn_offset > 3) / count(*), 1) as retention_m3_pct from c group by signup_month order by signup_month",
+          "save_to": "workspace/output/cohort_{label}.csv"
+        }
+      },
+      "checks": [
+        {
+          "type": "file_exists",
+          "path": "output/cohort_{label}.csv"
+        },
+        {
+          "type": "csv_has_columns",
+          "path": "output/cohort_{label}.csv",
+          "columns": [
+            "cohort_month",
+            "customers",
+            "retained_m1",
+            "retained_m2",
+            "retained_m3",
+            "retention_m3_pct"
+          ]
+        },
+        {
+          "type": "csv_rows",
+          "path": "output/cohort_{label}.csv",
+          "min": 1,
+          "max": 24
+        }
+      ]
+    },
+    {
+      "id": "summarise",
+      "intent": "Summarise overall month-3 retention and the weakest cohort",
+      "tier": "code",
+      "script": {
+        "kind": "python",
+        "code": "import csv, json, os\nlabel = PARAMS.get('label', 'range')\nwith open(os.path.join(OUTPUT_DIR, f'cohort_{label}.csv'), newline='', encoding='utf-8') as f:\n    rows = list(csv.DictReader(f))\ncustomers = sum(int(r['customers']) for r in rows)\nretained = sum(int(r['retained_m3']) for r in rows)\nworst = min(rows, key=lambda r: float(r['retention_m3_pct'])) if rows else None\nsummary = {'label': label, 'region': PARAMS.get('region', 'all'), 'cohorts': len(rows), 'customers': customers, 'retained_m3': retained,\n           'retention_m3_pct': round(100.0 * retained / customers, 1) if customers else None,\n           'worst_cohort': worst['cohort_month'] if worst else None}\nopen(os.path.join(OUTPUT_DIR, f'cohort_summary_{label}.json'), 'w').write(json.dumps(summary, indent=1))\nlines = [f\"# Churn cohorts {PARAMS['start_month']} to {PARAMS['end_month']} (region: {summary['region']})\", '',\n         f\"{summary['cohorts']} cohorts, {customers} customers; {summary['retention_m3_pct']}% still active three months after signup.\",\n         f\"Weakest cohort: {summary['worst_cohort']}.\", '', 'Internal test accounts are excluded.']\nopen(os.path.join(OUTPUT_DIR, f'cohort_note_{label}.md'), 'w', encoding='utf-8').write('\\n'.join(lines))\nprint(json.dumps(summary))\n"
+      },
+      "checks": [
+        {
+          "type": "file_exists",
+          "path": "output/cohort_summary_{label}.json"
+        },
+        {
+          "type": "file_exists",
+          "path": "output/cohort_note_{label}.md"
+        }
+      ]
+    }
+  ],
+  "final_checks": [
+    {
+      "type": "file_exists",
+      "path": "output/cohort_{label}.csv"
+    }
+  ]
+}
