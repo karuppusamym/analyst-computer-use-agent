@@ -145,6 +145,10 @@ class _Keep(dict):
 
 def _fill(obj: Any, values: dict) -> Any:
     if isinstance(obj, str):
+        whole = re.fullmatch(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", obj)
+        if whole and isinstance(values.get(whole.group(1)), (list, tuple)):
+            return [str(x) for x in values[whole.group(1)]]  # a list parameter fills a whole field as a list
+
         # Only replace {name} tokens that are known parameters; leave code braces alone.
         def sub(m: re.Match) -> str:
             key = m.group(1)
