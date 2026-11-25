@@ -17,6 +17,7 @@ import sys
 import time
 
 from ..policy import PolicyViolation
+from ..vault import has_placeholder, resolve_secrets
 from . import screen_win as sw
 from .base import Tier, ToolContext, ToolOutput
 
@@ -166,7 +167,15 @@ class ComputerTier(Tier):
         elif member == "scroll":
             sw.scroll(coord[0], coord[1], inp.get("scroll_direction", "down"), int(inp.get("scroll_amount", 3)), mods)
         elif member == "type":
-            sw.type_text(inp.get("text", ""))
+            text = inp.get("text", "")
+            if has_placeholder(text):
+                # The guard already checked the foreground window against the policy; the
+                # secret must also allow this exe or title. Re-read it right before typing.
+                ok, msg, (title, exe) = self._guard(ctx)
+                if not ok:
+                    return ToolOutput(msg, is_error=True)
+                text = resolve_secrets(text, ctx, tool="computer.type", app=exe, window=title)
+            sw.type_text(text)
         elif member == "key":
             sw.key_combo(inp["text"], int(inp.get("repeat", 1)))
         elif member == "hold_key":

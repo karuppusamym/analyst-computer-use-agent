@@ -67,6 +67,11 @@ python -m analyst_agent eval
 ```powershell
 python -m analyst_agent stop <session-id>
 ```
+```powershell
+python -m analyst_agent vault set portal-pw --allow-host portal.example.com
+python -m analyst_agent vault list
+python -m analyst_agent vault remove portal-pw
+```
 
 - `run` without `--playbook` either matches a playbook from the request or has the planner build the steps. The planner needs the model.
 - `--unattended` declines every approval and reports it. Nothing is ever auto-approved.
@@ -74,6 +79,23 @@ python -m analyst_agent stop <session-id>
 - Each run writes its audit log, screenshots, checkpoint and a "what I checked" report to `workspace/audit/<session>/`. Outputs go to `workspace/output/`.
 
 Run `python samples/make_samples.py` to regenerate the sample ERP/CRM exports and `warehouse.sqlite`.
+
+### Credentials (`vault`)
+
+- `vault set` prompts for the value twice (getpass); it is never read from the command line. `--allow-host` (browser) and `--allow-app` (exe or window title, for the desktop tiers) are repeatable fnmatch patterns. A secret with no allowlist cannot be used.
+- Backends, set by `vault.backend` in the config: `dpapi` (default) uses Windows DPAPI for the current user via ctypes and stores `workspace/vault/vault.json`. The allowlists are bound into the encryption entropy, so editing them in the file breaks decryption. `env` is read-only: `AGENT_SECRET_<NAME>` plus `AGENT_SECRET_<NAME>__HOSTS` / `__APPS`. `keyring` works only if that package is installed.
+- Playbook steps and the model refer to secrets as `{{secret:name}}`. Only `browser_fill`, the pixel tier's `type` and `uia_set_text` resolve them, at the moment of typing, and only when the target host or window is on both the secret's allowlist and the policy allowlist.
+- Values are replaced with `[REDACTED:name]` in audit events, tool results sent to the model, reports and checkpoints. The audit log records `secret_used` (name, target, step) without the value. Browser snapshots mask password fields.
+- **Limit:** screenshots are not redacted. A secret typed into a visible plain-text field can appear in a screenshot.
+
+### Code tier containment
+
+`run_python` starts `python -I -B -X utf8` with an allowlisted environment: SYSTEMROOT, a minimal PATH, and TEMP/HOME inside the workdir. No tokens or secrets are passed. The user site-packages folder is added back so `pip --user` installs of pandas and openpyxl still work. Two layers apply:
+
+1. **Windows Job Object** (`tools/sandbox.py`): the process is created suspended, assigned to the job, then resumed. Limits: kill on job close, `memory_mb` (default 1024), `max_processes` (default 1, so no child processes), `cpu_s` (default `timeout_s`), and UI restrictions (desktop, clipboard, global atoms, handles, system parameters, ExitWindows). Other platforms use `setrlimit`.
+2. **Audit-hook guard** (`tools/_sandbox_guard.py`): blocks network (unless `allow_network`), subprocess/`os.system`/exec/spawn/startfile, ctypes called from task code, and writes outside the workdir and `OUTPUT_DIR`. Reads are limited to `INPUT_DIRS` (read-only; sqlite files there open read-only), the workdir, `OUTPUT_DIR` and the Python install. The vault and audit folders are always refused.
+
+The guard is defense in depth. Audit hooks can be bypassed by native extension code or crafted bytecode, and the Job Object limits resources, not file or network access. **Production still needs the disposable per-task VM or container.**
 
 ## Testing on this PC without a VM
 
@@ -94,7 +116,7 @@ To include the live desktop tests, set the variable first. They move the mouse f
 $env:RUN_DESKTOP_TESTS = "1"
 ```
 
-Current result: **55 tests pass**, including the live desktop end-to-end test. That test runs playbook → approval → router → executor → real pixel tier → test app → verifier.
+Current result: **92 tests**. Without `RUN_DESKTOP_TESTS`, 88 pass and 4 skip: the 3 live desktop tests, plus the clipboard test when the clipboard is empty. The baseline's 55 tests passed with the live desktop end-to-end test included. That test runs playbook → approval → router → executor → real pixel tier → test app → verifier.
 
 ## Layout
 
@@ -104,7 +126,8 @@ analyst_agent/
   agents.py     planner, executor (computer batch rules, act-then-look, context resets), verifier
   orchestrator.py  clarify → plan → approve → steps → verify → checkpoint → recover → report
   router.py     tier selection and fallbacks
-  tools/        connectors, code, browser, desktop_uia, computer (+ screen_win ctypes)
+  tools/        connectors, code (+ sandbox Job Object, _sandbox_guard audit hook), browser, desktop_uia, computer (+ screen_win ctypes)
+  vault.py      credential vault (DPAPI / env / keyring), {{secret:name}} resolution
   playbook.py checks.py policy.py audit.py checkpoint.py report.py evals.py gateway_check.py
 playbooks/      4 pilot playbooks (reconciliation, warehouse question, portal download, legacy entry)
 evals/tasks.json  eval set with graders, tune/holdout split
@@ -117,6 +140,6 @@ tests/          unit, integration and live desktop tests
 
 - **Not tested against a real model.** No gateway token was available here, so every model call is mocked. Run `gateway-check` first, then `eval`, on your gateway.
 - **No portal UI yet.** There are no web screens for task chat, live view, the approval inbox or playbook review; the console stands in for them.
-- **Later-phase features:** teach mode recording, schedules, SSO, the credential vault and Guacamole/noVNC live view are Phase 3 items in the design.
+- **Later-phase features:** teach mode recording, schedules, SSO and Guacamole/noVNC live view are Phase 3 items in the design. The credential vault is local only (DPAPI, env or keyring). There is no central secret store, rotation or per-user sharing yet.
 - **Two eval tasks per workflow** for two workflows. The design calls for five per workflow across all ten.
-- **The code tier is not a sandbox on its own.** Production needs the disposable per-task VM or container from the design.
+- **The code tier is contained, not sandboxed.** The Job Object and the audit-hook guard limit it, but they are not an isolation boundary. Production needs the disposable per-task VM or container from the design, with network egress blocked there, since Windows Home can't block network per process without the firewall.

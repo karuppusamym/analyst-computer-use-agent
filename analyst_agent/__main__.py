@@ -7,6 +7,8 @@
   python -m analyst_agent run "Q3 churn by region?"            (planner builds the steps; needs the model)
   python -m analyst_agent eval [--split holdout]
   python -m analyst_agent stop <session-id>                     (kill switch)
+  python -m analyst_agent vault set <name> --allow-host h       (value is prompted, never on argv)
+  python -m analyst_agent vault list | vault remove <name>
 """
 
 from __future__ import annotations
@@ -68,6 +70,9 @@ def main(argv: list[str] | None = None) -> int:
     ev.add_argument("--tasks", default=str(ROOT / "evals" / "tasks.json"))
     st = sub.add_parser("stop", help="kill switch for a running session")
     st.add_argument("session")
+    from .vault import add_cli as _add_vault_cli
+
+    _add_vault_cli(sub)
     args = ap.parse_args(argv)
 
     s = _settings(args)
@@ -86,6 +91,10 @@ def main(argv: list[str] | None = None) -> int:
         for pb in registry.all():
             print(f"{pb.name:<28} v{pb.version}  owner={pb.owner:<18} steps={len(pb.steps)}  params={list(pb.parameters)}")
         return 0
+    if args.cmd == "vault":
+        from .vault import run_cli
+
+        return run_cli(args, s)
     if args.cmd == "stop":
         d = s.audit_dir / args.session
         if not d.exists():

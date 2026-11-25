@@ -11,6 +11,7 @@ import os
 import re
 
 from ..policy import ApprovalRequest, PolicyViolation, wrap_untrusted
+from ..vault import has_placeholder, resolve_secrets
 from .base import Tier, Tool, ToolContext, ToolOutput, schema
 
 RISKY = re.compile(r"\b(submit|send|pay|delete|remove|confirm|place order|purchase|transfer|sign)\b", re.I)
@@ -126,7 +127,11 @@ class UiaTier(Tier):
     def _set_text(self, inp: dict, ctx: ToolContext) -> ToolOutput:
         win = self._window(inp["window"], ctx)
         ctl = self._control(win, inp)
-        ctl.set_edit_text(inp["text"])
+        text = inp["text"]
+        if has_placeholder(text):
+            # _window() already checked the process against the policy app allowlist.
+            text = resolve_secrets(text, ctx, tool="uia_set_text", app=self._proc_name(win), window=win.window_text() or inp["window"])
+        ctl.set_edit_text(text)
         ctx.audit.event("uia_action", step=ctx.step_id, action="set_text", window=inp["window"], control=ctl.element_info.name, chars=len(inp["text"]))
         return ToolOutput("text set")
 

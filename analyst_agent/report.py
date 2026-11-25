@@ -57,7 +57,9 @@ def write_report(result: "TaskResult", request: str, settings: "Settings", audit
         lines += ["## Not done", ""] + [f"- {r.step.intent}: {r.summary[:400] or r.status}" for r in not_done] + [""]
     if result.questions:
         lines += ["## Questions for you", ""] + [f"- {q}" for q in result.questions] + [""]
-    text = "\n".join(lines)
+    from .audit import redact
+
+    text = redact("\n".join(lines), audit)  # vault values -> [REDACTED:name]
     path = audit.dir / "report.md"
     path.write_text(text, encoding="utf-8")
     settings.output_dir.mkdir(parents=True, exist_ok=True)
