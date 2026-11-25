@@ -12,6 +12,7 @@ import re
 from pathlib import Path
 
 from ..policy import ApprovalRequest, PolicyViolation, wrap_untrusted
+from ..vault import has_placeholder, resolve_secrets
 from .base import Tier, Tool, ToolContext, ToolOutput, schema
 
 RISKY = re.compile(r"\b(submit|send|pay|delete|remove|confirm|place order|purchase|transfer|sign)\b", re.I)
@@ -37,7 +38,8 @@ _SNAPSHOT_JS = r"""
     }
     const name = (label || el.innerText || el.value || el.getAttribute('placeholder') || el.getAttribute('name') || el.getAttribute('title') || '').trim().slice(0, 120);
     out.push({ref, tag: el.tagName.toLowerCase(), role: el.getAttribute('role') || el.type || '', name,
-               value: (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') ? String(el.value).slice(0, 120) : '',
+               value: el.type === 'password' ? (el.value ? '********' : '') :
+                      (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') ? String(el.value).slice(0, 120) : '',
                href: el.getAttribute('href') || ''});
   }
   return {title: document.title, url: location.href, elements: out, text: (document.body ? document.body.innerText : '')};
@@ -186,8 +188,12 @@ class BrowserTier(Tier):
             el = self._element(page, inp["ref"])
         except ValueError as e:
             return ToolOutput(f"Error: {e}", is_error=True)
-        el.fill(inp["text"])
-        ctx.audit.event("browser_action", step=ctx.step_id, action="fill", ref=inp["ref"], chars=len(inp["text"]))
+        text = inp["text"]
+        if has_placeholder(text):
+            # Resolve at the last moment, for this page's host only; the value never leaves this frame.
+            text = resolve_secrets(text, ctx, tool="browser_fill", url=page.url)
+        el.fill(text)
+        ctx.audit.event("browser_action", step=ctx.step_id, action="fill", ref=inp["ref"], chars=len(inp["text"]), secret=text is not inp["text"])
         return ToolOutput(f"filled {inp['ref']}")
 
     def _select(self, inp: dict, ctx: ToolContext) -> ToolOutput:

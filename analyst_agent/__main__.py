@@ -9,6 +9,8 @@
   python -m analyst_agent stop <session-id>                     (kill switch)
   python -m analyst_agent portal [--host 127.0.0.1] [--port 8765] (web portal)
   python -m analyst_agent portal-user add <name> --role analyst|reviewer|admin
+  python -m analyst_agent vault set <name> --allow-host h       (value is prompted, never on argv)
+  python -m analyst_agent vault list | vault remove <name>
 """
 
 from __future__ import annotations
@@ -73,6 +75,10 @@ def main(argv: list[str] | None = None) -> int:
     from .portal.cli import add_parsers as _portal_parsers
 
     _portal_parsers(sub)
+
+    from .vault import add_cli as _add_vault_cli
+
+    _add_vault_cli(sub)
     args = ap.parse_args(argv)
 
     s = _settings(args)
@@ -91,6 +97,10 @@ def main(argv: list[str] | None = None) -> int:
         for pb in registry.all():
             print(f"{pb.name:<28} v{pb.version}  owner={pb.owner:<18} steps={len(pb.steps)}  params={list(pb.parameters)}")
         return 0
+    if args.cmd == "vault":
+        from .vault import run_cli
+
+        return run_cli(args, s)
     if args.cmd == "stop":
         d = s.audit_dir / args.session
         if not d.exists():

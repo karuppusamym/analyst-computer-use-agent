@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .audit import redact
 from .checks import CheckOutcome, run_deterministic
 from .model import ModelClient
 from .playbook import TIERS, Step
@@ -265,6 +266,7 @@ class Executor:
                     out = tier.execute(block, ctx)
                 except Exception as e:  # a crashing tool is an error result, not a crashed task
                     out = ToolOutput(f"Error: {type(e).__name__}: {e}", is_error=True)
+            out.text = redact(out.text, ctx.audit)  # vault values never go back to the model
             ctx.audit.event("tool_call", step=ctx.step_id, tool=block.get("name"), input=block.get("input"), is_error=out.is_error, output=out.text[:3000], files=out.files)
             for img in out.images:
                 ctx.audit.save_image(img, block.get("name", "img"))

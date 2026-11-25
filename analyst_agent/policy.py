@@ -91,6 +91,8 @@ class PolicyEngine:
         self.write_roots = [settings.workspace_root, settings.output_dir]
         self.data_class = perms.get("data_class", "internal")
         self.base_dir = settings.base_dir
+        # The vault folder is never readable or writable through file tools.
+        self.deny_roots = [settings.path(settings.data.get("vault", {}).get("path", "./workspace/vault"))]
 
     # ---- allowlists
     def check_url(self, url: str) -> None:
@@ -107,6 +109,8 @@ class PolicyEngine:
     def check_path(self, path: str | Path, write: bool = False) -> Path:
         p = Path(path)
         p = (p if p.is_absolute() else self.base_dir / p).resolve()
+        if any(p == d or d in p.parents for d in self.deny_roots):
+            raise PolicyViolation(f"may not access {p}: the credential vault folder is off limits")
         roots = self.write_roots if write else self.read_roots + self.write_roots
         if not any(p == r or r in p.parents for r in roots):
             kind = "write to" if write else "read"

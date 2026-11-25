@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Callable
 
 from .agents import Executor, Plan, Planner, StepRun, Verdict, Verifier
-from .audit import AuditLog
+from .audit import AuditLog, redact
 from .checkpoint import CheckpointStore
 from .config import Settings
 from .model import ModelClient, ModelError
@@ -157,7 +157,7 @@ class Orchestrator:
             self._run_step(rec, records, ctx, policy, audit, approvals, deadline)
             if rec.status == "verified":
                 done_ids.add(rec.step.id)
-                checkpoints.save({"request": request, "verified_steps": sorted(done_ids), "params": params, "files": [f for r in records for f in r.files]})
+                checkpoints.save(redact({"request": request, "verified_steps": sorted(done_ids), "params": params, "files": [f for r in records for f in r.files]}, audit))
                 continue
             if rec.status in ("rejected", "skipped"):
                 continue  # a declined action is reported, never forced
@@ -288,4 +288,4 @@ class Orchestrator:
         else:
             out = ToolOutput(f"Error: unknown script kind {kind}", is_error=True)
         files = list(out.files) + [c["path"] for c in step.checks if c.get("type") == "file_exists"]
-        return StepRun("failed" if out.is_error else "done", out.text, files)
+        return StepRun("failed" if out.is_error else "done", redact(out.text, ctx.audit), files)

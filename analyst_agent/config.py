@@ -51,7 +51,9 @@ DEFAULTS: dict[str, Any] = {
     },
     "tiers": {
         "connector": {"enabled": True},
-        "code": {"enabled": True, "timeout_s": 300},
+        # Code tier containment (see tools/code.py, tools/sandbox.py). cpu_s null = timeout_s.
+        "code": {"enabled": True, "timeout_s": 300, "memory_mb": 1024, "max_processes": 1, "cpu_s": None,
+                 "allow_network": False, "python_guard": True, "ui_restrictions": True, "require_job": True},
         "browser": {"enabled": True, "headless": True},
         "desktop_uia": {"enabled": False},
         # Pixel control drives a real mouse and keyboard. Only enable it inside
@@ -96,6 +98,8 @@ DEFAULTS: dict[str, Any] = {
                      "username_claim": "preferred_username", "groups_claim": "groups", "user_roles": {}, "group_roles": {}, "default_role": "analyst"},
         },
     },
+    # Credential vault (vault.py). backend: "dpapi" (Windows, current user), "env" (read-only), "keyring" (if installed).
+    "vault": {"backend": "dpapi", "path": "./workspace/vault", "env_prefix": "AGENT_SECRET_", "entropy_env": ""},
 }
 
 
