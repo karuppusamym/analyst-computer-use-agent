@@ -369,6 +369,17 @@ class FailClosedTests(FakeDockerBase):
         self.assertEqual(self.run_calls(), [])
         self.assertFalse((self.s.output_dir / "x.txt").exists())
 
+    def test_windows_containers_daemon_fails_closed(self):
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"FAKE_DOCKER_MODE": "windows"}):
+            out = run_python("print(1)", self.ctx)
+        self.assertTrue(out.is_error)
+        self.assertIn("Linux-containers daemon", out.text)
+        self.assertIn("nothing was run", out.text)
+        self.assertEqual(self.run_calls(), [])
+
     def test_cli_missing_fails_closed(self):
         self.s.data["tiers"]["code"]["docker_cli"] = str(self.ws.root / "no" / "docker.exe")
         out = run_python("print(1)", self.ctx)
@@ -439,7 +450,9 @@ def _docker_up() -> bool:
     if not exe:
         return False
     try:
-        return subprocess.run([exe, "info"], capture_output=True, timeout=30).returncode == 0
+        r = subprocess.run([exe, "version", "--format", "{{.Server.Os}}"], capture_output=True, text=True, timeout=30)
+        # GitHub's windows runners have a Windows-containers daemon; the Linux image can't run there.
+        return r.returncode == 0 and r.stdout.strip().lower() == "linux"
     except Exception:
         return False
 
@@ -447,7 +460,7 @@ def _docker_up() -> bool:
 LIVE = _docker_up()
 
 
-@unittest.skipUnless(LIVE, "docker daemon not reachable (`docker info` failed)")
+@unittest.skipUnless(LIVE, "no Linux-containers docker daemon reachable")
 class LiveDockerTests(unittest.TestCase):
     extra: dict = {}
 
@@ -482,7 +495,7 @@ class LiveDockerTests(unittest.TestCase):
         self.assertLess(time.time() - t, 60)
 
 
-@unittest.skipUnless(LIVE, "docker daemon not reachable (`docker info` failed)")
+@unittest.skipUnless(LIVE, "no Linux-containers docker daemon reachable")
 class LiveDockerNoGuardTests(LiveDockerTests):
     """With the Python guard off, the container itself must still hold."""
 

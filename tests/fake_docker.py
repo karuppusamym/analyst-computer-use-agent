@@ -2,6 +2,7 @@
 
 Every call is appended to $FAKE_DOCKER_STATE/calls.jsonl. Behaviour:
 - FAKE_DOCKER_MODE=down     `version` fails like an unreachable daemon
+- FAKE_DOCKER_MODE=windows  the daemon runs Windows containers
 - FAKE_DOCKER_MODE=noimage  `image inspect` fails until `pull` has run
 - FAKE_DOCKER_MODE=pullfail `image inspect` and `pull` fail
 - `run`: parses --name and --mount, then execs $FAKE_DOCKER_RUN_SCRIPT (if set)
@@ -26,7 +27,7 @@ if cmd == "version":
     if mode == "down":
         sys.stderr.write("error during connect: open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specified.\n")
         sys.exit(1)
-    print("28.5.2")
+    print("28.5.2 windows" if mode == "windows" else "28.5.2 linux")
 elif cmd == "image":
     if mode == "pullfail" or (mode == "noimage" and not (state / "pulled").exists()):
         sys.stderr.write("Error: No such image\n")

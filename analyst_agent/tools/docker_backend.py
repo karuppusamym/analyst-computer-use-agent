@@ -266,14 +266,20 @@ def check(cfg: DockerConfig, check_image: bool = True) -> DockerStatus:
         st.errors.append(f"docker CLI not found ({cfg.cli[0]!r}; set tiers.code.docker_cli)")
         return st
     try:
-        r = _control(cfg, ["version", "--format", "{{.Server.Version}}"])
+        r = _control(cfg, ["version", "--format", "{{.Server.Version}} {{.Server.Os}}"])
     except (OSError, subprocess.TimeoutExpired) as e:
         st.errors.append(f"docker daemon not reachable: {e}")
         return st
     if r.returncode != 0 or not r.stdout.strip():
         st.errors.append(f"docker daemon not reachable: {_first_line(r.stderr) or f'exit code {r.returncode}'}")
         return st
-    st.daemon = r.stdout.strip()
+    version, _, os_type = r.stdout.strip().partition(" ")
+    if os_type and os_type.strip().lower() != "linux":
+        # A Windows-containers daemon (Docker Desktop switched to Windows containers, or a
+        # Windows Server engine) cannot run the Linux python image; say so rather than fail at pull.
+        st.errors.append(f"docker daemon runs {os_type.strip()} containers; the code tier needs a Linux-containers daemon")
+        return st
+    st.daemon = version
     if check_image:
         try:
             r = _control(cfg, ["image", "inspect", "--format", "{{.Id}}", cfg.image])

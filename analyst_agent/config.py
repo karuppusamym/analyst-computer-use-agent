@@ -143,8 +143,10 @@ class Settings:
         return self.data[key]
 
     def path(self, value: str) -> Path:
+        # Always resolve: on Windows a temp or profile path can arrive as an 8.3 short name
+        # (C:\Users\RUNNER~1\...), and containment checks compare resolved long names.
         p = Path(value)
-        return p if p.is_absolute() else (self.base_dir / p).resolve()
+        return (p if p.is_absolute() else self.base_dir / p).resolve()
 
     @property
     def workspace_root(self) -> Path:
