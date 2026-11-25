@@ -23,6 +23,7 @@ from .playbook import Playbook, Step
 from .policy import ApprovalRequest, Approver, ConsoleApprover, PolicyEngine
 from .report import write_report
 from .router import RouteError, Router
+from .takeover import HUMAN_KINDS, PAUSE_FILE, human_note, pause_info
 from .tools.base import ToolContext, ToolOutput
 from .tools.code import run_python
 
@@ -74,6 +75,9 @@ class Orchestrator:
         self.require_plan_approval = require_plan_approval
         self.planner = Planner(self.client)
         self.verifier = Verifier(self.client)
+        self.pause_poll_s = 0.25
+        self._human_note = ""
+        self._pause_end = ""
 
     # ------------------------------------------------------------------ helpers
     def _knowledge(self) -> str:
@@ -91,11 +95,53 @@ class Orchestrator:
     def _stop_requested(self, audit: AuditLog) -> bool:
         return (audit.dir / "STOP").exists() or (self.settings.workspace_root / "STOP").exists()
 
+    # ------------------------------------------------------------------ human takeover (PAUSE file)
+    def _wait_if_paused(self, audit: AuditLog, step_id: str = "") -> bool:
+        """Block while a human holds this session (PAUSE file). Like STOP, but resumable.
+
+        Returns False when the run must stop instead (kill switch, or no hand-back within
+        limits.takeover_timeout_s); self._pause_end says why. On hand-back the human's
+        audited actions become a note for the executor's next turn (self._human_note)."""
+        if not (audit.dir / PAUSE_FILE).exists():
+            return True
+        info = pause_info(audit.dir) or {}
+        start = audit.event("takeover_paused", step=step_id, by=info.get("by"))
+        limit = float(self.settings["limits"].get("takeover_timeout_s", 1800))
+        t0 = time.time()
+        while (audit.dir / PAUSE_FILE).exists():
+            if self._stop_requested(audit):
+                self._pause_end = "stopped by kill switch"
+                audit.event("takeover_wait_ended", step=step_id, reason="kill switch")
+                return False
+            if time.time() - t0 > limit:
+                self._pause_end = f"stopped: human takeover was not handed back within {int(limit)} s"
+                audit.event("takeover_timeout", step=step_id, by=info.get("by"), waited_s=round(time.time() - t0, 1))
+                return False
+            time.sleep(self.pause_poll_s)
+        after = [e for e in audit.events() if int(e.get("seq", 0) or 0) > int(start.get("seq", 0))]
+        actions = [e for e in after if e.get("kind") in HUMAN_KINDS]
+        ended_by = next((e.get("by") for e in reversed(after) if e.get("kind") == "takeover_ended"), None)
+        note = human_note(after, str(info.get("by") or ""))
+        self._human_note = note if not self._human_note else self._human_note + "\n\n" + note
+        audit.event("takeover_resumed", step=step_id, by=info.get("by"), handed_back_by=ended_by, human_actions=sum(1 for e in actions if e["kind"] == "human_action"),
+                    human_refused=sum(1 for e in actions if e["kind"] == "human_action_refused"), paused_s=round(time.time() - t0, 1))
+        return True
+
+    def _pause_hook(self, audit: AuditLog, step_id: str) -> tuple[bool, str]:
+        """For the executor: (False, reason) to stop, else (True, note-for-the-model or "")."""
+        if not self._wait_if_paused(audit, step_id):
+            return False, self._pause_end
+        note, self._human_note = self._human_note, ""
+        if note:
+            audit.event("takeover_note_sent", step=step_id, note=note)
+        return True, note
+
     # ------------------------------------------------------------------ main entry
     def run(self, request: str, playbook: Playbook | None = None, params: dict | None = None, session_id: str | None = None, resume: bool = False, guide: Playbook | None = None) -> TaskResult:
         """playbook: follow it exactly (scripted replay). guide: a playbook matched to the request,
         given to the planner as a reference so the plan covers everything the request asks."""
         self._guide = guide
+        self._human_note = ""
         s = self.settings
         s.output_dir.mkdir(parents=True, exist_ok=True)
         audit = AuditLog(s.audit_dir, session_id=session_id, user=self.user)
@@ -150,6 +196,10 @@ class Orchestrator:
             if self._stop_requested(audit):
                 rec.status = "blocked"
                 rec.summary = "stopped by kill switch"
+                break
+            if not self._wait_if_paused(audit, rec.step.id):
+                rec.status = "blocked"
+                rec.summary = self._pause_end
                 break
             if time.time() > deadline:
                 rec.status = "failed"
@@ -273,12 +323,17 @@ class Orchestrator:
         scripted_failure = ""
         max_attempts = 1 + self.settings["limits"]["max_step_retries"] + (1 if step.script else 0)
         while rec.attempts < max_attempts:
+            # A takeover may have started while this step waited for its approval.
+            if not self._wait_if_paused(audit, step.id):
+                rec.status, rec.summary = "blocked", self._pause_end
+                return
             rec.attempts += 1
             if step.script and rec.attempts == 1 and route.requested == route.tier.name:
                 run = self._run_script(step, route.tier, ctx)
             else:
                 try:
-                    run = Executor(self.client).run(step, route.tier, ctx, prior=prior, error=error, deadline=deadline, stop_flag=lambda: self._stop_requested(audit))
+                    run = Executor(self.client).run(step, route.tier, ctx, prior=prior, error=error, deadline=deadline, stop_flag=lambda: self._stop_requested(audit),
+                                                   pause_hook=lambda: self._pause_hook(audit, step.id), paused=lambda: (audit.dir / PAUSE_FILE).exists())
                 except ModelError as e:
                     # Keep the real cause from the scripted attempt; the model retry is only a fallback.
                     first = f"{scripted_failure}; " if scripted_failure else ""
@@ -287,7 +342,7 @@ class Orchestrator:
                 scripted_failure = f"scripted run failed: {run.summary[:1500]}"
             rec.summary = run.summary
             rec.files = list(dict.fromkeys(rec.files + run.files))
-            if run.status == "blocked" and "kill switch" in run.summary:
+            if run.status == "blocked" and ("kill switch" in run.summary or run.summary.startswith("stopped: human takeover")):
                 rec.status = "blocked"
                 return
             try:
@@ -319,6 +374,12 @@ class Orchestrator:
             elif kind == "tools":  # a fixed sequence of tool calls on one tier; stops at the first error
                 texts, written, failed = [], [], False
                 for call in script.get("calls", []):
+                    if (ctx.audit.dir / PAUSE_FILE).exists():
+                        # A human took over mid-sequence: the screen no longer matches the script.
+                        # Fail this attempt; the guided retry waits for the hand-back and gets the note.
+                        texts.append("interrupted: a human took over this session during the scripted sequence")
+                        failed = True
+                        break
                     o = tier.execute({"name": call["tool"], "input": call.get("input", {})}, ctx)
                     texts.append(f"{call['tool']}: {o.text}")
                     written += o.files

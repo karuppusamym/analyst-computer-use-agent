@@ -56,6 +56,8 @@ button:disabled{opacity:.5;cursor:not-allowed}.row{display:flex;flex-wrap:wrap;g
 .shots{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px}.shots img{width:100%;max-height:70vh;object-fit:contain;border:1px solid var(--border);border-radius:6px;background:#000}
 .events{font:12px/1.4 ui-monospace,Consolas,monospace;max-height:360px;overflow:auto}.events div{border-bottom:1px solid var(--border);padding:2px 0;word-break:break-word}
 .inline,.row form{display:inline}.narrow{max-width:420px}figure{margin:0}
+.tk-frame{display:block;max-width:100%;cursor:crosshair;border:2px solid var(--warn);border-radius:6px;background:#000}
+.tk-tools input[type=text]{width:auto;flex:1 1 220px}input.share-user{max-width:240px}.tk-tools select{width:auto}
 @media (max-width:600px){main{padding:10px}header .me{margin-left:0}}
 """
 
@@ -90,7 +92,35 @@ JS = """
         if(j.events.length) ev.scrollTop=ev.scrollHeight;
       }).catch(function(){});
     }
-    tick(); setInterval(tick,1500);
+    var holder=live.getAttribute('data-takeover');
+    function tick2(){ fetch(api+'?after='+after,{credentials:'same-origin'}).then(function(r){return r.ok?r.json():null}).then(function(j){
+      if(j && (j.takeover===null?'':j.takeover)!==holder) location.reload(); }).catch(function(){}); }
+    tick(); setInterval(tick,1500); setInterval(tick2,3000);
+  }
+  var tk=document.getElementById('tk');
+  if(tk){
+    var img=document.getElementById('tk-frame'), msg=document.getElementById('tk-msg'), base=tk.getAttribute('data-frame');
+    var input=tk.getAttribute('data-input'), every=parseInt(tk.getAttribute('data-interval')||'1000',10);
+    var csrf=document.querySelector('meta[name=csrf]').getAttribute('content'), busy=false, last=null;
+    function refresh(){ if(busy) return; busy=true; var n=new Image();
+      n.onload=function(){ img.src=n.src; busy=false; }; n.onerror=function(){ busy=false; msg.textContent='Screen not available.'; };
+      n.src=base+'?t='+Date.now(); }
+    refresh(); setInterval(refresh, Math.max(300, every));
+    function send(fields){ var body=new URLSearchParams(fields); body.set('csrf',csrf);
+      return fetch(input,{method:'POST',credentials:'same-origin',headers:{'X-CSRF-Token':csrf,'Content-Type':'application/x-www-form-urlencoded'},body:body.toString()})
+        .then(function(r){return r.json().then(function(j){ msg.textContent=(j.ok?'Sent: ':'Not sent: ')+(j.message||j.error||''); setTimeout(refresh,250); });})
+        .catch(function(){ msg.textContent='Could not reach the portal.'; }); }
+    function point(e){ var r=img.getBoundingClientRect(); var sx=img.naturalWidth/r.width, sy=img.naturalHeight/r.height;
+      return {x:Math.round((e.clientX-r.left)*sx), y:Math.round((e.clientY-r.top)*sy)}; }
+    img.addEventListener('click',function(e){ var p=point(e); last=p; var mode=document.getElementById('tk-mode').value;
+      send({action:mode,x:p.x,y:p.y,modifiers:document.getElementById('tk-mods').value}); });
+    img.addEventListener('contextmenu',function(e){ e.preventDefault(); var p=point(e); last=p; send({action:'right_click',x:p.x,y:p.y}); });
+    img.addEventListener('wheel',function(e){ e.preventDefault(); var p=point(e); send({action:'scroll',x:p.x,y:p.y,direction:e.deltaY<0?'up':'down',amount:3}); },{passive:false});
+    document.getElementById('tk-type').addEventListener('submit',function(e){ e.preventDefault(); var t=document.getElementById('tk-text');
+      if(t.value){ send({action:'type',text:t.value}); t.value=''; } });
+    document.getElementById('tk-key').addEventListener('submit',function(e){ e.preventDefault(); var k=document.getElementById('tk-keytext');
+      if(k.value) send({action:'key',text:k.value}); });
+    tk.querySelectorAll('button[data-key]').forEach(function(b){ b.addEventListener('click',function(){ send({action:'key',text:b.getAttribute('data-key')}); }); });
   }
 })();
 """
@@ -214,16 +244,16 @@ def event_detail(e: dict) -> str:
     return text if len(text) <= 400 else text[:400] + " ..."
 
 
-def approval_card(item, ident: Identity, csrf: str, show_session: bool = True) -> str:
+def approval_card(item, ident: Identity, csrf: str, show_session: bool = True, may: bool | None = None) -> str:
     r = item.req
     left = max(0, int(item.deadline - time.time()))
-    may = ident.can("reviewer")
+    may = ident.can("reviewer") if may is None else may
     back = "" if show_session else "<input type=hidden name=back value=session>"
     form = (
         f'<form method="post" action="/approvals/{u(item.id)}">{csrf_input(csrf)}{back}<label for="n-{h(item.id)}">Note (optional)</label>'
         f'<input type=text id="n-{h(item.id)}" name=note><p class="row"><button type=submit name=decision value=approve {"" if may else "disabled"}>Approve</button>'
         f'<button type=submit name=decision value=reject class="danger" {"" if may else "disabled"}>Reject</button>'
-        + ("" if may else '<span class="muted">Only reviewers and admins can decide.</span>')
+        + ("" if may else '<span class="muted">Only reviewers and admins can decide' + (" (your team does not review this playbook)" if ident.can("reviewer") else "") + ".</span>")
         + "</p></form>"
     )
     sess = f'<div>Session <a href="/sessions/{u(item.session_id)}">{h(item.session_id)}</a> &middot; started by {h(item.requested_by)}</div>' if show_session else ""
@@ -236,12 +266,30 @@ def approval_card(item, ident: Identity, csrf: str, show_session: bool = True) -
     )
 
 
-def session_page(info: dict, events: list[dict], ident: Identity, csrf: str, pending: list, question) -> str:
+def share_card(sid: str, csrf: str, viewers: list[str], may_share: bool) -> str:
+    rows = "".join(
+        f'<li>{h(v)}' + (f' <form method="post" action="/sessions/{u(sid)}/share" class="inline">{csrf_input(csrf)}<input type=hidden name=op value=remove>'
+                         f'<input type=hidden name=user value="{h(v)}"><button type=submit class="secondary">Remove</button></form>' if may_share else "") + "</li>"
+        for v in viewers
+    )
+    form = (
+        f'<form method="post" action="/sessions/{u(sid)}/share" class="row">{csrf_input(csrf)}<input type=hidden name=op value=add>'
+        '<label for=share-user class="inline">Share with user</label><input type=text id=share-user name=user required class="share-user">'
+        '<button type=submit>Share</button></form>'
+        if may_share else ""
+    )
+    if not (rows or form):
+        return ""
+    return '<h2>Shared with</h2><div class="card">' + (f"<ul>{rows}</ul>" if rows else '<p class="muted">Not shared with anyone. Team members of the owner see it anyway.</p>') + form + "</div>"
+
+
+def session_page(info: dict, events: list[dict], ident: Identity, csrf: str, pending: list, question, may_decide=None, viewers: list[str] | None = None, may_share: bool = False) -> str:
     sid = info["id"]
     final = info.get("status") in FINAL
     head = (
         f'<h1>Session {h(sid)}</h1><div class="card"><div class="row">{badge(info.get("status", ""))}'
         + (' <span class="badge b-bad">STOP requested</span>' if info.get("stopped") else "")
+        + (f' <span class="badge b-warn">taken over by {h((info.get("takeover") or {}).get("by") or "someone")}</span>' if info.get("takeover") is not None else "")
         + f'</div><p>{h(info.get("request"))}</p><div class="muted">by {h(info.get("user"))} &middot; started {h(ts(info.get("started")))}'
         + (f' &middot; playbook {h(info.get("playbook"))}' if info.get("playbook") else "")
         + (f' &middot; params {h(json.dumps(info.get("params") or {}))}' if info.get("params") else "")
@@ -270,7 +318,7 @@ def session_page(info: dict, events: list[dict], ident: Identity, csrf: str, pen
             + "</ul></div>"
         )
     if pending:
-        parts.append("<h2>Waiting for approval</h2>" + "".join(approval_card(p, ident, csrf, show_session=False) for p in pending))
+        parts.append("<h2>Waiting for approval</h2>" + "".join(approval_card(p, ident, csrf, show_session=False, may=may_decide(p) if may_decide else None) for p in pending))
     if question:
         parts.append(f'<div class="card">The agent is waiting for answers. <a href="/">Answer in task chat</a>.</div>')
     if info.get("questions"):
@@ -289,18 +337,64 @@ def session_page(info: dict, events: list[dict], ident: Identity, csrf: str, pen
         parts.append('<h2>Outputs</h2><div class="card"><ul>' + "".join(
             f'<li><a href="{"/out/" + quote(o["rel"]) if o["kind"] == "out" else f"/sessions/{u(sid)}/file/" + quote(o["rel"])}">{h(o["name"])}</a> <span class="muted">{int(o["size"])} bytes</span></li>' for o in outs
         ) + "</ul></div>")
+    parts.append(share_card(sid, csrf, viewers or [], may_share))
     ev_rows = "".join(f'<tr><td>{h(e.get("seq"))}</td><td>{h(ts(e.get("ts")))}</td><td>{h(e.get("kind"))}</td><td><code>{h(event_detail(e))}</code></td></tr>' for e in events[-300:])
     parts.append(f'<h2>Audit log</h2><div class="card scroll"><table><tr><th>#</th><th>Time</th><th>Event</th><th>Detail</th></tr>{ev_rows or "<tr><td colspan=4 class=muted>No events yet.</td></tr>"}</table></div>')
     return "".join(parts)
 
 
-def live_page(sid: str, csrf: str, stopped: bool, final: bool) -> str:
+def takeover_panel(sid: str, csrf: str, tk: dict) -> str:
+    """Take over / hand back buttons and, for the person holding the takeover, the remote screen."""
+    if not tk:
+        return ""
+    buttons = ""
+    if tk.get("may"):
+        buttons += (f'<form method="post" action="/sessions/{u(sid)}/takeover" data-confirm="Pause the agent and take over the desktop? Every input is checked against the window allowlist and audited under your name.">'
+                    f'{csrf_input(csrf)}<button type=submit>Take over</button></form>')
+    if tk.get("may_end"):
+        buttons += (f'<form method="post" action="/sessions/{u(sid)}/handback" data-confirm="Hand the session back to the agent?">{csrf_input(csrf)}'
+                    '<button type=submit class="secondary">Hand back</button></form>')
+    if tk.get("active"):
+        state = f'<strong>Paused: taken over by {h(tk.get("holder") or "someone")}.</strong> The agent waits until they hand back.'
+    elif tk.get("may"):
+        state = '<span class="muted">Take over pauses the agent before its next action so you can drive the desktop yourself.</span>'
+    else:
+        state = f'<span class="muted">{h(tk.get("why") or "")}</span>' if tk.get("why") else ""
+    out = f'<div class="card"><div class="row">{state}{buttons}</div>'
+    if tk.get("active") and tk.get("watch"):
+        ok, why = tk.get("desktop") or (True, "")
+        if not ok:
+            out += f'<p class="msg err">{h(why)}</p>'
+        else:
+            dry = '<p class="msg err">Dry run: your input is logged but not sent (tiers.desktop_pixels.dry_run).</p>' if tk.get("dry_run") else ""
+            ctl = (
+                '<div class="row tk-tools"><label for=tk-mode class="inline">Click</label><select id=tk-mode><option value=click>left click</option><option value=double_click>double click</option>'
+                '<option value=right_click>right click</option><option value=move>move only</option></select>'
+                '<label for=tk-mods class="inline">with</label><select id=tk-mods><option value="">no modifier</option><option value=shift>shift</option><option value=ctrl>ctrl</option><option value=alt>alt</option></select>'
+                '<span class="muted">Right-click and the wheel on the image also work.</span></div>'
+                '<form id=tk-type class="row tk-tools"><label for=tk-text class="inline">Type</label><input type=text id=tk-text autocomplete=off><button type=submit>Type</button></form>'
+                '<form id=tk-key class="row tk-tools"><label for=tk-keytext class="inline">Key</label><input type=text id=tk-keytext placeholder="ctrl+s, Return, Tab" autocomplete=off><button type=submit>Press</button>'
+                + "".join(f'<button type=button class="secondary" data-key="{k}">{k}</button>' for k in ("Return", "Tab", "Escape", "BackSpace"))
+                + "</form>"
+                if tk.get("controls") else '<p class="muted">You are watching; only the person holding the takeover can send input.</p>'
+            )
+            out += (
+                f'{dry}<div id="tk" data-frame="/api/sessions/{u(sid)}/takeover/frame" data-input="/api/sessions/{u(sid)}/takeover/input" data-interval="{int(tk.get("interval", 1000))}">'
+                f'{ctl}<p id="tk-msg" class="muted" aria-live="polite"></p><img id="tk-frame" class="tk-frame" alt="Remote screen"></div>'
+                '<p class="muted">Every input goes through the same window allowlist as the agent; refused input is not sent. All input is audited as human:&lt;you&gt;.</p>'
+            )
+    return out + "</div>"
+
+
+def live_page(sid: str, csrf: str, stopped: bool, final: bool, tk: dict | None = None) -> str:
+    tk = tk or {}
     return (
         f'<h1>Live view: {h(sid)}</h1><div class="card row"><span>Status: <strong id="live-status">...</strong></span>'
         f'<a href="/sessions/{u(sid)}">Session detail</a>'
         f'<form method="post" action="/sessions/{u(sid)}/stop" data-confirm="Stop this session before its next action?">{csrf_input(csrf)}'
         f'<button type=submit class="danger" {"disabled" if final or stopped else ""}>Kill switch: stop</button></form></div>'
-        f'<div id="live" data-api="/api/sessions/{u(sid)}/live"></div>'
+        + takeover_panel(sid, csrf, tk)
+        + f'<div id="live" data-api="/api/sessions/{u(sid)}/live" data-takeover="{h(tk.get("holder") or "") if tk.get("active") else ""}"></div>'
         '<h2>Latest screenshots</h2><div id="shots" class="shots"><p class="muted">Loading...</p></div>'
         '<h2>Audit events</h2><div class="card events" id="events"></div>'
         '<p class="muted">Refreshes every 1.5 seconds. Screenshots come from the session\'s audit folder.</p>'
@@ -314,9 +408,9 @@ def report_page(sid: str, text: str) -> str:
 # --------------------------------------------------------------------------- approvals
 
 
-def approvals_page(pending: list, history: list, ident: Identity, csrf: str) -> str:
+def approvals_page(pending: list, history: list, ident: Identity, csrf: str, may_decide=None) -> str:
     body = "<h1>Approval inbox</h1>"
-    body += "".join(approval_card(p, ident, csrf) for p in pending) or '<p class="muted">Nothing is waiting for approval.</p>'
+    body += "".join(approval_card(p, ident, csrf, may=may_decide(p) if may_decide else None) for p in pending) or '<p class="muted">Nothing is waiting for approval.</p>'
     if history:
         body += '<h2>Recent decisions</h2><div class="card scroll"><table><tr><th>When</th><th>Session</th><th>Step</th><th>Action</th><th>Decision</th><th>By</th><th>Note</th></tr>' + "".join(
             f'<tr><td>{h(ts(x.decision.decided_at))}</td><td><a href="/sessions/{u(x.session_id)}">{h(x.session_id)}</a></td><td>{h(x.req.step_id)}</td><td>{h(x.req.action_class)}</td>'
