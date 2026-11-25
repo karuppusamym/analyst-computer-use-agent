@@ -143,6 +143,47 @@ python -m analyst_agent portal --host 127.0.0.1 --port 8765
 - The portal **refuses to start** when no auth is configured (for example, `local` mode with no users). `--dev-no-auth` makes everyone admin with no sign-in and only binds to loopback (127.0.0.1).
 - The portal binds to `127.0.0.1` by default. To expose it, put it behind the SSO proxy or use `oidc` with HTTPS.
 
+### Teach mode (draft playbooks)
+
+```powershell
+python -m analyst_agent teach from-session <session-id> --name recon-taught
+```
+```powershell
+python -m analyst_agent teach record --name portal-flow --url http://127.0.0.1:8765/
+```
+```powershell
+python -m analyst_agent teach drafts
+```
+```powershell
+python -m analyst_agent teach promote recon-taught --reviewer finance-team-lead
+```
+
+- `from-session` reads a finished session's audit log and keeps only the verified steps. Scripted steps keep their script. A guided step whose tool calls can be replayed (`run_python`, connector calls, browser actions, UIA calls) becomes a scripted step; browser refs are turned into element descriptions (role + name, label, text). Pixel actions stay guided, with the recorded actions as hints. Values that repeat from the run's parameters or the request (e.g. `2026-10`) become `{period}`-style parameters. Checks carry over. A `provenance` block records the source session, `created_at` and `created_by`.
+- `record` opens a browser window (Playwright; it reports *unavailable* without it) on an allowlisted host (`policy.allowed_hosts`) and records clicks, fills, selects and navigations with robust targets (role + name, label, `data-testid`, then CSS). Close the window or press Ctrl+C to write the draft. Steps replay with the browser tier tools. Password fields are stored only as `{{secret:<field>}}`; the value never leaves the page, and the browser tier refuses to type a placeholder.
+- Drafts go to `playbooks/drafts/` with `"status": "draft"`. `playbooks`, `run` and matching never use a draft.
+- `promote` checks the schema and that every step has a tier and a check (or an explicit `no_check_reason`), declares every `{param}` it uses, then moves the draft into `playbooks/`, bumps the version and records the reviewer.
+
+### Schedules (unattended runs)
+
+```powershell
+python -m analyst_agent schedule add monthly-recon --playbook erp-crm-reconciliation --cron "0 7 2 * *" --tz Europe/London --param "period={{prev_month}}" --owner finance-analytics
+```
+```powershell
+python -m analyst_agent schedule list
+```
+```powershell
+python -m analyst_agent schedule run-due
+```
+```powershell
+python -m analyst_agent schedule install-hint
+```
+
+- Schedules live in `config/schedules.json` (setting `schedules.path`): `id`, `playbook`, `params`, `cron`, `timezone`, `enabled`, `owner`, and an optional `notify` path for a run summary.
+- `cron` is 5 fields with `*`, lists, ranges, steps and month/day names, or `@daily`-style macros. Day-of-month and day-of-week follow Vixie cron: if both are restricted, either one matching is enough. Time zones use `zoneinfo`; without tzdata, local time is used and a warning is printed.
+- Date macros in params resolve at fire time: `{{prev_month}}` (YYYY-MM), `{{today}}`, `{{quarter_start}}`, `{{quarter_end}}`, `{{prev_quarter_start}}`, `{{prev_quarter_end}}` (also `{{yesterday}}`, `{{this_month}}`, `{{prev_month_start}}`, `{{prev_month_end}}`).
+- `run-due` runs every due schedule unattended: every approval is declined and reported, never auto-approved. A lock file stops overlapping runs. A missed slot runs once for the latest slot, with no catch-up series. History goes to `workspace/schedules/history.jsonl` and the last-fired state to `workspace/schedules/state.json`. `--now <ISO time>` is for testing.
+- `daemon [--interval 60]` calls `run-due` in a loop. `install-hint` prints a `schtasks /Create` command that calls `run-due` every 5 minutes.
+
 Run `python samples/make_samples.py` to regenerate the sample ERP/CRM exports and `warehouse.sqlite`.
 
 ### Credentials (`vault`)
@@ -194,8 +235,11 @@ analyst_agent/
   tools/        connectors, code (+ sandbox Job Object, _sandbox_guard audit hook), browser, desktop_uia, computer (+ screen_win ctypes)
   vault.py      credential vault (DPAPI / env / keyring), {{secret:name}} resolution
   playbook.py checks.py policy.py audit.py checkpoint.py report.py evals.py gateway_check.py
+  teach.py      teach mode: drafts from sessions, browser recorder, promote
+  scheduler.py  cron parser, schedules, unattended run-due
   portal/       web portal: server, views, auth (local / SSO header / OIDC), WebApprover inbox, runs, playbook review
-playbooks/      4 pilot playbooks (reconciliation, warehouse question, portal download, legacy entry)
+playbooks/      4 pilot playbooks (reconciliation, warehouse question, portal download, legacy entry); drafts/ for teach-mode drafts
+config/schedules.json  schedule definitions (an example, disabled)
 evals/tasks.json  eval set with graders, tune/holdout split
 knowledge/      team knowledge injected into the planner
 test_targets/   local portal + Legacy Ledger test app
@@ -209,6 +253,7 @@ tests/          unit, integration and live desktop tests
   - Pending approvals and questions live in memory, so a portal restart declines them.
   - The live view shows screenshots, not an interactive remote desktop.
   - Every signed-in user can see every session.
-- **Later-phase features:** teach mode recording, schedules and a Guacamole/noVNC interactive desktop are Phase 3 items in the design. The credential vault is local only (DPAPI, env or keyring). There is no central secret store, rotation or per-user sharing yet.
+- **Later-phase features:** a Guacamole/noVNC interactive desktop is still a Phase 3 item. The credential vault is local only (DPAPI, env or keyring). There is no central secret store, rotation or per-user sharing yet.
+- **Teach recorder:** records the first tab only and has been tested by driving the page in code, not with a person clicking in a headed window.
 - **Two eval tasks per workflow** for two workflows. The design calls for five per workflow across all ten.
 - **The code tier is contained, not sandboxed.** The Job Object and the audit-hook guard limit it, but they are not an isolation boundary. Production needs the disposable per-task VM or container from the design, with network egress blocked there, since Windows Home can't block network per process without the firewall.

@@ -100,6 +100,8 @@ DEFAULTS: dict[str, Any] = {
     },
     # Credential vault (vault.py). backend: "dpapi" (Windows, current user), "env" (read-only), "keyring" (if installed).
     "vault": {"backend": "dpapi", "path": "./workspace/vault", "env_prefix": "AGENT_SECRET_", "entropy_env": ""},
+    # Scheduled unattended runs (scheduler.py): definitions file and run state/history folder.
+    "schedules": {"path": "./config/schedules.json", "state_dir": "./workspace/schedules", "lock_stale_s": 7200},
 }
 
 

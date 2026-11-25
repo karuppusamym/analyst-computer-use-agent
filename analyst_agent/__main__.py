@@ -11,6 +11,8 @@
   python -m analyst_agent portal-user add <name> --role analyst|reviewer|admin
   python -m analyst_agent vault set <name> --allow-host h       (value is prompted, never on argv)
   python -m analyst_agent vault list | vault remove <name>
+  python -m analyst_agent teach from-session|record|promote|drafts   (draft playbooks; see teach.py)
+  python -m analyst_agent schedule list|add|remove|run-due|daemon|install-hint   (see scheduler.py)
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from .orchestrator import Orchestrator
 from .playbook import PlaybookRegistry
 from .policy import ConsoleApprover, UnattendedApprover
 from .router import Router
+from . import scheduler, teach
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -79,6 +82,9 @@ def main(argv: list[str] | None = None) -> int:
     from .vault import add_cli as _add_vault_cli
 
     _add_vault_cli(sub)
+
+    teach.add_cli(sub)
+    scheduler.add_cli(sub)
     args = ap.parse_args(argv)
 
     s = _settings(args)
@@ -117,6 +123,10 @@ def main(argv: list[str] | None = None) -> int:
         from .portal.cli import run_user_cmd
 
         return run_user_cmd(args, s)
+    if args.cmd == "teach":
+        return teach.cli(args, s, ROOT)
+    if args.cmd == "schedule":
+        return scheduler.cli(args, s, ROOT)
     if args.cmd == "eval":
         from .evals import format_eval, run_evals
 

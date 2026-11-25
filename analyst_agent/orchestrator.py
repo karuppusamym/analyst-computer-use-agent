@@ -15,6 +15,7 @@ from typing import Callable
 
 from .agents import Executor, Plan, Planner, StepRun, Verdict, Verifier
 from .audit import AuditLog, redact
+from .checks import CheckOutcome
 from .checkpoint import CheckpointStore
 from .config import Settings
 from .model import ModelClient, ModelError
@@ -219,11 +220,11 @@ class Orchestrator:
                 if still:
                     return Plan([], [], plan.questions or [f"Please give a value for '{k}'" for k in still], {}, "playbook")
             bound = playbook.bind(params)
-            audit.event("plan", source="playbook", playbook=bound.name, version=bound.version, steps=[st.to_dict() for st in bound.steps])
+            audit.event("plan", source="playbook", playbook=bound.name, version=bound.version, steps=[st.to_dict() for st in bound.steps], final_checks=bound.final_checks)
             return Plan(bound.steps, bound.final_checks, [], {}, "playbook")
         guide = getattr(self, "_guide", None)
         plan = self.planner.plan(request, self.router.available_names(), playbook=guide.to_dict() if guide else None, knowledge=self._knowledge())
-        audit.event("plan", source="planner", guide=guide.name if guide else None, questions=plan.questions, steps=[st.to_dict() for st in plan.steps])
+        audit.event("plan", source="planner", guide=guide.name if guide else None, questions=plan.questions, steps=[st.to_dict() for st in plan.steps], final_checks=plan.final_checks)
         return plan
 
     # ------------------------------------------------------------------ one step
@@ -265,7 +266,11 @@ class Orchestrator:
                 rec.status = "blocked"
                 return
             try:
-                verdict = self.verifier.verify(step.intent, step.checks, self.settings.workspace_root, run.summary, rec.files, run.last_screenshot)
+                if not step.checks and step.no_check_reason:
+                    # Reviewed exception (teach-mode drafts): the step passes if it ran without error.
+                    verdict = Verdict(run.status == "done", [CheckOutcome("no check (reviewed)", run.status == "done", step.no_check_reason)])
+                else:
+                    verdict = self.verifier.verify(step.intent, step.checks, self.settings.workspace_root, run.summary, rec.files, run.last_screenshot)
             except ModelError as e:
                 verdict = Verdict(False, [], f"verifier call failed: {e}")
             rec.verdict = verdict
