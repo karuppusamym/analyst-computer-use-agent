@@ -77,6 +77,25 @@ DEFAULTS: dict[str, Any] = {
     },
     "connectors": {"databases": {}},
     "audit": {"dir": "./workspace/audit"},
+    # Web portal (python -m analyst_agent portal). See README "Portal".
+    "portal": {
+        "host": "127.0.0.1",
+        "port": 8765,
+        "session_ttl_s": 28800,
+        "cookie_secure": False,  # set true when served over HTTPS
+        "allowed_hosts": [],  # Host header names; empty = loopback names when bound to loopback
+        "question_timeout_s": 900,
+        "live_screenshots": 4,
+        "auth": {
+            # "local" (users file), "trusted_header" (SSO reverse proxy) or "oidc".
+            "mode": "local",
+            "users_file": "portal_users.json",  # under workspace/
+            "secret_file": "portal_secret.key",  # under workspace/, created on first run
+            "trusted_header": {"header": "X-Forwarded-User", "groups_header": None, "proxy_ips": [], "user_roles": {}, "group_roles": {}, "default_role": "analyst"},
+            "oidc": {"issuer": "", "client_id": "", "client_secret_env": "PORTAL_OIDC_CLIENT_SECRET", "redirect_uri": "", "scopes": "openid profile email",
+                     "username_claim": "preferred_username", "groups_claim": "groups", "user_roles": {}, "group_roles": {}, "default_role": "analyst"},
+        },
+    },
 }
 
 

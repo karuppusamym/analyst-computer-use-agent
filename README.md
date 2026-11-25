@@ -104,6 +104,40 @@ python -m analyst_agent stop <session-id>
 - `--resume <session>` continues from the last checkpoint.
 - Each run writes its audit log, screenshots, checkpoint and a "what I checked" report to `workspace/audit/<session>/`. Outputs go to `workspace/output/`.
 
+## Portal
+
+A small web portal (standard library `http.server`, no CDN, works in light and dark mode) replaces the console for day-to-day use:
+
+```powershell
+python -m analyst_agent portal-user add alice --role admin
+```
+```powershell
+python -m analyst_agent portal --host 127.0.0.1 --port 8765
+```
+
+- **Task chat** (`/`): submit a request, optionally with a playbook and `name=value` parameters. Runs execute in background threads through the normal orchestrator. Clarifying questions from the planner appear in the chat; the run waits until they are answered or `portal.question_timeout_s` passes.
+- **Sessions** (`/sessions`): every session folder under `workspace/audit/`, with step statuses, approvals, outputs, the full audit log, the "what I checked" report and a **kill switch** button. The button writes the same `STOP` file as `python -m analyst_agent stop <session>`.
+- **Live view** (`/sessions/<id>/live`): the latest screenshots from the session's audit folder and a tail of audit events, refreshed by polling. It stands in for Guacamole/noVNC for now.
+- **Approval inbox** (`/approvals`): `WebApprover` queues every approval request, including the plan. A reviewer sees the full preview and approves or rejects. The run waits until someone decides or `policy.approval_timeout_s` passes; a timeout is a decline. The decision and who made it go into the session's audit log and `workspace/portal_audit/`.
+- **Playbook review** (`/playbooks`): lists playbooks with steps, parameters, owner and version. Drafts (`playbooks/drafts/*.json`, or `"status": "draft"`) never run. A reviewer approves a draft, which validates it and moves it into `playbooks/`, or rejects it, which moves it to `playbooks/drafts/rejected/`. The author of a draft cannot approve it unless they are an admin.
+
+**Roles:** `analyst` runs tasks and uses the kill switch. `reviewer` can also approve requests and playbooks. `admin` can do everything, including answering questions on anyone's run.
+
+**Sign-in** (`portal.auth.mode` in the config):
+
+| Mode | How it works |
+| --- | --- |
+| `local` (default) | Users and roles live in `workspace/portal_users.json`. Passwords are PBKDF2-SHA256 hashes (600,000 iterations). Manage them with `portal-user add/remove/list`. |
+| `trusted_header` | Behind an SSO reverse proxy. The user comes from `trusted_header.header` (default `X-Forwarded-User`), and groups optionally come from `groups_header`. Both are accepted **only** from the addresses in `proxy_ips`. Roles come from `user_roles` / `group_roles` / `default_role`. |
+| `oidc` | Authorization-code flow with PKCE against `oidc.issuer`, using stdlib `urllib`. The ID token's RS256 signature is checked against the issuer's JWKS in pure Python, then `iss`, `aud`, `exp` and `nonce`. The client secret, if any, is read from the env var `client_secret_env`. |
+
+- Sessions are HMAC-signed `HttpOnly; SameSite=Strict` cookies. The key is generated into `workspace/portal_secret.key` on first run. Set `portal.cookie_secure: true` when serving over HTTPS.
+- Every POST needs a CSRF token and a same-origin `Origin`.
+- Responses carry a strict CSP. Files are served only from inside the session folder or `workspace/output/`, and path traversal is refused.
+- The Host header is checked, which guards against DNS rebinding.
+- The portal **refuses to start** when no auth is configured (for example, `local` mode with no users). `--dev-no-auth` makes everyone admin with no sign-in and only binds to loopback (127.0.0.1).
+- The portal binds to `127.0.0.1` by default. To expose it, put it behind the SSO proxy or use `oidc` with HTTPS.
+
 Run `python samples/make_samples.py` to regenerate the sample ERP/CRM exports and `warehouse.sqlite`.
 
 ## Testing on this PC without a VM
@@ -125,7 +159,7 @@ To include the live desktop tests, set the variable first. They move the mouse f
 $env:RUN_DESKTOP_TESTS = "1"
 ```
 
-Current result: **57 tests pass**, including the live desktop end-to-end test. That test runs playbook → approval → router → executor → real pixel tier → test app → verifier.
+Current result: see the end of the Testing section (updated after all branches merge).
 
 ## Layout
 
@@ -137,6 +171,7 @@ analyst_agent/
   router.py     tier selection and fallbacks
   tools/        connectors, code, browser, desktop_uia, computer (+ screen_win ctypes)
   playbook.py checks.py policy.py audit.py checkpoint.py report.py evals.py gateway_check.py
+  portal/       web portal: server, views, auth (local / SSO header / OIDC), WebApprover inbox, runs, playbook review
 playbooks/      4 pilot playbooks (reconciliation, warehouse question, portal download, legacy entry)
 evals/tasks.json  eval set with graders, tune/holdout split
 knowledge/      team knowledge injected into the planner
@@ -148,7 +183,10 @@ tests/          unit, integration and live desktop tests
 
 - **Not yet tested on your office gateway.** It has been tested on OpenRouter only (see above). Run `gateway-check` on your gateway first.
 - **The code tier can reach the network when there is no VM.** The prompts forbid it and every script is audited, but nothing blocks it. Web access is meant to go through the browser tier, which enforces the site allowlist.
-- **No portal UI yet.** There are no web screens for task chat, live view, the approval inbox or playbook review; the console stands in for them.
-- **Later-phase features:** teach mode recording, schedules, SSO, the credential vault and Guacamole/noVNC live view are Phase 3 items in the design.
+- **Portal is a first version.** Task chat, sessions, approval inbox, playbook review, SSO (trusted header / OIDC) and a polling live view are in place (see Portal). Still missing:
+  - Pending approvals and questions live in memory, so a portal restart declines them.
+  - The live view shows screenshots, not an interactive remote desktop.
+  - Every signed-in user can see every session.
+- **Later-phase features:** teach mode recording, schedules, the credential vault and a Guacamole/noVNC interactive desktop are Phase 3 items in the design.
 - **Two eval tasks per workflow** for two workflows. The design calls for five per workflow across all ten.
 - **The code tier is not a sandbox on its own.** Production needs the disposable per-task VM or container from the design.

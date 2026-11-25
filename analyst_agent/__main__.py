@@ -7,6 +7,8 @@
   python -m analyst_agent run "Q3 churn by region?"            (planner builds the steps; needs the model)
   python -m analyst_agent eval [--split holdout]
   python -m analyst_agent stop <session-id>                     (kill switch)
+  python -m analyst_agent portal [--host 127.0.0.1] [--port 8765] (web portal)
+  python -m analyst_agent portal-user add <name> --role analyst|reviewer|admin
 """
 
 from __future__ import annotations
@@ -68,6 +70,9 @@ def main(argv: list[str] | None = None) -> int:
     ev.add_argument("--tasks", default=str(ROOT / "evals" / "tasks.json"))
     st = sub.add_parser("stop", help="kill switch for a running session")
     st.add_argument("session")
+    from .portal.cli import add_parsers as _portal_parsers
+
+    _portal_parsers(sub)
     args = ap.parse_args(argv)
 
     s = _settings(args)
@@ -94,6 +99,14 @@ def main(argv: list[str] | None = None) -> int:
         (d / "STOP").write_text("stop requested\n")
         print(f"stop requested for {args.session}; the agent stops before its next action")
         return 0
+    if args.cmd == "portal":
+        from .portal.cli import run_portal_cmd
+
+        return run_portal_cmd(args, s, ROOT)
+    if args.cmd == "portal-user":
+        from .portal.cli import run_user_cmd
+
+        return run_user_cmd(args, s)
     if args.cmd == "eval":
         from .evals import format_eval, run_evals
 
