@@ -1,0 +1,56 @@
+[
+  {
+    "id": "recon-2026-10",
+    "workflow": "erp-crm-reconciliation",
+    "split": "tune",
+    "request": "Reconcile the October 2026 ERP and CRM exports and list the mismatches.",
+    "playbook": "erp-crm-reconciliation",
+    "params": {"period": "2026-10"},
+    "expect_status": "partial",
+    "manual_minutes": 45,
+    "graders": [
+      {"type": "csv_rows", "path": "output/mismatches_2026-10.csv", "equals": 7},
+      {"type": "json_field_equals", "path": "output/recon_summary_2026-10.json", "field": "by_issue.amount_differs", "value": 3},
+      {"type": "json_field_equals", "path": "output/recon_summary_2026-10.json", "field": "by_issue.missing_in_crm", "value": 2}
+    ]
+  },
+  {
+    "id": "recon-2026-11",
+    "workflow": "erp-crm-reconciliation",
+    "split": "holdout",
+    "request": "Reconcile the November 2026 ERP and CRM exports and list the mismatches.",
+    "playbook": "erp-crm-reconciliation",
+    "params": {"period": "2026-11"},
+    "expect_status": "partial",
+    "manual_minutes": 40,
+    "graders": [
+      {"type": "csv_rows", "path": "output/mismatches_2026-11.csv", "equals": 4},
+      {"type": "json_field_equals", "path": "output/recon_summary_2026-11.json", "field": "by_issue.missing_in_erp", "value": 1}
+    ]
+  },
+  {
+    "id": "region-q3",
+    "workflow": "warehouse-region-revenue",
+    "split": "tune",
+    "request": "Revenue and churn by region for Q3 2026.",
+    "playbook": "warehouse-region-revenue",
+    "params": {"start_date": "2026-07-01", "end_date": "2026-09-30", "label": "q3"},
+    "manual_minutes": 30,
+    "graders": [
+      {"type": "csv_rows", "path": "output/region_q3.csv", "equals": 4},
+      {"type": "csv_has_columns", "path": "output/region_q3.csv", "columns": ["region", "revenue", "churn_pct"]}
+    ]
+  },
+  {
+    "id": "region-q4",
+    "workflow": "warehouse-region-revenue",
+    "split": "holdout",
+    "request": "Revenue and churn by region for Q4 2026.",
+    "playbook": "warehouse-region-revenue",
+    "params": {"start_date": "2026-10-01", "end_date": "2026-12-31", "label": "q4"},
+    "manual_minutes": 30,
+    "graders": [
+      {"type": "csv_rows", "path": "output/region_q4.csv", "equals": 4}
+    ]
+  }
+]

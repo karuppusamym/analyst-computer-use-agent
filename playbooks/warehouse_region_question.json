@@ -1,0 +1,38 @@
+{
+  "name": "warehouse-region-revenue",
+  "version": 1,
+  "owner": "sales-analytics",
+  "backup_owner": "sales-team-lead",
+  "workflow": "warehouse question revenue churn by region quarter",
+  "description": "Answer an ad-hoc warehouse question: revenue, orders and churn by region for a date range, saved as a CSV.",
+  "permissions": {"data_class": "internal"},
+  "parameters": {
+    "start_date": {"type": "string", "required": true, "description": "YYYY-MM-DD"},
+    "end_date": {"type": "string", "required": true, "description": "YYYY-MM-DD, inclusive"},
+    "label": {"type": "string", "default": "range"}
+  },
+  "steps": [
+    {
+      "id": "query-by-region",
+      "intent": "Pull revenue, orders and churn by region from {start_date} to {end_date}",
+      "tier": "connector",
+      "script": {
+        "kind": "tool",
+        "tool": "sql_query",
+        "input": {
+          "database": "warehouse",
+          "sql": "select region, count(*) as orders, round(sum(revenue), 2) as revenue, sum(churned) as churned, round(100.0 * sum(churned) / count(*), 1) as churn_pct from sales where order_date between '{start_date}' and '{end_date}' group by region order by region",
+          "save_to": "workspace/output/region_{label}.csv"
+        }
+      },
+      "checks": [
+        {"type": "file_exists", "path": "output/region_{label}.csv"},
+        {"type": "csv_has_columns", "path": "output/region_{label}.csv", "columns": ["region", "orders", "revenue", "churn_pct"]},
+        {"type": "csv_rows", "path": "output/region_{label}.csv", "min": 1, "max": 4}
+      ]
+    }
+  ],
+  "final_checks": [
+    {"type": "file_exists", "path": "output/region_{label}.csv"}
+  ]
+}

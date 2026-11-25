@@ -1,0 +1,38 @@
+{
+  "gateway": {
+    "base_url": "https://openrouter.ai/api",
+    "token_env": "OPENROUTER_API_KEY",
+    "auth_style": "bearer",
+    "backend": "http",
+    "fallbacks": null
+  },
+  "models": {
+    "planner": {"model": "anthropic/claude-fable-5.2", "effort": "high", "max_tokens": 32000},
+    "executor": {"model": "anthropic/claude-opus-5.5", "effort": "medium", "max_tokens": 32000},
+    "routine_executor": {"model": "anthropic/claude-opus-5.5", "effort": "medium", "max_tokens": 32000},
+    "verifier": {"model": "anthropic/claude-opus-5.5", "effort": "high", "max_tokens": 16000},
+    "helper": {"model": "anthropic/claude-haiku-5.5", "effort": "low", "max_tokens": 4000}
+  },
+  "workspace": {
+    "root": "./workspace",
+    "input_dirs": ["./samples"],
+    "output_dir": "./workspace/output"
+  },
+  "connectors": {
+    "databases": {"warehouse": "./samples/warehouse.sqlite"}
+  },
+  "policy": {
+    "allowed_hosts": ["127.0.0.1", "localhost"],
+    "allowed_apps": []
+  },
+  "tiers": {
+    "browser": {"enabled": true, "headless": true},
+    "desktop_uia": {"enabled": false},
+    "desktop_pixels": {
+      "enabled": false,
+      "dry_run": false,
+      "allowed_window_titles": ["Legacy Ledger - TEST"]
+    }
+  },
+  "audit": {"dir": "./workspace/audit"}
+}

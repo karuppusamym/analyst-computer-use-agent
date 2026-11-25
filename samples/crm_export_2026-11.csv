@@ -1,0 +1,30 @@
+invoice_id,account_name,amount,stage
+INV-202611-0001,Acme Ltd,4180.94,closed_won
+INV-202611-0002,Brightline,5126.00,closed_won
+INV-202611-0003,Cobalt Foods,8333.05,closed_won
+INV-202611-0004,Delta Retail,4297.72,closed_won
+INV-202611-0005,Evergreen,4669.00,closed_won
+INV-202611-0006,Fjord Logistics,5368.99,closed_won
+INV-202611-0007,Granite Co,1825.01,closed_won
+INV-202611-0008,Harbor Health,4704.80,closed_won
+INV-202611-0009,Acme Ltd,5742.97,closed_won
+INV-202611-0010,Brightline,7178.20,closed_won
+INV-202611-0011,Cobalt Foods,878.29,closed_won
+INV-202611-0012,Delta Retail,2869.93,closed_won
+INV-202611-0013,Evergreen,997.90,closed_won
+INV-202611-0014,Fjord Logistics,7324.87,closed_won
+INV-202611-0015,Granite Co,6302.26,closed_won
+INV-202611-0016,Harbor Health,568.55,closed_won
+INV-202611-0017,Acme Ltd,8843.30,closed_won
+INV-202611-0018,Brightline,8689.87,closed_won
+INV-202611-0019,Cobalt Foods,5954.52,closed_won
+INV-202611-0020,Delta Retail,5616.95,closed_won
+INV-202611-0021,Evergreen,1585.95,closed_won
+INV-202611-0022,Fjord Logistics,332.01,closed_won
+INV-202611-0023,Granite Co,4849.76,closed_won
+INV-202611-0025,Acme Ltd,1873.83,closed_won
+INV-202611-0026,Brightline,2329.10,closed_won
+INV-202611-0027,Cobalt Foods,464.73,closed_won
+INV-202611-0028,Delta Retail,4282.62,closed_won
+INV-202611-0029,Evergreen,4386.92,closed_won
+INV-202611-0030,Fjord Logistics,7613.36,closed_won

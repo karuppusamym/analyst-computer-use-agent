@@ -1,0 +1,40 @@
+invoice_id,customer,amount,status
+INV-202610-0001,Acme Ltd,5228.34,posted
+INV-202610-0002,Brightline,3974.22,posted
+INV-202610-0003,Cobalt Foods,5287.20,posted
+INV-202610-0004,Delta Retail,2013.66,posted
+INV-202610-0005,Evergreen,7357.23,posted
+INV-202610-0006,Fjord Logistics,7447.58,posted
+INV-202610-0007,Granite Co,5950.56,posted
+INV-202610-0008,Harbor Health,1610.02,posted
+INV-202610-0009,Acme Ltd,4781.89,posted
+INV-202610-0010,Brightline,3084.40,posted
+INV-202610-0011,Cobalt Foods,2399.97,posted
+INV-202610-0012,Delta Retail,8584.79,posted
+INV-202610-0013,Evergreen,8969.70,posted
+INV-202610-0015,Granite Co,7769.42,posted
+INV-202610-0016,Harbor Health,5508.08,posted
+INV-202610-0017,Acme Ltd,3558.13,posted
+INV-202610-0018,Brightline,2695.84,posted
+INV-202610-0019,Cobalt Foods,6139.69,posted
+INV-202610-0020,Delta Retail,4220.11,posted
+INV-202610-0021,Evergreen,6235.58,posted
+INV-202610-0022,Fjord Logistics,6024.25,posted
+INV-202610-0023,Granite Co,1370.21,posted
+INV-202610-0024,Harbor Health,6956.97,posted
+INV-202610-0025,Acme Ltd,8845.24,posted
+INV-202610-0026,Brightline,8730.62,posted
+INV-202610-0027,Cobalt Foods,5597.28,posted
+INV-202610-0028,Delta Retail,589.49,posted
+INV-202610-0029,Evergreen,235.69,posted
+INV-202610-0030,Fjord Logistics,1378.96,posted
+INV-202610-0031,Granite Co,8480.82,posted
+INV-202610-0032,Harbor Health,2865.17,posted
+INV-202610-0033,Acme Ltd,3422.08,posted
+INV-202610-0034,Brightline,8104.13,posted
+INV-202610-0035,Cobalt Foods,2966.40,posted
+INV-202610-0036,Delta Retail,5031.04,posted
+INV-202610-0037,Evergreen,4037.07,posted
+INV-202610-0038,Fjord Logistics,771.95,posted
+INV-202610-0039,Granite Co,5344.01,posted
+INV-202610-0040,Harbor Health,7627.80,posted

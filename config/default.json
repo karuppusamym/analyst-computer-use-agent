@@ -1,0 +1,30 @@
+{
+  "gateway": {
+    "base_url": "https://api.anthropic.com",
+    "token_env": "ANTHROPIC_API_KEY",
+    "auth_style": "x-api-key",
+    "backend": "http"
+  },
+  "workspace": {
+    "root": "./workspace",
+    "input_dirs": ["./samples"],
+    "output_dir": "./workspace/output"
+  },
+  "connectors": {
+    "databases": {"warehouse": "./samples/warehouse.sqlite"}
+  },
+  "policy": {
+    "allowed_hosts": ["127.0.0.1", "localhost"],
+    "allowed_apps": []
+  },
+  "tiers": {
+    "browser": {"enabled": true, "headless": true},
+    "desktop_uia": {"enabled": false},
+    "desktop_pixels": {
+      "enabled": false,
+      "dry_run": false,
+      "allowed_window_titles": ["Legacy Ledger - TEST"]
+    }
+  },
+  "audit": {"dir": "./workspace/audit"}
+}

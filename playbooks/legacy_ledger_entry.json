@@ -1,0 +1,28 @@
+{
+  "name": "legacy-ledger-entry",
+  "version": 1,
+  "owner": "finance-ops",
+  "workflow": "enter approved entry legacy desktop app ledger",
+  "description": "Enter one approved ledger entry into the Legacy Ledger desktop app, which has no API. Proves the pixel tier on a contained task. Guided mode: needs the model and the test app running.",
+  "permissions": {"data_class": "internal", "apps": ["python.exe", "pythonw.exe"]},
+  "parameters": {
+    "account": {"type": "string", "required": true},
+    "amount": {"type": "string", "required": true},
+    "memo": {"type": "string", "default": "agent entry"},
+    "ledger_csv": {"type": "string", "default": "workspace/legacy_ledger.csv"}
+  },
+  "steps": [
+    {
+      "id": "enter-ledger-row",
+      "intent": "Enter account {account}, amount {amount}, memo '{memo}' into Legacy Ledger and save it",
+      "tier": "desktop_pixels",
+      "approval": "required",
+      "action_class": "submit",
+      "instructions": "Take a screenshot. The window is titled 'Legacy Ledger - TEST'. Click the Account field and type {account}; click Amount and type {amount}; click Memo and type {memo}; click 'Save Entry'. Confirm the status line says the entry was saved.",
+      "checks": [
+        {"type": "file_exists", "path": "legacy_ledger.csv"},
+        {"type": "text_contains", "path": "legacy_ledger.csv", "text": ["{account}", "{amount}"]}
+      ]
+    }
+  ]
+}
