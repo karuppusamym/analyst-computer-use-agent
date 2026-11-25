@@ -113,6 +113,17 @@ python -m analyst_agent vault remove portal-pw
 
 - `run` without `--playbook` either matches a playbook from the request or has the planner build the steps. The planner needs the model.
 - `eval` runs `evals/tasks.json` (50 tasks: 5 per workflow for all 10 workflows, 3 tune / 2 holdout each, at least one safety task per workflow). Without a gateway token it runs offline: fully scripted playbooks run for real, and tasks that need the model are reported as `needs_model` (or `needs_tier` when a scripted tier such as the browser is missing) and left out of the pilot-gate math. `--split holdout` runs one split.
+- **Eval history.** Every `eval` run appends one row to `workspace/evals/history.jsonl`: run id, UTC timestamp, git commit (with a dirty flag), config name (the `--config` file's stem, else `default`), the model id for each role from the settings, each task's status, grade (`pass`/`fail`/`skip`), cost and seconds (plus the failing grader lines), and the pilot metrics. It also writes a self-contained HTML report to `workspace/evals/<run-id>.html` (inline CSS, light and dark mode, no scripts and no CDN).
+
+```powershell
+python -m analyst_agent eval history --last 10
+```
+```powershell
+python -m analyst_agent eval compare -2 -1
+```
+
+- `eval history` prints a trend table: pass/fail/skip counts, success rate and its change from the run before, unapproved outbound actions, cost per success and the pilot gate.
+- `eval compare <A> <B>` lists tasks that **regressed** (pass to fail) or **improved** (fail to pass), tasks newly skipped or newly graded, status changes, changed models and changed pilot metrics. Name a run by its id, a unique prefix of it, or a negative index (`-1` is the latest). It exits with 1 when anything regressed, so CI can gate on it.
 - `--unattended` declines every approval and reports it. Nothing is ever auto-approved.
 - `--resume <session>` continues from the last checkpoint.
 - Each run writes its audit log, screenshots, checkpoint and a "what I checked" report to `workspace/audit/<session>/`. Outputs go to `workspace/output/`.
@@ -192,6 +203,8 @@ python -m analyst_agent teach promote recon-taught --reviewer finance-team-lead
 
 - `from-session` reads a finished session's audit log and keeps only the verified steps. Scripted steps keep their script. A guided step whose tool calls can be replayed (`run_python`, connector calls, browser actions, UIA calls) becomes a scripted step; browser refs are turned into element descriptions (role + name, label, text). Pixel actions stay guided, with the recorded actions as hints. Values that repeat from the run's parameters or the request (e.g. `2026-10`) become `{period}`-style parameters. Checks carry over. A `provenance` block records the source session, `created_at` and `created_by`.
 - `record` opens a browser window (Playwright; it reports *unavailable* without it) on an allowlisted host (`policy.allowed_hosts`) and records clicks, fills, selects and navigations with robust targets (role + name, label, `data-testid`, then CSS). Close the window or press Ctrl+C to write the draft. Steps replay with the browser tier tools. Password fields are stored only as `{{secret:<field>}}`; the value never leaves the page. At replay the browser tier fills it from the credential vault (`vault set <field> --allow-host <host>`), and refuses if no allowed secret exists.
+- **Tabs and popups.** The recorder follows every page in the browser context, including popups opened by `window.open` or `target=_blank`. Each event carries its tab (0 = first tab, then in open order) and each popup its opener. The click that opened a popup is replayed with `expect_popup: true`: `browser_click` waits for the new tab and makes it current. An action in another tab first gets a `browser_switch_tab` step (`tab`, or `url_contains`, waiting up to `wait_s`). A tab opened by a page script with no click becomes a `browser_switch_tab` that waits for it. A popup on a host off the allowlist is closed, at recording and at replay. `provenance.tabs` counts the tabs used.
+- **Downloads and uploads.** A download in any tab turns the click that started it into a `browser_download` step with a `file_exists` check on `output/downloads/<name>`. Choosing a file for a file input becomes a `browser_upload` step whose path is a required `{<field>_path}` parameter. Only the file's base name is recorded (in the parameter's description), never its content or a local path. At replay `browser_upload` only takes a file the policy lets the agent read (input folders, workspace, output) and **always asks for approval** before setting it, because it sends a local file to a website. The approved upload is logged as an `outbound_action`.
 - Drafts go to `playbooks/drafts/` with `"status": "draft"`. `playbooks`, `run` and matching never use a draft.
 - `promote` checks the schema and that every step has a tier and a check (or an explicit `no_check_reason`), declares every `{param}` it uses, then moves the draft into `playbooks/`, bumps the version and records the reviewer.
 
@@ -239,7 +252,7 @@ The guard is defense in depth. Audit hooks can be bypassed by native extension c
 
 Windows 11 Home has no Windows Sandbox, so the tests use local targets that are safe to drive:
 
-- `test_targets/portal.py`: a localhost web portal with report downloads, weekly KPI packs (`/kpi`), a submit form for approval tests, and prompt-injection text (`/evil`, and a notice on `/kpi`).
+- `test_targets/portal.py`: a localhost web portal with report downloads, weekly KPI packs (`/kpi`), a submit form for approval tests, prompt-injection text (`/evil`, and a notice on `/kpi`), and a teach-recorder page (`/tabs`: a `target=_blank` popup with a download, a `window.open` popup, and a file upload form that keeps only each upload's name, size and SHA-256).
 - `test_targets/legacy_app.py`: the "Legacy Ledger - TEST" tkinter window for the pixel tier.
 - **Pixel tier guard:** every click or keystroke is refused unless the window in front matches `allowed_window_titles` or an allowed app. It can only act on the test app, and refusals are logged. `--dry-run-desktop` logs actions without sending them.
 - **Mock model:** a scripted model client tests the planner, executor and verifier loop without a gateway.
@@ -254,7 +267,7 @@ To include the live desktop tests, set the variable first. They move the mouse f
 $env:RUN_DESKTOP_TESTS = "1"
 ```
 
-Current result: **196 tests**. Without `RUN_DESKTOP_TESTS`, 193 pass and 3 skip (the live desktop tests; the clipboard test also skips when the clipboard is empty). Offline, the eval run passes all 44 graded tasks and skips 6 (4 `needs_model`, 2 `needs_tier`). On OpenRouter all 48 graded tasks pass.
+Current result: **206 tests**. Without `RUN_DESKTOP_TESTS`, 203 pass and 3 skip (the live desktop tests; the clipboard test also skips when the clipboard is empty). Offline, the eval run passes all 44 graded tasks and skips 6 (4 `needs_model`, 2 `needs_tier`). On OpenRouter all 48 graded tasks pass.
 
 The live desktop end-to-end test runs playbook → approval → router → executor → real pixel tier → test app → verifier.
 
@@ -269,6 +282,7 @@ analyst_agent/
   tools/        connectors, code (+ sandbox Job Object, _sandbox_guard audit hook), browser, desktop_uia, computer (+ screen_win ctypes)
   vault.py      credential vault (DPAPI / env / keyring), {{secret:name}} resolution
   playbook.py checks.py policy.py audit.py checkpoint.py report.py evals.py gateway_check.py
+  eval_history.py  eval history.jsonl rows, `eval history` / `eval compare`, per-run HTML report
   teach.py      teach mode: drafts from sessions, browser recorder, promote
   scheduler.py  cron parser, schedules, unattended run-due
   portal/       web portal: server, views, auth (local / SSO header / OIDC), WebApprover inbox, runs, playbook review
@@ -291,7 +305,12 @@ tests/          unit, integration and live desktop tests
   - A restart can't reconnect a waiting run. Its pending requests are declined as orphaned, and the session has to be resumed from its last checkpoint. The plan is approved again, and an unverified step that was in progress runs again.
   - Visibility is per user, not per team. Sharing a session, or limiting reviewers to particular playbooks or approvers, is not built yet.
 - **Later-phase features:** a Guacamole/noVNC interactive desktop is still a Phase 3 item. The credential vault is local only (DPAPI, env or keyring). There is no central secret store, rotation or per-user sharing yet.
-- **Teach recorder:** records the first tab only and has been tested by driving the page in code, not with a person clicking in a headed window.
+- **Teach recorder:** has been tested by driving the page in code (`tests/test_teach.py`, against the `/tabs` page of the test portal), not with a person clicking in a headed window. Still limited:
+  - A link that downloads straight into a new tab (`target=_blank` on an attachment) is reported as a warning, not replayed, because the download belongs to a tab that closes itself.
+  - Tabs are matched by open order. If a site opens its tabs in a different order at replay, the `browser_switch_tab` steps need `url_contains` instead of `tab`, by hand.
+  - Closing a tab is not recorded. Replay leaves popups open and switches back by index.
+  - A multi-file upload replays one path only (with a warning). Drag-and-drop uploads are not recorded.
+  - Actions inside iframes are recorded, but replay looks for their targets in the main frame only, so those steps fail.
 - **The code tier is contained, not sandboxed.** The Job Object and the audit-hook guard limit it, but they are not an isolation boundary. Production needs the disposable per-task VM or container from the design, with network egress blocked there, since Windows Home can't block network per process without the firewall.
 - **Pixel-tier evals.** The 2 approved legacy-ledger entry tasks need the pixel tier, which moves the real mouse, so they have not run with a real model here. Run them on the isolated agent VM with `tiers.desktop_pixels.enabled`.
 

@@ -314,6 +314,61 @@ class RecorderConversionTests(unittest.TestCase):
         self.assertEqual([s["script"]["tool"] for s in steps], ["browser_goto", "browser_fill", "browser_click"])
 
 
+class RecorderTabsConversionTests(unittest.TestCase):
+    START = "http://127.0.0.1:9/tabs"
+    B = "http://127.0.0.1:9/"
+
+    def ev(self, t, type, tab=0, **kw):
+        return {"t": t, "type": type, "tab": tab, **kw}
+
+    def test_popups_switches_downloads_and_uploads(self):
+        export = [{"role": "link", "name": "Open export window"}]
+        dl = [{"role": "link", "name": "Download summary"}]
+        helpb = [{"role": "button", "name": "Open help"}]
+        att = [{"label": "Attachment"}, {"css": "#attachment"}]
+        events = [
+            self.ev(1, "navigate", url=self.START),
+            self.ev(1000, "click", targets=export, role="link", name="Open export window", href=self.B + "export"),
+            self.ev(1100, "navigate", tab=1, url=self.B + "export"),  # reported before the popup itself
+            self.ev(1101, "popup", tab=1, opener=0, url=self.B + "export"),
+            self.ev(2000, "click", tab=1, targets=dl, role="link", name="Download summary", href=self.B + "download/summary.csv"),
+            self.ev(2100, "download", tab=1, filename="summary.csv"),
+            self.ev(3000, "click", targets=helpb, role="button", name="Open help"),
+            self.ev(3100, "popup", tab=2, opener=0, url="about:blank"),
+            self.ev(3200, "navigate", tab=2, url=self.B + "help"),  # the popup's own load
+            self.ev(4000, "popup", tab=3, opener=0, url=self.B + "help"),  # opened by a script, no click
+            self.ev(5000, "upload", tab=0, targets=att, label="Attachment", field="attachment", files=["C:\\Users\\me\\secret\\pack.csv", "b.csv"], value="C:\\fakepath\\pack.csv"),
+        ]
+        steps, params, warnings = events_to_steps(events, self.START)
+        got = [(s["script"]["tool"], s["script"]["input"]) for s in steps]
+        self.assertEqual([g[0] for g in got], ["browser_goto", "browser_click", "browser_download", "browser_switch_tab", "browser_click", "browser_switch_tab", "browser_switch_tab", "browser_upload"], json.dumps(got, indent=1))
+        self.assertTrue(got[1][1]["expect_popup"])
+        self.assertNotIn("expect_popup", got[2][1])
+        self.assertEqual(got[3][1], {"tab": 0})
+        self.assertTrue(got[4][1]["expect_popup"])
+        self.assertEqual(got[5][1], {"tab": 3, "wait_s": 10})  # script-opened tab: wait for it
+        self.assertEqual(got[6][1], {"tab": 0})
+        self.assertEqual(got[7][1], {"targets": att, "path": "{attachment_path}"})
+        self.assertEqual(steps[2]["checks"], [{"type": "file_exists", "path": "output/downloads/summary.csv"}])
+        self.assertTrue(params["attachment_path"]["required"])
+        self.assertNotIn("default", params["attachment_path"])
+        self.assertIn("pack.csv", params["attachment_path"]["description"])
+        self.assertTrue(any("only one path" in w for w in warnings))
+        data = recording_to_draft("tabs-flow", self.START, events, created_by="tester")
+        raw = json.dumps(data)
+        self.assertNotIn("secret\\\\pack", raw)  # only the base name survives
+        self.assertNotIn("fakepath", raw)
+        self.assertEqual(data["provenance"]["tabs"], 4)
+        self.assertEqual(validate_draft(data), [])
+
+    def test_clean_event_tabs_and_files(self):
+        out = clean_event({"type": "upload", "tab": "2", "opener": "x", "files": ["/home/u/a.csv", "C:\\d\\b.csv"], "value": "C:\\fakepath\\a.csv", "targets": []})
+        self.assertEqual(out["tab"], 2)
+        self.assertNotIn("opener", out)
+        self.assertEqual(out["files"], ["a.csv", "b.csv"])
+        self.assertNotIn("value", out)
+
+
 class RecordUnavailableTest(Base):
     def test_record_reports_unavailable_cleanly(self):
         import contextlib
@@ -455,6 +510,78 @@ class LiveBrowserTeachTests(unittest.TestCase):
         self.assertEqual(r2.status, "success", [(x.step.id, x.status, x.summary) for x in r2.records])
         self.assertEqual(backend.requests, [])
         self.assertTrue((self.s.output_dir / "downloads" / "report_wk46.csv").exists())
+
+    def test_record_popups_download_upload_then_replay(self):
+        self.portal.UPLOADS.clear()
+        content = "region,amount\nNorth,PRIVATE-CONTENT-123\n"
+        upload = self.ws.root / "samples" / "pack.csv"
+        upload.write_bytes(content.encode())
+
+        def drive(page):
+            with page.expect_popup() as info:
+                page.get_by_role("link", name="Open export window").click()
+            export = info.value
+            export.wait_for_load_state()
+            with export.expect_download():
+                export.get_by_role("link", name="Download summary").click()
+            with page.expect_popup() as info:
+                page.get_by_role("button", name="Open help").click()
+            info.value.wait_for_load_state()
+            info.value.close()
+            page.bring_to_front()
+            page.get_by_role("link", name="Upload a file").click()
+            page.wait_for_url("**/upload")
+            page.get_by_label("Attachment").set_input_files(str(upload))
+            page.get_by_label("Comment").fill("monthly pack")
+            page.get_by_role("button", name="Upload").click()
+            page.wait_for_url("**/uploaded")
+            page.wait_for_timeout(300)
+
+        path, data = record_draft(self.s, "tabs-recorded", self.base + "/tabs", self.pbdir, headless=True, driver=drive, created_by="tester")
+        raw = path.read_text(encoding="utf-8")
+        self.assertNotIn("PRIVATE-CONTENT-123", raw)
+        self.assertNotIn(str(upload.parent), raw)  # no local path, only the file name
+        self.assertEqual(len(self.portal.UPLOADS), 1)
+        steps = data["steps"]
+        tools = [s["script"]["tool"] for s in steps]
+        self.assertEqual(tools, ["browser_goto", "browser_click", "browser_download", "browser_switch_tab", "browser_click", "browser_switch_tab", "browser_click", "browser_upload", "browser_fill", "browser_click"], json.dumps(steps, indent=1))
+        self.assertTrue(steps[1]["script"]["input"]["expect_popup"])
+        self.assertTrue(steps[4]["script"]["input"]["expect_popup"])
+        self.assertEqual(steps[3]["script"]["input"], {"tab": 0})
+        self.assertEqual(steps[7]["script"]["input"]["path"], "{attachment_path}")
+        self.assertEqual(steps[2]["checks"], [{"type": "file_exists", "path": "output/downloads/summary.csv"}])
+        self.assertEqual(data["provenance"]["tabs"], 3)
+        self.assertEqual(validate_draft(data), [])
+
+        # Replay every step with the browser tier and no model; the upload is approved once.
+        self.portal.UPLOADS.clear()
+        steps[-1].pop("checks")
+        steps[-1]["no_check_reason"] = "checked by the test against the portal's UPLOADS"
+        r, backend = self._replay(data, {"attachment_path": str(upload), "comment": "replayed"}, approvals=[True])
+        self.assertEqual(r.status, "success", [(x.step.id, x.status, x.summary) for x in r.records])
+        self.assertEqual(backend.requests, [])
+        self.assertEqual(self.portal.UPLOADS, [{"filename": "pack.csv", "size": len(content.encode()), "sha256": __import__("hashlib").sha256(content.encode()).hexdigest(), "comment": "replayed"}])
+        self.assertEqual((self.s.output_dir / "downloads" / "summary.csv").read_text(encoding="utf-8"), self.portal.SUMMARY_CSV)
+
+        # Without approval nothing is uploaded; a path outside the allowed folders is refused.
+        from analyst_agent.policy import PolicyEngine
+        from analyst_agent.tools.base import ToolContext
+        from analyst_agent.tools.browser import BrowserTier
+
+        tier = BrowserTier(self.s)
+        ctx = ToolContext(self.s, PolicyEngine(self.s), AuditLog(self.s.audit_dir), ScriptedApprover([False]), step_id="t")
+        try:
+            tier.execute({"name": "browser_goto", "input": {"url": self.base + "/upload"}}, ctx)
+            out = tier.execute({"name": "browser_upload", "input": {"targets": [{"label": "Attachment"}], "path": str(upload)}}, ctx)
+            self.assertTrue(out.is_error)
+            self.assertIn("needs human approval", out.text)
+            out = tier.execute({"name": "browser_upload", "input": {"targets": [{"label": "Attachment"}], "path": str(ROOT / "README.md")}}, ctx)
+            self.assertTrue(out.is_error)
+            self.assertIn("may not read", out.text)
+            out = tier.execute({"name": "browser_switch_tab", "input": {"tab": 5, "wait_s": 0.2}}, ctx)
+            self.assertTrue(out.is_error)
+        finally:
+            tier.close()
 
     def test_record_refuses_host_off_allowlist(self):
         with self.assertRaisesRegex(TeachError, "allowlist"):

@@ -8,6 +8,11 @@
 Drafts live in playbooks/drafts/ with "status": "draft". PlaybookRegistry never
 matches or runs them until they are promoted. Recorded password fields are stored
 only as a {{secret:<field>}} placeholder; the value never reaches Python.
+The recorder follows every tab of the browser context (popups included): steps
+carry the tab through `expect_popup` on the click that opened it and
+`browser_switch_tab` steps. Downloads become browser_download steps; file
+uploads become browser_upload steps with a `{<field>_path}` parameter (only the
+file name is seen, never the file content).
 """
 
 from __future__ import annotations
@@ -46,7 +51,7 @@ READ_ONLY_TOOLS = {
     "screenshot", "zoom", "cursor_position", "wait",
 }
 CONNECTOR_ACTIONS = {"copy_file", "sql_query", "draft_email"}
-BROWSER_REF_TOOLS = {"browser_click", "browser_fill", "browser_select", "browser_download"}
+BROWSER_REF_TOOLS = {"browser_click", "browser_fill", "browser_select", "browser_download", "browser_upload"}
 UIA_ACTIONS = {"uia_invoke", "uia_set_text"}
 _NO_PARAM_KEYS = {"id", "tier", "kind", "tool", "type", "mode", "approval", "action_class", "role"}
 
@@ -231,6 +236,9 @@ def _convert_action(call: dict, snapshot: dict[str, dict]) -> dict | None:
         return {"tier": "desktop_uia", "script": {"kind": "tool", "tool": name, "input": inp}, "intent": f"{'Press' if name == 'uia_invoke' else 'Set text of'} '{what}' in '{inp.get('window', '')}'"}
     if name == "browser_goto" and inp.get("url"):
         return {"tier": "browser", "script": {"kind": "tool", "tool": "browser_goto", "input": {"url": inp["url"]}}, "intent": f"Open {inp['url']}"}
+    if name == "browser_switch_tab" and (inp.get("tab") is not None or inp.get("url_contains")):
+        keep = {k: inp[k] for k in ("tab", "url_contains", "wait_s") if k in inp}
+        return {"tier": "browser", "script": {"kind": "tool", "tool": name, "input": keep}, "intent": f"Switch to tab {inp.get('tab', inp.get('url_contains'))}"}
     if name in BROWSER_REF_TOOLS:
         el = snapshot.get(inp.get("ref", ""))
         if not el or not el["name"]:
@@ -240,7 +248,11 @@ def _convert_action(call: dict, snapshot: dict[str, dict]) -> dict | None:
             new["text"] = "{{secret:" + _slug(el["name"]) + "}}" if el["type"] == "password" or "password" in el["name"].lower() else inp.get("text", "")
         if name == "browser_select":
             new["value"] = inp.get("value", "")
-        verb = {"browser_click": "Click", "browser_fill": "Fill", "browser_select": "Select in", "browser_download": "Download via"}[name]
+        if name == "browser_upload":
+            new["path"] = inp.get("path", "")
+        if name == "browser_click" and inp.get("expect_popup"):
+            new["expect_popup"] = True
+        verb = {"browser_click": "Click", "browser_fill": "Fill", "browser_select": "Select in", "browser_download": "Download via", "browser_upload": "Upload a file into"}[name]
         return {"tier": "browser", "script": {"kind": "tool", "tool": name, "input": new}, "intent": f"{verb} '{el['name']}'"}
     return None
 
@@ -535,6 +547,10 @@ RECORDER_JS = r"""
   document.addEventListener('input', (e) => { if (isText(e.target)) dirty.add(e.target); }, true);
   document.addEventListener('change', (e) => {
     const el = e.target;
+    if (el.tagName === 'INPUT' && typeOf(el) === 'file') {  // file names only, never the content
+      send(Object.assign({type: 'upload', files: Array.from(el.files || []).map(f => f.name).slice(0, 20)}, describe(el)));
+      return;
+    }
     if (el.tagName === 'SELECT') {
       const opt = el.options[el.selectedIndex];
       send(Object.assign({type: 'select', value: el.value, option: opt ? txt(opt.text) : ''}, describe(el)));
@@ -548,6 +564,8 @@ RECORDER_JS = r"""
     const el = (e.target.closest && e.target.closest(CLICKABLE)) || e.target;
     if (!el || !el.tagName) return;
     if (isText(el) || el.tagName === 'SELECT' || el.tagName === 'OPTION') return;  // focus clicks; fills/selects cover them
+    const fileInput = (el.tagName === 'INPUT' && typeOf(el) === 'file') || (el.tagName === 'LABEL' && el.control && typeOf(el.control) === 'file');
+    if (fileInput) return;  // opens the file chooser; the upload event covers it
     const a = el.closest('a');
     send(Object.assign({type: 'click', href: a && a.href ? a.href : ''}, describe(el)));
   }, true);
@@ -561,12 +579,13 @@ RECORDER_JS = r"""
 })();
 """
 
-_EVENT_KEYS = {"type", "t", "tag", "role", "name", "label", "input_type", "field", "secret", "masked", "targets", "value", "option", "href", "url", "filename", "title", "reason"}
+_EVENT_KEYS = {"type", "t", "tag", "role", "name", "label", "input_type", "field", "secret", "masked", "targets", "value", "option", "href", "url", "filename", "title", "reason", "tab", "opener", "files"}
+PAGE_EVENT_TYPES = ("click", "fill", "select", "submit", "upload")  # what the page script may report
 
 
 def clean_event(ev: Any) -> dict | None:
     """Whitelist an event from the page. Secret fields never keep a value (defence in depth)."""
-    if not isinstance(ev, dict) or ev.get("type") not in ("click", "fill", "select", "submit", "navigate", "download", "blocked", "popup"):
+    if not isinstance(ev, dict) or ev.get("type") not in (*PAGE_EVENT_TYPES, "navigate", "download", "blocked", "popup"):
         return None
     out = {k: v for k, v in ev.items() if k in _EVENT_KEYS}
     if out.get("secret") or out.get("masked") or out.get("input_type") == "password":
@@ -579,6 +598,16 @@ def clean_event(ev: Any) -> dict | None:
             if t:
                 targets.append(t)
     out["targets"] = targets
+    for k in ("tab", "opener"):
+        if k in out:
+            try:
+                out[k] = int(out[k])
+            except (TypeError, ValueError):
+                out.pop(k)
+    if "files" in out:  # base names only; a browser never reveals the local path
+        out["files"] = [re.split(r"[\\/]", str(f))[-1][:200] for f in (out["files"] if isinstance(out["files"], list) else [])][:20]
+    if out["type"] == "upload":
+        out.pop("value", None)
     out["t"] = float(out.get("t") or time.time() * 1000)
     return out
 
@@ -592,62 +621,104 @@ def _describe(ev: dict) -> str:
 
 
 def events_to_steps(events: list[dict], start_url: str, cause_window_ms: float = 5000) -> tuple[list[dict], dict[str, dict], list[str]]:
-    """Recorded events -> (steps, parameters, warnings). Steps replay with the browser tier tools."""
+    """Recorded events -> (steps, parameters, warnings). Steps replay with the browser tier tools.
+
+    Events carry `tab` (open order, 0 = first page). A popup marks the click that opened it with
+    `expect_popup` (the replay then continues in the new tab); an action on another tab first
+    gets a browser_switch_tab step.
+    """
     evs = sorted((e for e in (clean_event(x) for x in events) if e), key=lambda e: e["t"])
-    actions: list[dict] = [{"tool": "browser_goto", "input": {"url": start_url}, "intent": f"Open {start_url}", "t": 0.0}]
+    actions: list[dict] = [{"tool": "browser_goto", "input": {"url": start_url}, "intent": f"Open {start_url}", "t": 0.0, "tab": 0}]
     warnings: list[str] = []
     params: dict[str, dict] = {}
-    current = _norm_url(start_url)
-    last_cause: dict | None = None  # the click/submit that may explain the next navigation
+    current: dict[int, str] = {0: _norm_url(start_url)}  # last URL per tab
+    last_cause: dict[int, dict] = {}  # per tab: the click/submit that may explain the next navigation
+    first_load: set[int] = set()  # popups whose first navigation is their own opening
+    loaded: set[int] = {0}  # tabs whose first page load has been seen
+    state = {"cur": 0}  # the tab the replay is on
+
+    def on_tab(tab: int, t: float) -> None:
+        if tab != state["cur"]:
+            actions.append({"tool": "browser_switch_tab", "input": {"tab": tab}, "intent": f"Switch to tab {tab}", "t": t, "tab": tab})
+            state["cur"] = tab
 
     for ev in evs:
         kind = ev["type"]
+        tab = ev.get("tab", 0)
+        if kind == "popup":
+            opener = ev.get("opener")
+            url = ev.get("url", "")
+            if url and not url.startswith("about:"):
+                current[tab] = _norm_url(url)
+                loaded.add(tab)
+            elif tab not in loaded:
+                first_load.add(tab)
+            cause = None
+            for a in reversed(actions):
+                if a["tool"] in ("browser_click", "browser_download") and a.get("tab") == opener and ev["t"] - a["t"] <= cause_window_ms and not a.get("opened"):
+                    cause = a
+                    break
+            if cause is not None and cause["tool"] == "browser_click":
+                cause["input"]["expect_popup"] = True
+                cause["opened"] = tab
+                state["cur"] = tab
+            else:
+                why = "a page script" if opener is not None else "the browser"
+                actions.append({"tool": "browser_switch_tab", "input": {"tab": tab, "wait_s": 10}, "intent": f"Wait for the new tab {tab} opened by {why} and switch to it", "t": ev["t"], "tab": tab})
+                state["cur"] = tab
+            continue
         if kind == "navigate":
             url = ev.get("url", "")
-            if _norm_url(url) == current:
+            if tab in first_load or tab not in loaded:
+                # A popup's own opening (its navigation can be reported just before the popup itself).
+                first_load.discard(tab)
+                loaded.add(tab)
+                current[tab] = _norm_url(url)
+                continue
+            if _norm_url(url) == current.get(tab):
                 continue
             caused = False
-            if last_cause and ev["t"] - last_cause["t"] <= cause_window_ms and not last_cause.get("used"):
-                href = last_cause.get("href", "")
-                caused = not href or _norm_url(href) == _norm_url(url) or last_cause.get("kind") == "submit"
+            lc = last_cause.get(tab)
+            if lc and ev["t"] - lc["t"] <= cause_window_ms and not lc.get("used"):
+                href = lc.get("href", "")
+                caused = not href or _norm_url(href) == _norm_url(url) or lc.get("kind") == "submit"
                 if caused:
-                    last_cause["used"] = True
-            current = _norm_url(url)
+                    lc["used"] = True
+            current[tab] = _norm_url(url)
             if not caused:
-                actions.append({"tool": "browser_goto", "input": {"url": url}, "intent": f"Open {url}", "t": ev["t"]})
+                on_tab(tab, ev["t"])
+                actions.append({"tool": "browser_goto", "input": {"url": url}, "intent": f"Open {url}", "t": ev["t"], "tab": tab})
             continue
         if kind == "blocked":
             warnings.append(f"navigation to {ev.get('url')} was blocked (host not on the allowlist); not recorded")
             continue
-        if kind == "popup":
-            warnings.append(f"a new tab/window opened ({ev.get('url', '')}); only the first tab is recorded")
-            continue
         if kind == "download":
             for a in reversed(actions):
-                if a["tool"] == "browser_click":
+                if a["tool"] == "browser_click" and a.get("tab") == tab and not a["input"].get("expect_popup"):
                     a["tool"] = "browser_download"
                     a["intent"] = f"Download via '{a.get('label_text', 'link')}'"
                     a["filename"] = ev.get("filename", "")
                     break
             else:
-                warnings.append(f"download {ev.get('filename')} had no recorded click")
+                warnings.append(f"download {ev.get('filename')} had no recorded click in its tab (a link that downloads into a new tab is not replayable yet)")
             continue
         if not ev["targets"]:
             if kind == "submit":
                 warnings.append("a form was submitted without a submit button; replay may need a manual step")
             continue
         label = _describe(ev)
+        on_tab(tab, ev["t"])
         prev = actions[-1]
         if kind == "click":
             if prev["tool"] == "browser_click" and prev["input"].get("targets") == ev["targets"] and ev["t"] - prev["t"] < 400:
                 continue  # double click
-            actions.append({"tool": "browser_click", "input": {"targets": ev["targets"]}, "intent": f"Click {ev.get('role') or ev.get('tag')} '{label}'", "label_text": label, "t": ev["t"]})
-            last_cause = {"t": ev["t"], "href": ev.get("href", ""), "kind": "click"}
+            actions.append({"tool": "browser_click", "input": {"targets": ev["targets"]}, "intent": f"Click {ev.get('role') or ev.get('tag')} '{label}'", "label_text": label, "t": ev["t"], "tab": tab})
+            last_cause[tab] = {"t": ev["t"], "href": ev.get("href", ""), "kind": "click"}
         elif kind == "submit":
-            if prev["tool"] == "browser_click" and ev["t"] - prev["t"] <= 1500:
+            if prev["tool"] in ("browser_click", "browser_download") and ev["t"] - prev["t"] <= 1500:
                 continue  # the click already submitted it
-            actions.append({"tool": "browser_click", "input": {"targets": ev["targets"]}, "intent": f"Submit the form ('{label}')", "label_text": label, "t": ev["t"]})
-            last_cause = {"t": ev["t"], "href": "", "kind": "submit"}
+            actions.append({"tool": "browser_click", "input": {"targets": ev["targets"]}, "intent": f"Submit the form ('{label}')", "label_text": label, "t": ev["t"], "tab": tab})
+            last_cause[tab] = {"t": ev["t"], "href": "", "kind": "submit"}
         elif kind == "fill":
             if ev.get("masked"):
                 text = "{{secret:" + _slug(ev.get("field") or label, "password") + "}}"
@@ -658,22 +729,36 @@ def events_to_steps(events: list[dict], start_url: str, cause_window_ms: float =
             if prev["tool"] == "browser_fill" and prev["input"]["targets"] == ev["targets"]:
                 prev["input"]["text"] = text
                 continue
-            actions.append({"tool": "browser_fill", "input": {"targets": ev["targets"], "text": text}, "intent": f"Fill '{label}'" + (" (secret from the credential vault)" if ev.get("masked") else ""), "t": ev["t"]})
+            actions.append({"tool": "browser_fill", "input": {"targets": ev["targets"], "text": text}, "intent": f"Fill '{label}'" + (" (secret from the credential vault)" if ev.get("masked") else ""), "t": ev["t"], "tab": tab})
+        elif kind == "upload":
+            files = ev.get("files") or []
+            if not files:
+                continue  # the person cleared the file input
+            pname = _slug(ev.get("field") or label, "file") + "_path"
+            if len(files) > 1:
+                warnings.append(f"{len(files)} files were chosen for '{label}'; only one path ({{{pname}}}) is replayed")
+            params[pname] = {"type": "string", "required": True, "description": f"local path of the file to upload into '{label}' (recorded file name: {files[0]})"}
+            if prev["tool"] == "browser_upload" and prev["input"]["targets"] == ev["targets"]:
+                continue
+            actions.append({"tool": "browser_upload", "input": {"targets": ev["targets"], "path": "{" + pname + "}"}, "intent": f"Upload a file into '{label}' (needs approval at replay)", "t": ev["t"], "tab": tab})
         elif kind == "select":
             if prev["tool"] == "browser_select" and prev["input"]["targets"] == ev["targets"]:
                 prev["input"]["value"] = ev.get("value", "")
                 continue
-            actions.append({"tool": "browser_select", "input": {"targets": ev["targets"], "value": ev.get("value", "")}, "intent": f"Select '{ev.get('option') or ev.get('value')}' in '{label}'", "t": ev["t"]})
+            actions.append({"tool": "browser_select", "input": {"targets": ev["targets"], "value": ev.get("value", "")}, "intent": f"Select '{ev.get('option') or ev.get('value')}' in '{label}'", "t": ev["t"], "tab": tab})
 
     steps = []
     for n, a in enumerate(actions, start=1):
         st = {"id": f"step-{n:02d}", "intent": a["intent"], "tier": "browser", "script": {"kind": "tool", "tool": a["tool"], "input": a["input"]}, "learned_from": "recorder"}
+        if a["tool"] == "browser_click" and a["input"].get("expect_popup"):
+            st["intent"] += f" (opens tab {a['opened']})"
         if a["tool"] == "browser_download" and a.get("filename"):
             fname = re.sub(r"[^\w.\-]", "_", a["filename"])
             st["checks"] = [{"type": "file_exists", "path": f"output/downloads/{fname}"}]
         steps.append(st)
     if not any("checks" in s for s in steps[-1:]):
-        steps[-1]["checks"] = [{"type": "model", "criteria": f"The browser finished at {current or start_url} and the page shows the expected result of: {steps[-1]['intent']}"}]
+        where = current.get(state["cur"]) or start_url
+        steps[-1]["checks"] = [{"type": "model", "criteria": f"The browser finished at {where} and the page shows the expected result of: {steps[-1]['intent']}"}]
     for st in steps[:-1]:
         if "checks" not in st:
             st["no_check_reason"] = NO_CHECK_INTERMEDIATE
@@ -686,6 +771,10 @@ def recording_to_draft(name: str, start_url: str, events: list[dict], created_by
     for s in steps:
         if s["script"]["tool"] == "browser_goto":
             hosts.add((urlparse(s["script"]["input"]["url"]).hostname or "").lower())
+    blocked = {_norm_url(e.get("url", "")) for e in events if isinstance(e, dict) and e.get("type") == "blocked"}
+    for e in events:  # pages reached by clicks or opened as popups in any tab
+        if isinstance(e, dict) and e.get("type") in ("navigate", "popup") and str(e.get("url", "")).startswith(("http:", "https:")) and _norm_url(e["url"]) not in blocked:
+            hosts.add((urlparse(e["url"]).hostname or "").lower())
     hosts.discard("")
     who = created_by or _user()
     return {
@@ -705,6 +794,7 @@ def recording_to_draft(name: str, start_url: str, events: list[dict], created_by
             "created_at": _now_iso(),
             "created_by": who,
             "events": len(events),
+            "tabs": 1 + max([int(e["tab"]) for e in events if isinstance(e, dict) and isinstance(e.get("tab"), int)] or [0]),
             "warnings": warnings,
             "secrets": sorted({m for s in steps for m in re.findall(r"\{\{secret:([^}]+)\}\}", json.dumps(s))}),
         },
@@ -741,7 +831,8 @@ def record_browser(settings: Settings, start_url: str, headless: bool = False, d
     from playwright.sync_api import sync_playwright
 
     events: list[dict] = []
-    state = {"closed": False, "back": None}
+    state = {"closed": False, "back": []}  # back: (page, url) left the allowlist
+    pages: list = []  # every page in open order; index = tab
 
     def push(ev: dict) -> None:
         ev = clean_event(ev)
@@ -750,35 +841,62 @@ def record_browser(settings: Settings, start_url: str, headless: bool = False, d
             if on_event:
                 on_event(ev)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        context = browser.new_context(accept_downloads=True)
-        context.expose_binding("__agentTeachRecord", lambda source, ev: push(ev))
-        context.add_init_script(RECORDER_JS)
-        page = context.new_page()
+    def tab_of(pg) -> int:
+        if pg not in pages:
+            attach(pg)
+        return pages.index(pg)
+
+    def from_page(source, ev) -> None:
+        # Only element events come from page script; the tab is taken from the real source page.
+        if isinstance(ev, dict) and ev.get("type") in PAGE_EVENT_TYPES:
+            push({**{k: v for k, v in ev.items() if k not in ("tab", "opener")}, "tab": tab_of(source["page"])})
+
+    def attach(pg) -> None:
+        if pg in pages:
+            return
+        pages.append(pg)
+        idx = len(pages) - 1
 
         def on_nav(frame) -> None:
-            if frame != page.main_frame or frame.url.startswith(("about:", "data:", "chrome-error:")):
+            if frame != pg.main_frame or frame.url.startswith(("about:", "data:", "chrome-error:")):
                 return
             try:
                 policy.check_url(frame.url)
             except PolicyViolation:
-                push({"type": "blocked", "url": frame.url})
-                state["back"] = frame.url
+                push({"type": "blocked", "url": frame.url, "tab": idx})
+                state["back"].append((pg, idx, frame.url))
                 return
-            push({"type": "navigate", "url": frame.url})
+            push({"type": "navigate", "url": frame.url, "tab": idx})
 
-        page.on("framenavigated", on_nav)
-        page.on("download", lambda d: push({"type": "download", "filename": d.suggested_filename}))
-        page.on("close", lambda _p: state.update(closed=True))
-        context.on("page", lambda pg: pg is not page and push({"type": "popup", "url": pg.url}))
+        def on_popup(child) -> None:
+            child_idx = tab_of(child)
+            push({"type": "popup", "url": child.url, "tab": child_idx, "opener": idx})
+
+        pg.on("framenavigated", on_nav)
+        pg.on("popup", on_popup)
+        pg.on("download", lambda d: push({"type": "download", "filename": d.suggested_filename, "tab": idx}))
+
+    def live_page():
+        return next((pg for pg in pages if not pg.is_closed()), None)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        context = browser.new_context(accept_downloads=True)
+        context.expose_binding("__agentTeachRecord", from_page)
+        context.add_init_script(RECORDER_JS)
+        context.on("page", attach)
+        page = context.new_page()
+        attach(page)
         browser.on("disconnected", lambda _b: state.update(closed=True))
 
         def settle() -> None:
-            if state["back"]:
-                state["back"] = None
+            while state["back"]:
+                pg, idx, _url = state["back"].pop(0)
                 try:
-                    page.go_back()
+                    if idx == 0:
+                        pg.go_back()
+                    elif not pg.is_closed():
+                        pg.close()  # a popup off the allowlist has nothing to go back to
                 except PWError:
                     pass
 
@@ -789,20 +907,31 @@ def record_browser(settings: Settings, start_url: str, headless: bool = False, d
                 settle()
             else:
                 while not state["closed"]:
+                    pg = live_page()
+                    if pg is None:
+                        break
                     try:
-                        page.wait_for_timeout(250)
+                        pg.wait_for_timeout(250)
                         settle()
                     except PWError:
-                        break
+                        if live_page() is None:
+                            break
         except KeyboardInterrupt:
             pass
         finally:
-            try:
-                if not state["closed"]:
-                    page.evaluate("() => window.__agentTeachFlush && window.__agentTeachFlush()")
-                    page.wait_for_timeout(100)
-            except Exception:
-                pass
+            if not state["closed"]:
+                for pg in pages:
+                    try:
+                        if not pg.is_closed():
+                            pg.evaluate("() => window.__agentTeachFlush && window.__agentTeachFlush()")
+                    except Exception:
+                        pass
+                try:
+                    pg = live_page()
+                    if pg is not None:
+                        pg.wait_for_timeout(100)
+                except Exception:
+                    pass
             for closer in (context.close, browser.close):
                 try:
                     closer()
