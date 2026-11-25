@@ -53,7 +53,12 @@ DEFAULTS: dict[str, Any] = {
         "connector": {"enabled": True},
         # Code tier containment (see tools/code.py, tools/sandbox.py). cpu_s null = timeout_s.
         "code": {"enabled": True, "timeout_s": 300, "memory_mb": 1024, "max_processes": 1, "cpu_s": None,
-                 "allow_network": False, "python_guard": True, "ui_restrictions": True, "require_job": True},
+                 "allow_network": False, "python_guard": True, "ui_restrictions": True, "require_job": True,
+                 # backend "local" (Job Object + guard) or "docker" (disposable container per step, tools/docker_backend.py).
+                 # docker fails closed when unavailable unless fallback_to_local. docker_cli: path or argv prefix.
+                 "backend": "local", "fallback_to_local": False, "docker_cli": "docker",
+                 "docker": {"image": "python:3.13-slim", "pull": "if-missing", "cpus": 1.0, "pids_limit": 64, "tmpfs_mb": 64,
+                            "max_output_file_mb": 100, "max_output_total_mb": 500, "max_output_files": 2000}},
         "browser": {"enabled": True, "headless": True},
         "desktop_uia": {"enabled": False},
         # Pixel control drives a real mouse and keyboard. Only enable it inside
