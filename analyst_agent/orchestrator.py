@@ -91,7 +91,10 @@ class Orchestrator:
         return (audit.dir / "STOP").exists() or (self.settings.workspace_root / "STOP").exists()
 
     # ------------------------------------------------------------------ main entry
-    def run(self, request: str, playbook: Playbook | None = None, params: dict | None = None, session_id: str | None = None, resume: bool = False) -> TaskResult:
+    def run(self, request: str, playbook: Playbook | None = None, params: dict | None = None, session_id: str | None = None, resume: bool = False, guide: Playbook | None = None) -> TaskResult:
+        """playbook: follow it exactly (scripted replay). guide: a playbook matched to the request,
+        given to the planner as a reference so the plan covers everything the request asks."""
+        self._guide = guide
         s = self.settings
         s.output_dir.mkdir(parents=True, exist_ok=True)
         audit = AuditLog(s.audit_dir, session_id=session_id, user=self.user)
@@ -168,6 +171,7 @@ class Orchestrator:
                     break
                 audit.event("replanned", steps=[st.to_dict() for st in new.steps])
                 records = [r for r in records if r.status == "verified"] + [StepRecord(st) for st in new.steps]
+                plan.final_checks = new.final_checks  # final checks must match the new steps
                 i = len([r for r in records if r.status == "verified"])
                 continue
             rec.status = "blocked"
@@ -217,8 +221,9 @@ class Orchestrator:
             bound = playbook.bind(params)
             audit.event("plan", source="playbook", playbook=bound.name, version=bound.version, steps=[st.to_dict() for st in bound.steps])
             return Plan(bound.steps, bound.final_checks, [], {}, "playbook")
-        plan = self.planner.plan(request, self.router.available_names(), knowledge=self._knowledge())
-        audit.event("plan", source="planner", questions=plan.questions, steps=[st.to_dict() for st in plan.steps])
+        guide = getattr(self, "_guide", None)
+        plan = self.planner.plan(request, self.router.available_names(), playbook=guide.to_dict() if guide else None, knowledge=self._knowledge())
+        audit.event("plan", source="planner", guide=guide.name if guide else None, questions=plan.questions, steps=[st.to_dict() for st in plan.steps])
         return plan
 
     # ------------------------------------------------------------------ one step

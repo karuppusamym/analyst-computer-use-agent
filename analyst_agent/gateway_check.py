@@ -49,12 +49,26 @@ def run_gateway_check(settings: Settings, client: ModelClient | None = None, lon
 
     results.append(_try("1a. computer toolset on executor", toolset("executor")))
     results.append(_try("1b. computer toolset on planner", toolset("planner")))
+    if not (results[0].passed and results[1].passed):
+
+        def custom():
+            from .tools.computer import custom_tool_definition
+
+            msgs = [{"role": "user", "content": "Call the computer tool once with action screenshot."}]
+            r = client.create("executor", msgs, tools=[custom_tool_definition(1280, 800)])
+            calls = [b for b in r.tool_uses() if b.get("name") == "computer"]
+            ok = bool(calls) and calls[0].get("input", {}).get("action") == "screenshot"
+            return ok, ('fallback works: set tiers.desktop_pixels.tool_mode = "custom"' if ok else f"model did not call the custom tool (stop_reason={r.stop_reason})")
+
+        fallback = _try("1c. custom computer tool [informational]", custom)
+        results.append(fallback)
 
     def betas():
         # The fallbacks field is only accepted with its beta header. A gateway
         # that strips or rewrites anthropic-beta makes this call a 400.
+        # Uses the configured fallbacks (list form on OpenRouter), else "default".
         saved = settings["gateway"].get("fallbacks")
-        settings["gateway"]["fallbacks"] = "default"
+        settings["gateway"]["fallbacks"] = saved or "default"
         try:
             client.create("executor", hi)
         finally:
@@ -106,5 +120,12 @@ def run_gateway_check(settings: Settings, client: ModelClient | None = None, lon
 
 def format_results(results: list[CheckResult]) -> str:
     lines = [f"[{'PASS' if r.passed else 'FAIL'}] {r.name}: {r.detail}" for r in results]
-    verdict = "GATEWAY OK" if all(r.passed for r in results) else "GATEWAY NOT READY - see design doc, Risk 1 fix order"
+    core = [r for r in results if "[informational]" not in r.name]
+    fallback_ok = any(r.passed for r in results if "[informational]" in r.name)
+    if all(r.passed for r in core):
+        verdict = "GATEWAY OK"
+    elif fallback_ok and all(r.passed or r.name.startswith("1") for r in core):
+        verdict = 'GATEWAY OK EXCEPT NATIVE COMPUTER USE - run the pixel tier with tool_mode "custom" and eval it'
+    else:
+        verdict = "GATEWAY NOT READY - see design doc, Risk 1 fix order"
     return "\n".join(lines + ["", verdict])

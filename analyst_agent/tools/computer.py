@@ -48,6 +48,39 @@ def to_screen(coord, s: float, size: tuple[int, int]) -> tuple[int, int]:
     return max(0, min(size[0] - 1, x)), max(0, min(size[1] - 1, y))
 
 
+def custom_tool_definition(width: int, height: int) -> dict:
+    """The 17 toolset members as one client tool with an `action` field."""
+    xy = {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2}
+    return {
+        "name": "computer",
+        "description": (
+            f"Control the desktop with mouse and keyboard. The screen is {width}x{height} pixels; "
+            "coordinates are [x, y] in the pixel space of the screenshots this tool returns, origin top-left. "
+            "Take a screenshot first, and look again after actions to confirm what changed. "
+            "Actions: screenshot; zoom (region [x0,y0,x1,y1]); left_click/right_click/middle_click/double_click/triple_click "
+            "(coordinate, optional text = modifier keys such as shift or ctrl+shift); left_click_drag (start_coordinate, coordinate); "
+            "mouse_move (coordinate); left_mouse_down; left_mouse_up; cursor_position; scroll (scroll_direction up/down/left/right, "
+            "scroll_amount, optional coordinate); type (text); key (text such as ctrl+s or Return, optional repeat); "
+            "hold_key (text, duration seconds); wait (duration seconds)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": list(MEMBERS)},
+                "coordinate": xy,
+                "start_coordinate": xy,
+                "region": {"type": "array", "items": {"type": "integer"}, "minItems": 4, "maxItems": 4},
+                "text": {"type": "string"},
+                "scroll_direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
+                "scroll_amount": {"type": "integer"},
+                "repeat": {"type": "integer"},
+                "duration": {"type": "number"},
+            },
+            "required": ["action"],
+        },
+    }
+
+
 class ComputerTier(Tier):
     name = "desktop_pixels"
     rank = 5
@@ -65,13 +98,28 @@ class ComputerTier(Tier):
             return False, "desktop_pixels tier needs Windows (ctypes backend)"
         return True, "ok"
 
+    @property
+    def custom_mode(self) -> bool:
+        """tool_mode "custom": declare computer control as an ordinary client tool.
+
+        For gateways (e.g. OpenRouter) that reject the Anthropic computer-use
+        toolset. Same actions, same guard and audit; the model is not using
+        the trained toolset, so expect somewhat lower reliability - eval it.
+        """
+        return self.cfg.get("tool_mode", "toolset") == "custom"
+
     def api_tools(self) -> list[dict]:
-        return [{"type": "computer_toolset_20260801"}]
+        if not self.custom_mode:
+            return [{"type": "computer_toolset_20260801"}]
+        (w, h), s = self.geometry() if sys.platform == "win32" else ((1280, 800), 1.0)
+        return [custom_tool_definition(round(w * s), round(h * s))]
 
     def tools(self):
         return []
 
     def handles(self, block: dict) -> bool:
+        if self.custom_mode:
+            return block.get("name") == "computer" and "toolset_name" not in block
         return block.get("toolset_name") == "computer"
 
     # ---- geometry
@@ -102,6 +150,9 @@ class ComputerTier(Tier):
     def execute(self, block: dict, ctx: ToolContext) -> ToolOutput:
         member = block.get("name", "")
         inp = block.get("input") or {}
+        if self.custom_mode and member == "computer":
+            inp = dict(inp)
+            member = inp.pop("action", "")
         if member not in MEMBERS:
             return ToolOutput(f"Error: unknown computer action {member}", is_error=True)
         try:

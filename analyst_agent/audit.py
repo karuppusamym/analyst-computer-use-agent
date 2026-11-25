@@ -14,7 +14,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-_SECRET_KEYS = re.compile(r"(pass(word)?|secret|token|api[_-]?key|authorization|credential)", re.I)
+_SECRET_KEYS = re.compile(r"(^pass$|^pwd$|password|passwd|passphrase|secret|token|api[_-]?key|authorization|credential)", re.I)
 
 
 def _mask(obj: Any) -> Any:

@@ -3,7 +3,10 @@
 Runs a separate interpreter process with a time-out, the workspace as its
 current folder and the gateway token removed from its environment. This is
 not a security sandbox by itself: in production the whole agent workspace is
-a disposable VM or container (design doc, Security).
+a disposable VM or container (design doc, Security) whose network egress is
+limited to allowlisted hosts. Without that VM, code steps CAN reach the network;
+the prompts forbid it and the audit log records every script, but nothing here
+enforces it.
 
 Excel note (Risk 11): editing .xlsx with openpyxl does not recalculate
 formulas or refresh pivots. Steps that need fresh numbers must recalculate in

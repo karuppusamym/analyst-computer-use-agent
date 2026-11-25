@@ -60,6 +60,9 @@ DEFAULTS: dict[str, Any] = {
             "enabled": False,
             "dry_run": False,
             "max_long_edge": 2576,
+            # "toolset" = Anthropic computer_toolset_20260801 (best). "custom" = the same
+            # actions as an ordinary tool, for gateways that block the toolset.
+            "tool_mode": "toolset",
             # Input is refused unless the window in front matches one of these
             # titles (fnmatch, case-insensitive) or an allowed app.
             "allowed_window_titles": [],

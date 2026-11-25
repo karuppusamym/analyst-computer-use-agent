@@ -223,6 +223,24 @@ class GuidedRunTests(Base):
         self.assertIn("go away", vreq["messages"][0]["content"][-1]["text"])  # verifier sees the file, fresh context
         self.assertEqual(len(vreq["messages"]), 1)
 
+    def test_replan_replaces_final_checks(self):
+        bad = [{"id": "a", "intent": "write a", "tier": "code", "checks": [{"type": "file_exists", "path": "output/a.txt"}]}]
+        good = [{"id": "b", "intent": "write b", "tier": "code", "checks": [{"type": "file_exists", "path": "output/b.txt"}]}]
+        write_b = "open(OUTPUT_DIR + '/b.txt', 'w').write('b')"
+        script = [
+            plan_json(bad, final=[{"type": "file_exists", "path": "output/a.txt"}]),
+            mock_text("RESULT: blocked - cannot"), mock_text("RESULT: blocked - still cannot"),
+            plan_json(good, final=[{"type": "file_exists", "path": "output/b.txt"}]),
+            mock_tool("run_python", {"code": write_b}), mock_text("RESULT: done"),
+        ]
+        o, _, _ = self.orch(script)
+        r = o.run("make a file")
+        self.assertEqual(r.status, "success", [(x.step.id, x.status) for x in r.records])
+        self.assertEqual([o_.name for o_ in r.final.outcomes], ["file exists: output/b.txt"])
+        events = AuditLog(self.s.audit_dir, session_id=r.session_id).events()
+        verdicts = [e for e in events if e["kind"] == "final_verdict"]
+        self.assertIs(verdicts[0]["passed"], True)  # not masked as a secret
+
     def test_clarifying_questions_stop_before_acting(self):
         o, backend, _ = self.orch([plan_json([], questions=["Which region?"])])
         r = o.run("churn report")

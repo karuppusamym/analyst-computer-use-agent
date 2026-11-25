@@ -231,6 +231,34 @@ class BrowserTier(Tier):
         ctx.audit.event("browser_action", step=ctx.step_id, action="screenshot", path=str(path))
         return ToolOutput(f"screenshot of {page.url}", images=[png])
 
+    def _save_text(self, inp: dict, ctx: ToolContext) -> ToolOutput:
+        """Save the current page's visible text (or one table) to a file in the output folder."""
+        page = self._ensure(ctx)
+        name = Path(inp["file_name"]).name  # no folders: always inside the output folder
+        target = ctx.policy.check_path(ctx.settings.output_dir / name, write=True)
+        if target.exists():
+            return ToolOutput(f"Error: {target} exists; the agent never overwrites files", is_error=True)
+        if inp.get("table_index") is not None:
+            rows = page.evaluate(
+                "i => { const t = document.querySelectorAll('table')[i]; if (!t) return null;"
+                " return [...t.rows].map(r => [...r.cells].map(c => c.innerText.trim())); }",
+                int(inp["table_index"]),
+            )
+            if rows is None:
+                return ToolOutput(f"Error: no table number {inp['table_index']} on this page", is_error=True)
+            import csv
+            import io
+
+            buf = io.StringIO()
+            csv.writer(buf).writerows(rows)
+            text = buf.getvalue()
+        else:
+            text = page.evaluate("() => document.body ? document.body.innerText : ''")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        ctx.audit.event("file_written", step=ctx.step_id, path=str(target), source=page.url)
+        return ToolOutput(f"saved {len(text)} characters from {page.url} to {target}", files=[str(target)])
+
     def tools(self) -> list[Tool]:
         s = {"type": "string"}
         ref = {"type": "string", "description": "element ref from browser_snapshot, e.g. e3"}
@@ -242,6 +270,14 @@ class BrowserTier(Tier):
             Tool("browser_select", "Choose an option in a select element by ref.", schema({"ref": ref, "value": s}), self._select, self.name),
             Tool("browser_download", "Click a download link by ref and save the file into the output downloads folder.", schema({"ref": ref}), self._download, self.name),
             Tool("browser_screenshot", "Take a screenshot of the page.", schema({}), self._screenshot, self.name),
+            Tool(
+                "browser_save_text",
+                "Save the current page's visible text to a file in the output folder, or one HTML table as CSV with table_index (0 = first table). "
+                "Use this to keep page content for later steps instead of fetching the page with code.",
+                schema({"file_name": s, "table_index": {"type": "integer"}}, ["file_name"]),
+                self._save_text,
+                self.name,
+            ),
         ]
 
     def api_tools(self) -> list[dict]:

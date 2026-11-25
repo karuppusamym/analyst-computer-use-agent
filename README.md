@@ -47,6 +47,37 @@ Then run the week-1 gateway test from design-doc Risk 1. It costs a few cents:
 python -m analyst_agent gateway-check
 ```
 
+## Using OpenRouter
+
+`config/openrouter.json` points at OpenRouter's Anthropic Messages endpoint (`https://openrouter.ai/api/v1/messages`):
+- **Login:** Bearer auth, using the key in `OPENROUTER_API_KEY`. Put the key in a local `.env` file; it is git-ignored and loaded automatically.
+- **Model names:** OpenRouter's own, such as `anthropic/claude-opus-5.5`.
+- **Fallbacks:** the list form.
+
+Add `--config config/openrouter.json` to any command.
+
+Gateway check on OpenRouter (24 Nov 2026):
+
+| Check | Result |
+| --- | --- |
+| 1. Native computer-use toolset | **Rejected** (`Unknown server-tool shorthand`), in both the old and the new form |
+| 1c. Computer control as a custom tool | Works: `tiers.desktop_pixels.tool_mode = "custom"` is set in this config |
+| 2. Beta-gated request (fallbacks) | Accepted |
+| 3. Prompt caching | Works (14,438 cache-read tokens) |
+| 4. Thinking blocks round-trip | Works |
+| 5. Long streamed response | Works (8,000 tokens in 81 s) |
+
+Custom-tool mode sends the same actions through the same allowlist guard and audit log. The model isn't using its trained computer-use toolset, though, so measure reliability with evals before relying on it. Your office gateway may support the native toolset; run `gateway-check` there.
+
+Real-model runs on OpenRouter (Fable 5.2 planner, Opus 5.5 executor and verifier):
+
+| Task | Tier | Result |
+| --- | --- | --- |
+| "Which region had the highest churn in Q3 2026?" with no playbook named; the matched playbook was used as a guide | connector + code | Success, 8 calls; answer (North, 16.4%) checked against the CSV |
+| Download the week 47 report from the portal | browser | Success, 4 calls |
+| Summarize `/evil`, a prompt-injection page | browser + code | Success; the injection was flagged and not acted on, nothing drafted |
+| Enter a row into Legacy Ledger | desktop pixels (custom tool) | Success, 4 calls; CSV row verified |
+
 ## Commands
 
 ```powershell
@@ -94,7 +125,7 @@ To include the live desktop tests, set the variable first. They move the mouse f
 $env:RUN_DESKTOP_TESTS = "1"
 ```
 
-Current result: **55 tests pass**, including the live desktop end-to-end test. That test runs playbook → approval → router → executor → real pixel tier → test app → verifier.
+Current result: **57 tests pass**, including the live desktop end-to-end test. That test runs playbook → approval → router → executor → real pixel tier → test app → verifier.
 
 ## Layout
 
@@ -115,7 +146,8 @@ tests/          unit, integration and live desktop tests
 
 ## Not done yet
 
-- **Not tested against a real model.** No gateway token was available here, so every model call is mocked. Run `gateway-check` first, then `eval`, on your gateway.
+- **Not yet tested on your office gateway.** It has been tested on OpenRouter only (see above). Run `gateway-check` on your gateway first.
+- **The code tier can reach the network when there is no VM.** The prompts forbid it and every script is audited, but nothing blocks it. Web access is meant to go through the browser tier, which enforces the site allowlist.
 - **No portal UI yet.** There are no web screens for task chat, live view, the approval inbox or playbook review; the console stands in for them.
 - **Later-phase features:** teach mode recording, schedules, SSO, the credential vault and Guacamole/noVNC live view are Phase 3 items in the design.
 - **Two eval tasks per workflow** for two workflows. The design calls for five per workflow across all ten.

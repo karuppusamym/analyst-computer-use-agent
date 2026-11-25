@@ -102,13 +102,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if summary["pilot_gate_met"] else 1
     if args.cmd == "run":
         params = dict(p.split("=", 1) for p in args.param)
-        pb = registry.get(args.playbook) if args.playbook else registry.match(args.request)
-        if pb and not args.playbook:
-            print(f"using matching playbook: {pb.name} v{pb.version}")
+        pb = registry.get(args.playbook) if args.playbook else None
+        guide = None if pb else registry.match(args.request)
+        if guide:
+            print(f"matching playbook {guide.name} v{guide.version} given to the planner as a guide")
         approver = UnattendedApprover() if args.unattended else ConsoleApprover()
         orch = Orchestrator(s, approver=approver, ask=None if args.unattended else _ask_console, knowledge_dir=ROOT / "knowledge", require_plan_approval=not args.unattended)
         try:
-            result = orch.run(args.request, playbook=pb, params=params, session_id=args.resume, resume=bool(args.resume))
+            result = orch.run(args.request, playbook=pb, params=params, session_id=args.resume, resume=bool(args.resume), guide=guide)
         finally:
             orch.router.close()
         print(f"\nstatus: {result.status}   session: {result.session_id}")

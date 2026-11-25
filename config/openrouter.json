@@ -4,7 +4,7 @@
     "token_env": "OPENROUTER_API_KEY",
     "auth_style": "bearer",
     "backend": "http",
-    "fallbacks": null
+    "fallbacks": [{"model": "anthropic/claude-opus-4.8"}]
   },
   "models": {
     "planner": {"model": "anthropic/claude-fable-5.2", "effort": "high", "max_tokens": 32000},
@@ -31,6 +31,7 @@
     "desktop_pixels": {
       "enabled": false,
       "dry_run": false,
+      "tool_mode": "custom",
       "allowed_window_titles": ["Legacy Ledger - TEST"]
     }
   },
