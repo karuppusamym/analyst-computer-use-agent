@@ -1,0 +1,109 @@
+{
+  "name": "data-quality-check",
+  "version": 1,
+  "owner": "data-governance",
+  "backup_owner": "finance-analytics",
+  "workflow": "data quality check export nulls bad dates out of range duplicate keys",
+  "description": "Data-quality check of a customer master export before it is loaded: required fields, email format, signup dates, credit limit and discount ranges, status values and duplicate keys. Writes an issue list and a pass/fail report; never edits the export.",
+  "permissions": {
+    "data_class": "confidential"
+  },
+  "parameters": {
+    "dataset": {
+      "type": "string",
+      "required": true,
+      "description": "export file name in the input folder without .csv, e.g. customer_master_2026-11"
+    },
+    "key_column": {
+      "type": "string",
+      "default": "customer_id"
+    },
+    "as_of": {
+      "type": "string",
+      "default": "2026-11-30",
+      "description": "signup dates after this are invalid"
+    }
+  },
+  "steps": [
+    {
+      "id": "profile-export",
+      "intent": "Check {dataset} is an export in the input folder and has the expected columns",
+      "tier": "code",
+      "script": {
+        "kind": "python",
+        "code": "import csv, json, os, sys\ndataset = PARAMS['dataset']\nsrc = os.path.realpath(INPUT_DIRS[0])\npath = os.path.realpath(os.path.join(src, dataset + '.csv'))\nif os.path.dirname(path) != src or not os.path.basename(dataset) == dataset:\n    print(f'refused: dataset {dataset!r} is not a file in the input folder'); sys.exit(2)\nif not os.path.exists(path):\n    print(f'missing: {dataset}.csv'); sys.exit(2)\nneed = {'customer_id', 'name', 'email', 'country', 'signup_date', 'credit_limit', 'discount_pct', 'status'}\nwith open(path, newline='', encoding='utf-8-sig') as f:\n    r = csv.DictReader(f); rows = list(r)\nmissing = sorted(need - set(r.fieldnames or []))\nprofile = {'ok': not missing and bool(rows), 'dataset': dataset, 'rows': len(rows), 'columns': r.fieldnames, 'missing_columns': missing}\nopen(os.path.join(OUTPUT_DIR, f'dq_profile_{dataset}.json'), 'w').write(json.dumps(profile, indent=1))\nprint(json.dumps(profile))\n"
+      },
+      "checks": [
+        {
+          "type": "file_exists",
+          "path": "output/dq_profile_{dataset}.json"
+        },
+        {
+          "type": "json_field_equals",
+          "path": "output/dq_profile_{dataset}.json",
+          "field": "ok",
+          "value": true
+        }
+      ]
+    },
+    {
+      "id": "run-rules",
+      "intent": "Run the customer master data-quality rules on {dataset}",
+      "tier": "code",
+      "script": {
+        "kind": "python",
+        "code": "import csv, datetime, json, os\ndataset = PARAMS['dataset']\nkey = PARAMS.get('key_column', 'customer_id')\nas_of = datetime.date.fromisoformat(PARAMS.get('as_of', '2026-11-30'))\nwith open(os.path.join(INPUT_DIRS[0], dataset + '.csv'), newline='', encoding='utf-8-sig') as f:\n    rows = list(csv.DictReader(f))\nREQUIRED = ['customer_id', 'name', 'email', 'country']\nSTATUSES = {'active', 'inactive', 'prospect'}\ndef num(v):\n    try: return float(v)\n    except ValueError: return None\nissues, seen = [], set()\nfor n, r in enumerate(rows, start=1):\n    k = r.get(key, '')\n    for col in REQUIRED:\n        if not r.get(col, '').strip():\n            issues.append([n, k, col, 'missing_required', ''])\n    email = r.get('email', '').strip()\n    if email and ('@' not in email or '.' not in email.split('@')[-1] or ' ' in email):\n        issues.append([n, k, 'email', 'bad_email', email])\n    try:\n        d = datetime.date.fromisoformat(r.get('signup_date', ''))\n        if d > as_of: issues.append([n, k, 'signup_date', 'bad_date', r['signup_date']])\n    except ValueError:\n        issues.append([n, k, 'signup_date', 'bad_date', r.get('signup_date', '')])\n    cl = num(r.get('credit_limit', ''))\n    if cl is None or cl < 0:\n        issues.append([n, k, 'credit_limit', 'out_of_range', r.get('credit_limit', '')])\n    dp = num(r.get('discount_pct', ''))\n    if dp is None or not 0 <= dp <= 50:\n        issues.append([n, k, 'discount_pct', 'out_of_range', r.get('discount_pct', '')])\n    if r.get('status', '') not in STATUSES:\n        issues.append([n, k, 'status', 'invalid_value', r.get('status', '')])\n    if k and k in seen:\n        issues.append([n, k, key, 'duplicate_key', k])\n    seen.add(k)\nwith open(os.path.join(OUTPUT_DIR, f'dq_issues_{dataset}.csv'), 'w', newline='', encoding='utf-8') as f:\n    w = csv.writer(f); w.writerow(['row', 'key', 'column', 'rule', 'value']); w.writerows(issues)\nsummary = {'dataset': dataset, 'rows': len(rows), 'issues': len(issues), 'rows_with_issues': len({i[0] for i in issues}),\n           'by_rule': {}, 'passed': not issues}\nfor i in issues: summary['by_rule'][i[3]] = summary['by_rule'].get(i[3], 0) + 1\nopen(os.path.join(OUTPUT_DIR, f'dq_summary_{dataset}.json'), 'w').write(json.dumps(summary, indent=1))\nprint(json.dumps(summary))\n"
+      },
+      "checks": [
+        {
+          "type": "file_exists",
+          "path": "output/dq_issues_{dataset}.csv"
+        },
+        {
+          "type": "csv_has_columns",
+          "path": "output/dq_issues_{dataset}.csv",
+          "columns": [
+            "row",
+            "key",
+            "column",
+            "rule",
+            "value"
+          ]
+        },
+        {
+          "type": "file_exists",
+          "path": "output/dq_summary_{dataset}.json"
+        }
+      ]
+    },
+    {
+      "id": "write-report",
+      "intent": "Write the pass/fail data-quality report for {dataset}",
+      "tier": "code",
+      "script": {
+        "kind": "python",
+        "code": "import json, os\ndataset = PARAMS['dataset']\ns = json.load(open(os.path.join(OUTPUT_DIR, f'dq_summary_{dataset}.json')))\nverdict = 'PASSED: no issues found' if s['passed'] else f\"FAILED: {s['issues']} issues in {s['rows_with_issues']} of {s['rows']} rows\"\nlines = [f'# Data quality check: {dataset}', '', verdict, '']\nlines += [f'- {rule}: {n}' for rule, n in sorted(s['by_rule'].items())]\nlines += ['', f'Details: dq_issues_{dataset}.csv. The source export was not changed.']\nopen(os.path.join(OUTPUT_DIR, f'dq_report_{dataset}.md'), 'w', encoding='utf-8').write('\\n'.join(lines))\nprint('\\n'.join(lines))\n"
+      },
+      "checks": [
+        {
+          "type": "file_exists",
+          "path": "output/dq_report_{dataset}.md"
+        },
+        {
+          "type": "text_contains",
+          "path": "output/dq_report_{dataset}.md",
+          "text": [
+            "Data quality check",
+            "Details"
+          ]
+        }
+      ]
+    }
+  ],
+  "final_checks": [
+    {
+      "type": "file_exists",
+      "path": "output/dq_report_{dataset}.md"
+    }
+  ]
+}

@@ -69,17 +69,18 @@ python -m analyst_agent stop <session-id>
 ```
 
 - `run` without `--playbook` either matches a playbook from the request or has the planner build the steps. The planner needs the model.
+- `eval` runs `evals/tasks.json` (50 tasks: 5 per workflow for all 10 workflows, 3 tune / 2 holdout each, at least one safety task per workflow). Without a gateway token it runs offline: fully scripted playbooks run for real, and tasks that need the model are reported as `needs_model` (or `needs_tier` when a scripted tier such as the browser is missing) and left out of the pilot-gate math. `--split holdout` runs one split.
 - `--unattended` declines every approval and reports it. Nothing is ever auto-approved.
 - `--resume <session>` continues from the last checkpoint.
 - Each run writes its audit log, screenshots, checkpoint and a "what I checked" report to `workspace/audit/<session>/`. Outputs go to `workspace/output/`.
 
-Run `python samples/make_samples.py` to regenerate the sample ERP/CRM exports and `warehouse.sqlite`.
+Run `python samples/make_samples.py` to regenerate the sample data (ERP/CRM, budget and GL actuals, PO/receipt/invoice, payments and vendor master, customer master exports, and `warehouse.sqlite`). It is seeded and plants issues with known counts, so the eval graders assert exact numbers; the original pilot files come out byte-identical.
 
 ## Testing on this PC without a VM
 
 Windows 11 Home has no Windows Sandbox, so the tests use local targets that are safe to drive:
 
-- `test_targets/portal.py`: a localhost web portal with report downloads, a submit form for approval tests, and a prompt-injection page.
+- `test_targets/portal.py`: a localhost web portal with report downloads, weekly KPI packs (`/kpi`), a submit form for approval tests, and prompt-injection text (`/evil`, and a notice on `/kpi`).
 - `test_targets/legacy_app.py`: the "Legacy Ledger - TEST" tkinter window for the pixel tier.
 - **Pixel tier guard:** every click or keystroke is refused unless the window in front matches `allowed_window_titles` or an allowed app. It can only act on the test app, and refusals are logged. `--dry-run-desktop` logs actions without sending them.
 - **Mock model:** a scripted model client tests the planner, executor and verifier loop without a gateway.
@@ -94,7 +95,9 @@ To include the live desktop tests, set the variable first. They move the mouse f
 $env:RUN_DESKTOP_TESTS = "1"
 ```
 
-Current result: **55 tests pass**, including the live desktop end-to-end test. That test runs playbook → approval → router → executor → real pixel tier → test app → verifier.
+Current result: **73 tests**. 70 pass, and the 3 live desktop tests skip unless `RUN_DESKTOP_TESTS=1`. They passed with it set before the eval work and were not re-run after it. The offline eval run passes all 44 graded tasks and skips 6: 4 `needs_model` and 2 `needs_tier` for the pixel tier.
+
+The live desktop end-to-end test runs playbook → approval → router → executor → real pixel tier → test app → verifier.
 
 ## Layout
 
@@ -106,8 +109,11 @@ analyst_agent/
   router.py     tier selection and fallbacks
   tools/        connectors, code, browser, desktop_uia, computer (+ screen_win ctypes)
   playbook.py checks.py policy.py audit.py checkpoint.py report.py evals.py gateway_check.py
-playbooks/      4 pilot playbooks (reconciliation, warehouse question, portal download, legacy entry)
-evals/tasks.json  eval set with graders, tune/holdout split
+playbooks/      10 pilot playbooks: ERP/CRM reconciliation, warehouse region question, portal report download,
+                legacy ledger entry, budget-vs-actuals variance, three-way match, churn cohorts,
+                duplicate payments, data-quality check, weekly KPI summary (scripted browser tier)
+evals/tasks.json  50 eval tasks (5 per workflow) with exact-output graders, tune/holdout split, safety tasks
+samples/        seeded sample data + make_samples.py (planted issues with known counts)
 knowledge/      team knowledge injected into the planner
 test_targets/   local portal + Legacy Ledger test app
 tests/          unit, integration and live desktop tests
@@ -118,5 +124,5 @@ tests/          unit, integration and live desktop tests
 - **Not tested against a real model.** No gateway token was available here, so every model call is mocked. Run `gateway-check` first, then `eval`, on your gateway.
 - **No portal UI yet.** There are no web screens for task chat, live view, the approval inbox or playbook review; the console stands in for them.
 - **Later-phase features:** teach mode recording, schedules, SSO, the credential vault and Guacamole/noVNC live view are Phase 3 items in the design.
-- **Two eval tasks per workflow** for two workflows. The design calls for five per workflow across all ten.
+- **Evals with a real model.** All 10 workflows have 5 eval tasks each, but offline only the scripted ones run: the 4 guided portal-download tasks need the model, and the 2 approved legacy-ledger entries need the model plus the pixel tier. Their graders have not been run.
 - **The code tier is not a sandbox on its own.** Production needs the disposable per-task VM or container from the design.

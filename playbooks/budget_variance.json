@@ -1,0 +1,156 @@
+{
+  "name": "budget-variance",
+  "version": 1,
+  "owner": "fpa-team",
+  "backup_owner": "finance-analytics",
+  "approver": "fpa-lead",
+  "workflow": "month end budget vs actuals variance threshold flags",
+  "description": "Month-end budget vs actuals: total the GL actuals by cost center and account, compare with budget, flag lines over the percent and absolute thresholds plus any unbudgeted spend, write commentary and draft an email to the FP&A lead.",
+  "permissions": {
+    "data_class": "internal",
+    "apps": [],
+    "hosts": []
+  },
+  "parameters": {
+    "period": {
+      "type": "string",
+      "required": true,
+      "description": "YYYY-MM, e.g. 2026-10"
+    },
+    "threshold_pct": {
+      "type": "number",
+      "default": 10,
+      "description": "flag when |variance| >= this percent of budget"
+    },
+    "threshold_abs": {
+      "type": "number",
+      "default": 1000,
+      "description": "and |variance| >= this amount"
+    },
+    "recipient": {
+      "type": "string",
+      "default": "fpa-lead@example.com"
+    }
+  },
+  "steps": [
+    {
+      "id": "profile-inputs",
+      "intent": "Check the budget and GL actuals for {period} exist and have the expected columns",
+      "tier": "code",
+      "script": {
+        "kind": "python",
+        "code": "import csv, json, os\nperiod = PARAMS['period']\nsrc = INPUT_DIRS[0]\nfiles = {'budget': f'budget_{period}.csv', 'actuals': f'gl_actuals_{period}.csv'}\nneed = {'budget': {'cost_center', 'account', 'budget'}, 'actuals': {'journal_id', 'cost_center', 'account', 'amount'}}\nprofile = {'ok': True, 'period': period}\nfor k, name in files.items():\n    p = os.path.join(src, name)\n    if not os.path.exists(p):\n        profile['ok'] = False; profile[k] = f'missing: {name}'; continue\n    with open(p, newline='', encoding='utf-8-sig') as f:\n        r = csv.DictReader(f); rows = list(r)\n    missing = sorted(need[k] - set(r.fieldnames or []))\n    profile[k] = {'file': name, 'rows': len(rows), 'missing_columns': missing}\n    if missing or not rows: profile['ok'] = False\nopen(os.path.join(OUTPUT_DIR, f'input_profile_budget_{period}.json'), 'w').write(json.dumps(profile, indent=1))\nprint(json.dumps(profile))\n"
+      },
+      "checks": [
+        {
+          "type": "file_exists",
+          "path": "output/input_profile_budget_{period}.json"
+        },
+        {
+          "type": "json_field_equals",
+          "path": "output/input_profile_budget_{period}.json",
+          "field": "ok",
+          "value": true
+        }
+      ]
+    },
+    {
+      "id": "compute-variance",
+      "intent": "Total actuals by cost center and account, compare with budget and flag lines over {threshold_pct}% and {threshold_abs}",
+      "tier": "code",
+      "script": {
+        "kind": "python",
+        "code": "import csv, json, os\nperiod = PARAMS['period']\npct_limit = float(PARAMS.get('threshold_pct', 10))\nabs_limit = float(PARAMS.get('threshold_abs', 1000))\nsrc = INPUT_DIRS[0]\ndef rows(name):\n    with open(os.path.join(src, name), newline='', encoding='utf-8-sig') as f:\n        return list(csv.DictReader(f))\nbudget = {(r['cost_center'], r['account']): float(r['budget']) for r in rows(f'budget_{period}.csv')}\ngl = rows(f'gl_actuals_{period}.csv')\nactual = {}\nfor r in gl:\n    key = (r['cost_center'], r['account'])\n    actual[key] = actual.get(key, 0.0) + float(r['amount'])\nout = []\nfor key in sorted(set(budget) | set(actual)):\n    b, a = budget.get(key, 0.0), round(actual.get(key, 0.0), 2)\n    var = round(a - b, 2)\n    pct = round(100.0 * var / b, 2) if b else None\n    if not b and a:\n        flag = 'unbudgeted'\n    elif pct is not None and abs(pct) >= pct_limit and abs(var) >= abs_limit:\n        flag = 'over' if var > 0 else 'under'\n    else:\n        flag = ''\n    out.append([key[0], key[1], f'{b:.2f}', f'{a:.2f}', f'{var:.2f}', '' if pct is None else f'{pct:.2f}', flag])\nheader = ['cost_center', 'account', 'budget', 'actual', 'variance', 'variance_pct', 'flag']\nfor name, data in ((f'variance_{period}.csv', out), (f'variance_flags_{period}.csv', [r for r in out if r[6]])):\n    with open(os.path.join(OUTPUT_DIR, name), 'w', newline='', encoding='utf-8') as f:\n        w = csv.writer(f); w.writerow(header); w.writerows(data)\ngl_total = round(sum(float(r['amount']) for r in gl), 2)\nactual_total = round(sum(float(r[3]) for r in out), 2)\nsummary = {'period': period, 'threshold_pct': pct_limit, 'threshold_abs': abs_limit, 'lines': len(out),\n           'flagged': sum(1 for r in out if r[6]), 'by_flag': {},\n           'total_budget': round(sum(budget.values()), 2), 'total_actual': actual_total, 'gl_total': gl_total,\n           'control_total_ok': abs(gl_total - actual_total) < 0.01}\nfor r in out:\n    if r[6]: summary['by_flag'][r[6]] = summary['by_flag'].get(r[6], 0) + 1\nsummary['total_variance'] = round(summary['total_actual'] - summary['total_budget'], 2)\nopen(os.path.join(OUTPUT_DIR, f'variance_summary_{period}.json'), 'w').write(json.dumps(summary, indent=1))\nprint(json.dumps(summary))\n"
+      },
+      "checks": [
+        {
+          "type": "file_exists",
+          "path": "output/variance_{period}.csv"
+        },
+        {
+          "type": "csv_has_columns",
+          "path": "output/variance_{period}.csv",
+          "columns": [
+            "cost_center",
+            "account",
+            "budget",
+            "actual",
+            "variance",
+            "variance_pct",
+            "flag"
+          ]
+        },
+        {
+          "type": "json_field_equals",
+          "path": "output/variance_summary_{period}.json",
+          "field": "control_total_ok",
+          "value": true
+        }
+      ]
+    },
+    {
+      "id": "write-commentary",
+      "intent": "Write variance commentary for {period} listing every flagged line",
+      "tier": "code",
+      "instructions": "Read output/variance_summary_{period}.json and output/variance_flags_{period}.csv; write output/variance_note_{period}.md with the flagged count, totals and one line per flagged line, largest first.",
+      "script": {
+        "kind": "python",
+        "code": "import csv, json, os\nperiod = PARAMS['period']\ns = json.load(open(os.path.join(OUTPUT_DIR, f'variance_summary_{period}.json')))\nwith open(os.path.join(OUTPUT_DIR, f'variance_flags_{period}.csv'), newline='', encoding='utf-8') as f:\n    flags = list(csv.DictReader(f))\nlines = [f'# Budget vs actuals, {period}', '',\n         f\"{s['flagged']} of {s['lines']} cost-center lines are flagged (threshold {s['threshold_pct']:g}% and {s['threshold_abs']:,.0f}).\",\n         f\"Budget {s['total_budget']:,.2f}; actual {s['total_actual']:,.2f}; variance {s['total_variance']:,.2f}.\", '']\nfor r in sorted(flags, key=lambda r: -abs(float(r['variance']))):\n    pct = f\" ({r['variance_pct']}%)\" if r['variance_pct'] else ''\n    lines.append(f\"- {r['cost_center']} / {r['account']}: {r['flag']}, variance {float(r['variance']):,.2f}{pct}\")\nlines += ['', f'Details: variance_{period}.csv']\nopen(os.path.join(OUTPUT_DIR, f'variance_note_{period}.md'), 'w', encoding='utf-8').write('\\n'.join(lines))\nprint('\\n'.join(lines))\n"
+      },
+      "checks": [
+        {
+          "type": "file_exists",
+          "path": "output/variance_note_{period}.md"
+        },
+        {
+          "type": "text_contains",
+          "path": "output/variance_note_{period}.md",
+          "text": [
+            "flagged",
+            "Budget",
+            "variance"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "draft-email",
+      "intent": "Draft an email to {recipient} with the variance commentary and flagged lines attached",
+      "tier": "connector",
+      "approval": "required",
+      "action_class": "send",
+      "script": {
+        "kind": "tool",
+        "tool": "draft_email",
+        "input": {
+          "to": [
+            "{recipient}"
+          ],
+          "subject": "Budget vs actuals {period}: flagged variances",
+          "body": "Hi,\n\nThe budget vs actuals review for {period} is ready. The commentary is in variance_note_{period}.md and the flagged lines are attached.\n\nThis draft was prepared by the analyst agent and checked before sending.",
+          "attachments": [
+            "workspace/output/variance_flags_{period}.csv",
+            "workspace/output/variance_note_{period}.md"
+          ],
+          "name": "variance-email-{period}"
+        }
+      },
+      "checks": [
+        {
+          "type": "file_exists",
+          "path": "output/outbox/variance-email-{period}.eml"
+        }
+      ]
+    }
+  ],
+  "final_checks": [
+    {
+      "type": "file_exists",
+      "path": "output/variance_{period}.csv"
+    },
+    {
+      "type": "file_exists",
+      "path": "output/variance_note_{period}.md"
+    }
+  ]
+}

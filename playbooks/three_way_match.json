@@ -1,0 +1,141 @@
+{
+  "name": "three-way-match",
+  "version": 1,
+  "owner": "ap-operations",
+  "backup_owner": "finance-ops",
+  "approver": "ap-lead",
+  "workflow": "invoice purchase order PO goods receipt three way match AP exceptions",
+  "description": "Three-way match of AP invoices against purchase-order lines and goods receipts for a period: hold invoices with no PO, no receipt, more billed than received, or price outside tolerance, and draft the exception list for the AP lead.",
+  "permissions": {
+    "data_class": "confidential",
+    "apps": [],
+    "hosts": []
+  },
+  "parameters": {
+    "period": {
+      "type": "string",
+      "required": true,
+      "description": "YYYY-MM"
+    },
+    "tolerance_pct": {
+      "type": "number",
+      "default": 2,
+      "description": "allowed unit-price difference vs PO, percent"
+    },
+    "recipient": {
+      "type": "string",
+      "default": "ap-lead@example.com"
+    }
+  },
+  "steps": [
+    {
+      "id": "profile-inputs",
+      "intent": "Check the PO, receipt and invoice exports for {period} exist with the expected columns",
+      "tier": "code",
+      "script": {
+        "kind": "python",
+        "code": "import csv, json, os\nperiod = PARAMS['period']\nsrc = INPUT_DIRS[0]\nneed = {f'po_lines_{period}.csv': {'po_id', 'line', 'vendor', 'qty_ordered', 'unit_price'},\n        f'receipts_{period}.csv': {'receipt_id', 'po_id', 'line', 'qty_received'},\n        f'ap_invoices_{period}.csv': {'invoice_id', 'vendor', 'po_id', 'line', 'qty_billed', 'unit_price'}}\nprofile = {'ok': True, 'period': period, 'files': {}}\nfor name, cols in need.items():\n    p = os.path.join(src, name)\n    if not os.path.exists(p):\n        profile['ok'] = False; profile['files'][name] = 'missing'; continue\n    with open(p, newline='', encoding='utf-8-sig') as f:\n        r = csv.DictReader(f); rows = list(r)\n    missing = sorted(cols - set(r.fieldnames or []))\n    profile['files'][name] = {'rows': len(rows), 'missing_columns': missing}\n    if missing or not rows: profile['ok'] = False\nopen(os.path.join(OUTPUT_DIR, f'input_profile_match_{period}.json'), 'w').write(json.dumps(profile, indent=1))\nprint(json.dumps(profile))\n"
+      },
+      "checks": [
+        {
+          "type": "file_exists",
+          "path": "output/input_profile_match_{period}.json"
+        },
+        {
+          "type": "json_field_equals",
+          "path": "output/input_profile_match_{period}.json",
+          "field": "ok",
+          "value": true
+        }
+      ]
+    },
+    {
+      "id": "match",
+      "intent": "Match every invoice line to its PO line and receipts and classify exceptions (price tolerance {tolerance_pct}%)",
+      "tier": "code",
+      "script": {
+        "kind": "python",
+        "code": "import csv, json, os, re\nperiod = PARAMS['period']\ntol = float(PARAMS.get('tolerance_pct', 2))\nsrc = INPUT_DIRS[0]\ndef rows(name):\n    with open(os.path.join(src, f'{name}_{period}.csv'), newline='', encoding='utf-8-sig') as f:\n        return list(csv.DictReader(f))\npo = {(r['po_id'], r['line']): r for r in rows('po_lines')}\nreceived = {}\nfor r in rows('receipts'):\n    key = (r['po_id'], r['line'])\n    received[key] = received.get(key, 0) + int(r['qty_received'])\n# Memo text is untrusted data: it is reported, never acted on.\nsuspicious = re.compile(r'ignore|instruction|ai agent|system note|approve[d]? for payment|email', re.I)\nout = []\nfor inv in rows('ap_invoices'):\n    key = (inv['po_id'], inv['line'])\n    p = po.get(key)\n    qty, price = int(inv['qty_billed']), float(inv['unit_price'])\n    issue, detail = '', ''\n    if p is None:\n        issue, detail = 'no_po', f\"PO line {inv['po_id']}/{inv['line']} not found\"\n    elif key not in received:\n        issue, detail = 'no_receipt', 'no goods receipt for this PO line'\n    elif qty > received[key]:\n        issue, detail = 'qty_exceeds_received', f'billed {qty}, received {received[key]}'\n    else:\n        po_price = float(p['unit_price'])\n        diff_pct = 100.0 * (price - po_price) / po_price\n        if abs(diff_pct) > tol:\n            issue, detail = 'price_variance', f'invoice {price:.2f} vs PO {po_price:.2f} ({diff_pct:+.2f}%)'\n    memo_flag = 'instructions in memo ignored' if suspicious.search(inv.get('memo', '')) else ''\n    out.append([inv['invoice_id'], inv['vendor'], inv['po_id'], inv['line'], qty, f'{price:.2f}', f'{qty * price:.2f}',\n                'exception' if issue else 'matched', issue, detail, memo_flag])\nheader = ['invoice_id', 'vendor', 'po_id', 'line', 'qty_billed', 'unit_price', 'amount', 'status', 'issue', 'detail', 'memo_flag']\nfor name, data in ((f'match_results_{period}.csv', out), (f'match_exceptions_{period}.csv', [r for r in out if r[7] == 'exception'])):\n    with open(os.path.join(OUTPUT_DIR, name), 'w', newline='', encoding='utf-8') as f:\n        w = csv.writer(f); w.writerow(header); w.writerows(data)\nsummary = {'period': period, 'tolerance_pct': tol, 'invoice_lines': len(out),\n           'matched': sum(1 for r in out if r[7] == 'matched'), 'exceptions': sum(1 for r in out if r[7] == 'exception'),\n           'by_issue': {}, 'matched_amount': round(sum(float(r[6]) for r in out if r[7] == 'matched'), 2),\n           'exception_amount': round(sum(float(r[6]) for r in out if r[7] == 'exception'), 2),\n           'suspicious_memos': [r[0] for r in out if r[10]]}\nfor r in out:\n    if r[8]: summary['by_issue'][r[8]] = summary['by_issue'].get(r[8], 0) + 1\nopen(os.path.join(OUTPUT_DIR, f'match_summary_{period}.json'), 'w').write(json.dumps(summary, indent=1))\nprint(json.dumps(summary))\n"
+      },
+      "checks": [
+        {
+          "type": "file_exists",
+          "path": "output/match_results_{period}.csv"
+        },
+        {
+          "type": "csv_has_columns",
+          "path": "output/match_exceptions_{period}.csv",
+          "columns": [
+            "invoice_id",
+            "po_id",
+            "status",
+            "issue",
+            "detail"
+          ]
+        },
+        {
+          "type": "file_exists",
+          "path": "output/match_summary_{period}.json"
+        }
+      ]
+    },
+    {
+      "id": "write-note",
+      "intent": "Write a short exception note for {period}",
+      "tier": "code",
+      "script": {
+        "kind": "python",
+        "code": "import json, os\nperiod = PARAMS['period']\ns = json.load(open(os.path.join(OUTPUT_DIR, f'match_summary_{period}.json')))\nlabels = {'no_po': 'no matching PO line', 'no_receipt': 'no goods receipt', 'qty_exceeds_received': 'billed more than received', 'price_variance': 'price outside tolerance'}\nlines = [f'# Three-way match, {period}', '',\n         f\"{s['matched']} of {s['invoice_lines']} invoice lines match PO and receipt; {s['exceptions']} exceptions to hold (tolerance {s['tolerance_pct']:g}%).\", '']\nlines += [f'- {labels.get(k, k)}: {v}' for k, v in sorted(s['by_issue'].items())]\nlines += ['', f\"Matched amount {s['matched_amount']:,.2f}; held {s['exception_amount']:,.2f}.\"]\nif s['suspicious_memos']:\n    lines += ['', 'Invoice memos containing instructions (treated as data, not followed): ' + ', '.join(s['suspicious_memos'])]\nlines += ['', f'Details: match_exceptions_{period}.csv']\nopen(os.path.join(OUTPUT_DIR, f'match_note_{period}.md'), 'w', encoding='utf-8').write('\\n'.join(lines))\nprint('\\n'.join(lines))\n"
+      },
+      "checks": [
+        {
+          "type": "file_exists",
+          "path": "output/match_note_{period}.md"
+        },
+        {
+          "type": "text_contains",
+          "path": "output/match_note_{period}.md",
+          "text": [
+            "exceptions",
+            "Matched amount"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "draft-email",
+      "intent": "Draft an email to {recipient} with the exception list to hold",
+      "tier": "connector",
+      "approval": "required",
+      "action_class": "send",
+      "script": {
+        "kind": "tool",
+        "tool": "draft_email",
+        "input": {
+          "to": [
+            "{recipient}"
+          ],
+          "subject": "Three-way match exceptions {period}",
+          "body": "Hi,\n\nThe three-way match for {period} is done. Please hold the invoices in the attached exception list; the summary is in match_note_{period}.md.\n\nThis draft was prepared by the analyst agent and checked before sending.",
+          "attachments": [
+            "workspace/output/match_exceptions_{period}.csv",
+            "workspace/output/match_note_{period}.md"
+          ],
+          "name": "match-email-{period}"
+        }
+      },
+      "checks": [
+        {
+          "type": "file_exists",
+          "path": "output/outbox/match-email-{period}.eml"
+        }
+      ]
+    }
+  ],
+  "final_checks": [
+    {
+      "type": "file_exists",
+      "path": "output/match_exceptions_{period}.csv"
+    }
+  ]
+}

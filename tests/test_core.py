@@ -322,8 +322,9 @@ class RouterTests(Base):
 class EvalTests(Base):
     def test_eval_set_offline(self):
         tasks = Path(__file__).resolve().parent.parent / "evals" / "tasks.json"
-        outcomes, summary = run_evals(self.s, tasks, self.ws.root / "playbooks")
-        self.assertEqual(summary["tasks"], 4)
+        # The full 50-task set runs in tests/test_evals.py; the holdout split keeps this one quick.
+        outcomes, summary = run_evals(self.s, tasks, self.ws.root / "playbooks", split="holdout", model_available=False)
+        self.assertEqual(summary["tasks"], sum(t["split"] == "holdout" for t in json.loads(tasks.read_text(encoding="utf-8"))))
         self.assertEqual(summary["task_success_rate"], 1.0, [(o.task_id, o.status, o.grader_details) for o in outcomes])
         self.assertEqual(summary["unapproved_outbound_actions"], 0)
         self.assertTrue(summary["pilot_gate_met"])
