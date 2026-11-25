@@ -92,7 +92,11 @@ class OfflineEvalRun(unittest.TestCase):
             self.assertIn(status, ("needs_model", "needs_tier"), tid)
         # The guided playbooks are the only ones that need the model.
         model_wfs = {o.workflow for o in self.outcomes if o.status == "needs_model"}
-        self.assertEqual(model_wfs, {"portal-report-download"})
+        if self.browser_ok:
+            self.assertEqual(model_wfs, {"portal-report-download"})
+        else:
+            # Without Playwright the browser tasks stop at the tier check first.
+            self.assertLessEqual(model_wfs, {"portal-report-download"})
         ran_wfs = {o.workflow for o in self.outcomes if o.ran}
         expected = {t["workflow"] for t in TASKS} - (set() if self.browser_ok else {"weekly-kpi-summary"})
         self.assertEqual(ran_wfs, expected)
