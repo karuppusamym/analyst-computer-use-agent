@@ -146,23 +146,51 @@ python -m analyst_agent portal --host 127.0.0.1 --port 8765
 - **Task chat** (`/`): submit a request, optionally with a playbook and `name=value` parameters. Runs execute in background threads through the normal orchestrator. Clarifying questions from the planner appear in the chat; the run waits until they are answered or `portal.question_timeout_s` passes.
 - **Sessions** (`/sessions`): the session folders under `workspace/audit/` that you may see (see **Who sees which session** below), with step statuses, approvals, outputs, the full audit log, the "what I checked" report and a **kill switch** button. The button writes the same `STOP` file as `python -m analyst_agent stop <session>`.
 - **Resume** (session page): a session that has a `checkpoint.json`, is not running, did not end in `success` and has no `STOP` file gets a **Resume from checkpoint** button. It calls `Orchestrator.run(..., session_id=<id>, resume=True)` in a background thread, the same as `run --resume <id>`: verified steps are skipped, and the plan goes to the approval inbox again. The original owner stays the owner. Each resume is recorded in `portal_meta.json` and as `run_resumed` in `workspace/portal_audit/`.
-- **Live view** (`/sessions/<id>/live`): the latest screenshots from the session's audit folder and a tail of audit events, refreshed by polling. It stands in for Guacamole/noVNC for now.
+- **Live view** (`/sessions/<id>/live`): the latest screenshots from the session's audit folder and a tail of audit events, refreshed by polling, plus **Take over** / **Hand back** (see **Human takeover** below). For the pilot this replaces Guacamole/noVNC.
 - **Approval inbox** (`/approvals`): `WebApprover` queues every approval request, including the plan. A reviewer sees the full preview and approves or rejects. The run waits until someone decides or `policy.approval_timeout_s` passes; a timeout is a decline. The decision and who made it go into the session's audit log and `workspace/portal_audit/`.
 - **Playbook review** (`/playbooks`): lists playbooks with steps, parameters, owner and version. Drafts (`playbooks/drafts/*.json`, or `"status": "draft"`) never run. A reviewer approves a draft, which validates it and moves it into `playbooks/`, or rejects it, which moves it to `playbooks/drafts/rejected/`. The author of a draft cannot approve it unless they are an admin.
 
-**Roles:** `analyst` runs tasks and uses the kill switch. `reviewer` can also approve requests and playbooks. `admin` can do everything, including answering questions on anyone's run.
+**Roles:** `analyst` runs tasks and uses the kill switch. `reviewer` can also approve requests and playbooks (limited by teams, below). `admin` can do everything, including answering questions on anyone's run.
 
 **Who sees which session.** When the portal starts a run, it writes the owner (the signed-in user) to `workspace/audit/<session>/portal_meta.json` before the run begins.
 
 | Role | Sees |
 | --- | --- |
-| `analyst` | Only their own sessions. |
-| `reviewer` | Their own sessions, sessions with an approval waiting (which they can decide), and sessions with no owner. |
+| `analyst` | Their own sessions, sessions shared with them, and sessions owned by someone in one of their teams. |
+| `reviewer` | The same, plus sessions with an approval waiting that they may decide, and sessions with no owner. |
 | `admin` | Every session. |
 
 - Sessions with no `portal_meta.json` (started from the CLI or a schedule, or from a portal older than this change) count as having no owner, so only reviewers and admins see them.
-- The rule covers the session list, task chat, detail, live view, report, files, the polling APIs, the kill switch, Resume, answering questions, and the approval inbox and history.
+- The person holding a takeover keeps the session until they hand back.
+- The rule covers the session list, task chat, detail, live view, report, files, the polling APIs, the kill switch, Resume, answering questions, takeover, sharing, and the approval inbox and history.
 - A session you can't see returns **404**, the same page as a session that doesn't exist, and is logged as `session_hidden`.
+
+**Teams** (`portal.teams` in the config):
+
+```json
+"teams": {
+  "finance": {"members": ["alice", "bob"], "reviewers": ["rita"], "playbooks": ["erp-crm-reconciliation", "budget-*"]},
+  "audit":   {"members": [], "reviewers": ["rhea"], "playbooks": ["*"]}
+}
+```
+
+- Members and reviewers of a team are all in the team, and each sees the sessions the others own.
+- With teams configured, a reviewer may decide an approval only if the session's playbook matches (fnmatch) a `playbooks` entry of a team that lists them under `reviewers`. `"*"` means any playbook, including planner-built sessions with no playbook; nothing else matches those. A reviewer listed in no team's `reviewers` decides nothing. Admins are not limited.
+- Approvals a reviewer may not decide don't make the session visible to them. If they can see it anyway (team, share), the inbox shows the request with disabled buttons, and a POST gets **403** and is logged as `approval_forbidden`.
+- With no teams configured, every reviewer may decide every approval, as before.
+- Team names are not checked against the user store; with SSO they are the names from the proxy or the ID token.
+
+**Share** (session page, owner or admin only): adds or removes individual viewers by user name. They are stored as `viewers` in `portal_meta.json` and logged as `session_shared` / `session_unshared` in the session's audit log and `workspace/portal_audit/`. Viewers get the same access as a team member: they can see the session and use its kill switch and Resume, but they cannot share it further or decide approvals unless their role and team allow it.
+
+**Human takeover** (live view):
+
+- **Who:** admins on any session they see; reviewers on any session they see; the session owner when they are an analyst, if `portal.takeover.owner_analysts` is true (the default; set it to false so only reviewers and admins can take over). The run must be alive in this portal, and nobody else may hold it. Only the holder sends input; the holder or an admin can hand back.
+- **Take over** writes `workspace/audit/<session>/PAUSE` (who and when) and logs `takeover_started` with `actor: "human:<user>"`. The orchestrator checks the file before each step, the executor before each model turn and before each tool call in a batch, and a scripted tool sequence before each call. The run logs `takeover_paused` and waits. A hand-made `PAUSE` file works the same way.
+- **While paused**, the holder (and any admin, read-only) sees the screen refreshed every `frame_interval_ms` (default 1000 ms), as a PNG at the agent's screenshot scale reduced to `frame_max_width` (default 1280). Frames are captured on request and never saved. Click on the image (left, double, right, move; optional shift/ctrl/alt), use the wheel to scroll, type text, or press keys (`ctrl+s`, `Return`, …). The browser maps the click to the image's own pixels, and the server scales that back to the agent's coordinate space and then to the screen.
+- **Every input is a `ComputerTier` action**, so it uses the same foreground-window allowlist guard (`allowed_window_titles` or an allowed app) and `dry_run` as the agent. Allowed input is logged as `human_action`; refused input is not sent and is logged as `human_action_refused` (also in `workspace/portal_audit/`). Both carry `actor: "human:<user>"` and the foreground window. A person may not type `{{secret:...}}` placeholders or press Windows-key combinations. Input requests need the CSRF token and a same-origin `Origin`, like every POST.
+- **Hand back** logs `takeover_ended` and removes `PAUSE`. The run logs `takeover_resumed` with the human action counts. The executor's next turn gets a note listing what the person did (actions, coordinates and windows; typed text only as a character count) and must take a screenshot before its next desktop action. Any other desktop action is refused until it does. A scripted sequence interrupted by a takeover fails that attempt, and the guided retry gets the note. The step's checks still decide whether it passed.
+- **Kill switch while paused:** the run stops at once. If nobody hands back within `limits.takeover_timeout_s` (default 1800), the run stops as blocked; the `PAUSE` file stays until someone hands back. The task time-out (`limits.task_timeout_s`) keeps running during a takeover. A session with a `PAUSE` file is not resumed from the portal.
+- Screen and input need `tiers.desktop_pixels.enabled` on Windows. Without it, taking over still pauses the agent, and the panel says remote control is unavailable. Turn the feature off with `portal.takeover.enabled: false`.
 - Files in the shared `workspace/output/` (`/out/...`) are served only if a session you can see lists them as an output. Admins can get any file there. Two sessions that write the same file name share that file.
 
 **Pending requests survive a restart.** Each pending approval and each set of clarifying questions is saved as one JSON file in `workspace/portal_state/` (setting `portal.state_dir`).
@@ -343,7 +371,8 @@ analyst_agent/
   eval_history.py  eval history.jsonl rows, `eval history` / `eval compare`, per-run HTML report
   teach.py      teach mode: drafts from sessions, browser recorder, promote
   scheduler.py  cron parser, schedules, unattended run-due
-  portal/       web portal: server, views, auth (local / SSO header / OIDC), WebApprover inbox, runs, playbook review
+  takeover.py   human takeover: PAUSE file, hand-back note for the executor
+  portal/       web portal: server, views, auth (local / SSO header / OIDC), WebApprover inbox, runs, playbook review, takeover, teams
 config/schedules.json  schedule definitions (an example, disabled)
 playbooks/      10 pilot playbooks (drafts/ holds teach-mode drafts): ERP/CRM reconciliation, warehouse region question, portal report download,
                 legacy ledger entry, budget-vs-actuals variance, three-way match, churn cohorts,
@@ -358,11 +387,12 @@ tests/          unit, integration and live desktop tests
 ## Not done yet
 
 - **Not yet tested on your office gateway.** It has been tested on OpenRouter only (see above). Run `gateway-check` on your gateway first.
-- **Portal is a first version.** Task chat, sessions, approval inbox, playbook review, SSO (trusted header / OIDC), a polling live view, pending requests that survive a restart (with Resume), and per-owner session visibility are in place (see Portal). Still missing or limited:
-  - The live view shows screenshots, not an interactive remote desktop.
+- **Portal is a first version.** Task chat, sessions, approval inbox, playbook review, SSO (trusted header / OIDC), a polling live view with human takeover, pending requests that survive a restart (with Resume), team and per-owner session visibility, sharing, and team-limited reviewers are in place (see Portal). Still missing or limited:
+  - Takeover is polled PNG frames plus single inputs, not a streaming remote desktop. Expect about a second of lag, and no drag, key-hold or clipboard. The screen is the primary monitor of the machine the portal runs on, so the portal and the agent must share a desktop. Frames and typed text are not redacted; don't type secrets during a takeover.
+  - A takeover holds only within one portal process. After a restart the run thread is gone, a leftover `PAUSE` file blocks Resume until someone hands back, and the task time-out keeps running while a person holds the session.
   - A restart can't reconnect a waiting run. Its pending requests are declined as orphaned, and the session has to be resumed from its last checkpoint. The plan is approved again, and an unverified step that was in progress runs again.
-  - Visibility is per user, not per team. Sharing a session, or limiting reviewers to particular playbooks or approvers, is not built yet.
-- **Later-phase features:** a Guacamole/noVNC interactive desktop is still a Phase 3 item. The central vault backends (HashiCorp Vault, Azure Key Vault) have been tested only against local fake servers that mimic their APIs, not against a real Vault or Key Vault. Rotation is manual (`vault rotate`). Nothing changes the password on the target system itself. Sharing is per user, not per portal group or team.
+  - Teams come from the config file only, not from SSO groups, and team membership isn't checked against the user store. Reviewers are limited by playbook, not by approval type or amount.
+- **Later-phase features:** a Guacamole/noVNC desktop with streaming video is still a Phase 3 item, for VMs the portal does not run on. The central vault backends (HashiCorp Vault, Azure Key Vault) have been tested only against local fake servers that mimic their APIs, not against a real Vault or Key Vault. Rotation is manual (`vault rotate`). Nothing changes the password on the target system itself. Sharing is per user, not per portal group or team.
 - **Teach recorder:** has been tested by driving the page in code (`tests/test_teach.py`, against the `/tabs` page of the test portal), not with a person clicking in a headed window. Still limited:
   - A link that downloads straight into a new tab (`target=_blank` on an attachment) is reported as a warning, not replayed, because the download belongs to a tab that closes itself.
   - Tabs are matched by open order. If a site opens its tabs in a different order at replay, the `browser_switch_tab` steps need `url_contains` instead of `tab`, by hand.

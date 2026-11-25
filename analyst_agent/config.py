@@ -81,6 +81,7 @@ DEFAULTS: dict[str, Any] = {
         "max_step_retries": 1,
         "max_replans": 1,
         "task_timeout_s": 3600,
+        "takeover_timeout_s": 1800,  # a human takeover (PAUSE) not handed back by then stops the run
     },
     "connectors": {"databases": {}},
     "audit": {"dir": "./workspace/audit"},
@@ -94,6 +95,10 @@ DEFAULTS: dict[str, Any] = {
         "question_timeout_s": 900,
         "live_screenshots": 4,
         "state_dir": "portal_state",  # under workspace/: pending approvals and questions, one JSON file each
+        # Human takeover from the live view (README "Portal"). Input needs tiers.desktop_pixels.enabled.
+        "takeover": {"enabled": True, "owner_analysts": True, "frame_max_width": 1280, "frame_interval_ms": 1000, "max_text": 2000},
+        # Teams: {"finance": {"members": ["alice"], "reviewers": ["rita"], "playbooks": ["erp-crm-reconciliation"]}}
+        "teams": {},
         "auth": {
             # "local" (users file), "trusted_header" (SSO reverse proxy) or "oidc".
             "mode": "local",

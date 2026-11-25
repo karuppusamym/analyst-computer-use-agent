@@ -8,6 +8,7 @@ and vault secret values are replaced with [REDACTED:name] (see Redactor).
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -70,6 +71,47 @@ class Redactor:
         return obj
 
 
+_FILE_LOCKS: dict[str, threading.Lock] = {}
+_FILE_LOCKS_GUARD = threading.Lock()
+
+
+def file_lock(path: str | Path) -> threading.Lock:
+    """One lock per events.jsonl in this process, shared by the run's AuditLog and the portal,
+    so two writers (e.g. a human takeover and the agent) never interleave or reuse a seq."""
+    key = str(Path(path).resolve()).lower()
+    with _FILE_LOCKS_GUARD:
+        return _FILE_LOCKS.setdefault(key, threading.Lock())
+
+
+def _scan_last_seq(path: Path) -> int:
+    if not path.exists():
+        return 0
+    last = 0
+    with path.open("rb") as fh:
+        for line in fh:
+            try:
+                last = max(last, int(json.loads(line).get("seq", 0)))
+            except (ValueError, TypeError, AttributeError):
+                continue
+    return last
+
+
+def append_event(session_dir: str | Path, kind: str, user: str = "portal", **data: Any) -> dict | None:
+    """Append one event to a session's events.jsonl from outside its run (portal, takeover).
+    Secret-looking keys are masked like AuditLog.event; the seq continues the file's sequence."""
+    d = Path(session_dir)
+    if not d.is_dir():
+        return None
+    path = d / "events.jsonl"
+    with file_lock(path):
+        rec = {"seq": _scan_last_seq(path) + 1, "ts": time.time(), "session": d.name, "user": user, "kind": kind, **_mask(data)}
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, default=str) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+    return rec
+
+
 def redact(obj: Any, audit: Any) -> Any:
     """Apply the audit log's redactor if it has one (test doubles may not)."""
     r = getattr(audit, "redactor", None)
@@ -84,23 +126,18 @@ class AuditLog:
         self.path = self.dir / "events.jsonl"
         self.user = user
         self._seq = self._last_seq()  # a resumed session continues its sequence; it never restarts at 1
-        self._lock = threading.Lock()
+        self._lock = file_lock(self.path)
+        self._size = self.path.stat().st_size if self.path.exists() else 0
         self.redactor = Redactor()
 
     def _last_seq(self) -> int:
-        if not self.path.exists():
-            return 0
-        last = 0
-        with self.path.open("rb") as fh:
-            for line in fh:
-                try:
-                    last = max(last, int(json.loads(line).get("seq", 0)))
-                except (ValueError, TypeError, AttributeError):
-                    continue
-        return last
+        return _scan_last_seq(self.path)
 
     def event(self, kind: str, /, **data: Any) -> dict:
         with self._lock:
+            size = self.path.stat().st_size if self.path.exists() else 0
+            if size != self._size:  # someone else (the portal) appended: continue after their seq
+                self._seq = max(self._seq, self._last_seq())
             self._seq += 1
             record = {"seq": self._seq, "ts": time.time(), "session": self.session_id, "user": self.user, "kind": kind, **_mask({k: v for k, v in data.items() if k != "kind"}), **({"detail_kind": data["kind"]} if "kind" in data else {})}
             record = self.redactor.apply(record)

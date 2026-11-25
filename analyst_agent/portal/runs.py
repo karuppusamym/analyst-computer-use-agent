@@ -13,7 +13,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from ..audit import append_event
 from ..config import Settings
+from ..takeover import PAUSE_FILE, pause_info
 from ..playbook import Playbook, PlaybookError, PlaybookRegistry
 from .approvals import ApprovalInbox, QuestionBox, WebApprover
 from .state import atomic_write_json, read_json
@@ -69,15 +71,7 @@ def write_meta(session_dir: Path, meta: dict) -> None:
 
 def append_session_event(session_dir: Path, kind: str, user: str = "portal", **data: Any) -> None:
     """Append one event to a session's audit log from outside its run (e.g. an orphaned request)."""
-    if not session_dir.is_dir():
-        return
-    events = read_events(session_dir)
-    seq = max([int(e.get("seq", 0) or 0) for e in events] or [0]) + 1
-    rec = {"seq": seq, "ts": time.time(), "session": session_dir.name, "user": user, "kind": kind, **data}
-    with open(session_dir / "events.jsonl", "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, default=str) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
+    append_event(session_dir, kind, user, **data)
 
 
 def read_events(session_dir: Path, limit: int | None = None) -> list[dict]:
@@ -252,6 +246,37 @@ class RunManager:
         run = self.runs.get(sid)
         return str(owner) if owner else (run.user if run else None)
 
+    def playbook_of(self, sid: str) -> str | None:
+        """The session's playbook name (None for planner-built or unknown sessions)."""
+        run = self.runs.get(sid)
+        if run and run.playbook:
+            return run.playbook
+        if not valid_session_id(sid):
+            return None
+        for e in read_events(self.settings.audit_dir / sid):
+            if e.get("kind") == "task_started":
+                return e.get("playbook") or None
+        return None
+
+    def viewers(self, sid: str) -> list[str]:
+        """Users the owner or an admin shared this session with (portal_meta.json "viewers")."""
+        if not valid_session_id(sid):
+            return []
+        v = read_meta(self.settings.audit_dir / sid).get("viewers")
+        return [str(x) for x in v] if isinstance(v, list) else []
+
+    def set_viewers(self, sid: str, viewers: list[str]) -> None:
+        with self._lock:
+            d = self.settings.audit_dir / sid
+            meta = read_meta(d)
+            if not meta.get("owner"):
+                run = self.runs.get(sid)
+                if run:
+                    meta["owner"] = run.user
+            meta["viewers"] = sorted(dict.fromkeys(viewers))
+            d.mkdir(parents=True, exist_ok=True)
+            write_meta(d, meta)
+
     # ---- resume (the portal's `run --resume <session>`)
     def resume_problem(self, sid: str, info: dict | None = None) -> str:
         """Why this session cannot be resumed, or "" if it can."""
@@ -269,6 +294,8 @@ class RunManager:
             return "this session is waiting for a decision"
         if (d / "STOP").exists():
             return "the kill switch was pressed for this session, so it is not resumed from the portal"
+        if (d / PAUSE_FILE).exists():
+            return "a person has taken over this session; hand it back first"
         if not info.get("request"):
             return "the original request is not in the audit log"
         return ""
@@ -375,6 +402,7 @@ class RunManager:
         info = summarize_events(read_events(d))
         info["id"] = sid
         info["stopped"] = (d / "STOP").exists()
+        info["takeover"] = pause_info(d)
         info["owner"] = self.owner(sid)
         run = self.runs.get(sid)
         if run:
@@ -393,6 +421,8 @@ class RunManager:
                 info["report"] = run.result.report_path or info["report"]
         elif info["status"] == "running":
             info["status"] = "interrupted"  # no live thread in this portal and no task_finished event
+        if info["takeover"] is not None and info["status"] == "running":
+            info["status"] = "paused (human takeover)"
         if self.inbox.pending(sid):
             info["status"] = "waiting for approval"
         if self.questions.get(sid):
