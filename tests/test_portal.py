@@ -779,7 +779,9 @@ class AuthModeTests(unittest.TestCase):
         s = Signer(secrets.token_bytes(32))
         tok = s.sign({"u": "a", "exp": time.time() + 60})
         self.assertEqual(s.unsign(tok)["u"], "a")
-        self.assertIsNone(s.unsign(tok[:-1] + ("A" if tok[-1] != "A" else "B")))
+        for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_":
+            if c != tok[-1]:
+                self.assertIsNone(s.unsign(tok[:-1] + c), c)  # every other last character is rejected
         self.assertIsNone(Signer(secrets.token_bytes(32)).unsign(tok))
         self.assertIsNone(s.unsign(s.sign({"u": "a", "exp": time.time() - 1})))
 

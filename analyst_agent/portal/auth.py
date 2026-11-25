@@ -187,7 +187,9 @@ class Signer:
         body, mac = token.split(".")
         want = hmac.new(self.key, body.encode("ascii"), hashlib.sha256).digest()
         try:
-            if not hmac.compare_digest(want, b64url_decode(mac)):
+            # Compare the canonical encoding, so a token has exactly one valid spelling
+            # (non-canonical base64 could otherwise decode to the same MAC).
+            if not hmac.compare_digest(b64url_encode(want), mac):
                 return None
             data = json.loads(b64url_decode(body))
         except (ValueError, TypeError):

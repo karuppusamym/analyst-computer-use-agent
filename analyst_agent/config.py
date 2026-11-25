@@ -104,8 +104,16 @@ DEFAULTS: dict[str, Any] = {
                      "username_claim": "preferred_username", "groups_claim": "groups", "user_roles": {}, "group_roles": {}, "default_role": "analyst"},
         },
     },
-    # Credential vault (vault.py). backend: "dpapi" (Windows, current user), "env" (read-only), "keyring" (if installed).
-    "vault": {"backend": "dpapi", "path": "./workspace/vault", "env_prefix": "AGENT_SECRET_", "entropy_env": ""},
+    # Credential vault (vault.py). backend: "dpapi" (Windows, current user), "env" (read-only), "keyring" (if installed),
+    # "hashicorp" (KV v2) or "azure_keyvault" (central stores, see vault_remote.py).
+    "vault": {"backend": "dpapi", "path": "./workspace/vault", "env_prefix": "AGENT_SECRET_", "entropy_env": "",
+              # Central stores (vault_remote.py). Credentials come from the named env vars, never from this file.
+              "hashicorp": {"url": "", "mount": "secret", "path_prefix": "analyst_agent/", "namespace": "", "token_env": "VAULT_TOKEN",
+                            "role_id_env": "VAULT_ROLE_ID", "secret_id_env": "VAULT_SECRET_ID", "approle_mount": "approle",
+                            "ca_bundle": "", "verify_tls": True, "timeout_s": 10, "cache_ttl_s": 60},
+              "azure_keyvault": {"vault_url": "", "auth": "auto", "tenant_id": "", "client_id": "", "client_secret_env": "AZURE_CLIENT_SECRET",
+                                 "authority_host": "https://login.microsoftonline.com", "imds_endpoint": "http://169.254.169.254/metadata/identity/oauth2/token",
+                                 "managed_identity_client_id": "", "api_version": "7.4", "ca_bundle": "", "verify_tls": True, "timeout_s": 10, "cache_ttl_s": 60}},
     # Scheduled unattended runs (scheduler.py): definitions file and run state/history folder.
     "schedules": {"path": "./config/schedules.json", "state_dir": "./workspace/schedules", "lock_stale_s": 7200},
 }
