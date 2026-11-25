@@ -17,15 +17,18 @@
     "week": {
       "type": "string",
       "required": true,
-      "description": "ISO week number of 2026, e.g. 47"
+      "description": "ISO week number of 2026, e.g. 47",
+      "format": "week"
     },
     "portal_url": {
       "type": "string",
-      "default": "http://127.0.0.1:8765/"
+      "default": "http://127.0.0.1:8765/",
+      "format": "url"
     },
     "recipient": {
       "type": "string",
-      "default": "sales-leadership@example.com"
+      "default": "sales-leadership@example.com",
+      "format": "email"
     }
   },
   "steps": [

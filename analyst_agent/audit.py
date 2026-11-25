@@ -83,9 +83,21 @@ class AuditLog:
         (self.dir / "screenshots").mkdir(parents=True, exist_ok=True)
         self.path = self.dir / "events.jsonl"
         self.user = user
-        self._seq = 0
+        self._seq = self._last_seq()  # a resumed session continues its sequence; it never restarts at 1
         self._lock = threading.Lock()
         self.redactor = Redactor()
+
+    def _last_seq(self) -> int:
+        if not self.path.exists():
+            return 0
+        last = 0
+        with self.path.open("rb") as fh:
+            for line in fh:
+                try:
+                    last = max(last, int(json.loads(line).get("seq", 0)))
+                except (ValueError, TypeError, AttributeError):
+                    continue
+        return last
 
     def event(self, kind: str, /, **data: Any) -> dict:
         with self._lock:

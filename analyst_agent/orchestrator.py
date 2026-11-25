@@ -211,6 +211,14 @@ class Orchestrator:
 
     def _make_plan(self, request: str, playbook: Playbook | None, params: dict, audit: AuditLog) -> Plan:
         if playbook:
+            invalid = playbook.invalid_params(params)
+            if invalid:
+                # A value that does not fit its declared shape never reaches a step (SQL, code, file names, UI).
+                # Drop it and ask for a valid one; the model is not allowed to guess what was meant.
+                audit.event("params_invalid", params={k: {"value": str(params[k])[:200], "reason": r} for k, r in invalid.items()})
+                for k in invalid:
+                    params.pop(k, None)
+                return Plan([], [], [f"The value given for '{k}' {r}. Please give a valid value for '{k}'." for k, r in invalid.items()], {}, "playbook")
             missing = [k for k, spec in playbook.parameters.items() if spec.get("required", True) and k not in params and "default" not in spec]
             if missing:
                 # Let the planner read parameter values out of the request text.
@@ -219,10 +227,17 @@ class Orchestrator:
                 except ModelError as e:
                     # No model to read the request: ask for the values instead of failing.
                     audit.event("planner_unavailable", error=str(e)[:500])
+                    audit.event("params_missing", params=missing)
                     return Plan([], [], [f"Please give a value for '{k}'" for k in missing], {}, "playbook")
                 params.update({k: v for k, v in plan.params.items() if k in playbook.parameters})
+                invalid = playbook.invalid_params(params)
+                if invalid:
+                    audit.event("params_invalid", source="planner", params={k: {"value": str(params[k])[:200], "reason": r} for k, r in invalid.items()})
+                    for k in invalid:
+                        params.pop(k, None)
                 still = [k for k in missing if k not in params]
                 if still:
+                    audit.event("params_missing", params=still)
                     return Plan([], [], plan.questions or [f"Please give a value for '{k}'" for k in still], {}, "playbook")
             bound = playbook.bind(params)
             audit.event("plan", source="playbook", playbook=bound.name, version=bound.version, steps=[st.to_dict() for st in bound.steps], final_checks=bound.final_checks)
@@ -255,6 +270,7 @@ class Orchestrator:
         rec.tier_used, rec.route_note = route.tier.name, route.note
         prior = "\n".join(f"- {r.step.id}: {r.summary[:600]} files={r.files}" for r in records if r.status == "verified")
         error = ""
+        scripted_failure = ""
         max_attempts = 1 + self.settings["limits"]["max_step_retries"] + (1 if step.script else 0)
         while rec.attempts < max_attempts:
             rec.attempts += 1
@@ -264,7 +280,11 @@ class Orchestrator:
                 try:
                     run = Executor(self.client).run(step, route.tier, ctx, prior=prior, error=error, deadline=deadline, stop_flag=lambda: self._stop_requested(audit))
                 except ModelError as e:
-                    run = StepRun("failed", f"model call failed: {e}")
+                    # Keep the real cause from the scripted attempt; the model retry is only a fallback.
+                    first = f"{scripted_failure}; " if scripted_failure else ""
+                    run = StepRun("failed", f"{first}guided retry unavailable (model call failed: {e})")
+            if step.script and rec.attempts == 1 and run.status != "done":
+                scripted_failure = f"scripted run failed: {run.summary[:1500]}"
             rec.summary = run.summary
             rec.files = list(dict.fromkeys(rec.files + run.files))
             if run.status == "blocked" and "kill switch" in run.summary:

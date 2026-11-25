@@ -88,6 +88,7 @@ DEFAULTS: dict[str, Any] = {
         "allowed_hosts": [],  # Host header names; empty = loopback names when bound to loopback
         "question_timeout_s": 900,
         "live_screenshots": 4,
+        "state_dir": "portal_state",  # under workspace/: pending approvals and questions, one JSON file each
         "auth": {
             # "local" (users file), "trusted_header" (SSO reverse proxy) or "oidc".
             "mode": "local",

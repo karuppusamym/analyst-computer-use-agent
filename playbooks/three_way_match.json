@@ -15,16 +15,19 @@
     "period": {
       "type": "string",
       "required": true,
-      "description": "YYYY-MM"
+      "description": "YYYY-MM",
+      "format": "month"
     },
     "tolerance_pct": {
       "type": "number",
       "default": 2,
-      "description": "allowed unit-price difference vs PO, percent"
+      "description": "allowed unit-price difference vs PO, percent",
+      "format": "number"
     },
     "recipient": {
       "type": "string",
-      "default": "ap-lead@example.com"
+      "default": "ap-lead@example.com",
+      "format": "email"
     }
   },
   "steps": [

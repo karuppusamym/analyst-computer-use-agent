@@ -4,10 +4,25 @@
   "owner": "finance-analytics",
   "workflow": "download weekly report vendor portal",
   "description": "Download the weekly report CSV for a given week from the vendor web portal (read-only). Guided mode: needs the model.",
-  "permissions": {"data_class": "internal", "hosts": ["127.0.0.1", "localhost"]},
+  "permissions": {
+    "data_class": "internal",
+    "hosts": [
+      "127.0.0.1",
+      "localhost"
+    ]
+  },
   "parameters": {
-    "week": {"type": "string", "required": true, "description": "ISO week number, e.g. 47"},
-    "portal_url": {"type": "string", "default": "http://127.0.0.1:8765/"}
+    "week": {
+      "type": "string",
+      "required": true,
+      "description": "ISO week number, e.g. 47",
+      "format": "week"
+    },
+    "portal_url": {
+      "type": "string",
+      "default": "http://127.0.0.1:8765/",
+      "format": "url"
+    }
   },
   "steps": [
     {
@@ -16,12 +31,22 @@
       "tier": "browser",
       "instructions": "Open {portal_url}, go to the reports page, find the row for week {week} and download its CSV with browser_download. Do not submit any form.",
       "checks": [
-        {"type": "file_exists", "path": "output/downloads/report_wk{week}.csv"},
-        {"type": "csv_rows", "path": "output/downloads/report_wk{week}.csv", "min": 1}
+        {
+          "type": "file_exists",
+          "path": "output/downloads/report_wk{week}.csv"
+        },
+        {
+          "type": "csv_rows",
+          "path": "output/downloads/report_wk{week}.csv",
+          "min": 1
+        }
       ]
     }
   ],
   "final_checks": [
-    {"type": "file_exists", "path": "output/downloads/report_wk{week}.csv"}
+    {
+      "type": "file_exists",
+      "path": "output/downloads/report_wk{week}.csv"
+    }
   ]
 }

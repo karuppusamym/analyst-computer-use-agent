@@ -12,17 +12,26 @@
     "start_month": {
       "type": "string",
       "required": true,
-      "description": "first signup month, YYYY-MM"
+      "description": "first signup month, YYYY-MM",
+      "format": "month"
     },
     "end_month": {
       "type": "string",
       "required": true,
-      "description": "last signup month, YYYY-MM, inclusive"
+      "description": "last signup month, YYYY-MM, inclusive",
+      "format": "month"
     },
     "region": {
       "type": "string",
       "default": "all",
-      "description": "North, South, East, West or all"
+      "description": "North, South, East, West or all",
+      "enum": [
+        "North",
+        "South",
+        "East",
+        "West",
+        "all"
+      ]
     },
     "label": {
       "type": "string",

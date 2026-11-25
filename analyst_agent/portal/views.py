@@ -98,7 +98,7 @@ JS = """
 
 def badge(status: str) -> str:
     s = (status or "").lower()
-    cls = "b-ok" if s in ("success", "verified", "approved") else "b-bad" if s in ("failed", "blocked", "error", "rejected", "declined", "interrupted") else "b-warn" if s.startswith("waiting") or s in ("partial", "needs_input", "running", "pending", "draft", "timeout") else ""
+    cls = "b-ok" if s in ("success", "verified", "approved") else "b-bad" if s in ("failed", "blocked", "error", "rejected", "declined", "interrupted", "orphaned") else "b-warn" if s.startswith("waiting") or s in ("partial", "needs_input", "running", "pending", "draft", "timeout") else ""
     return f'<span class="badge {cls}">{h(status or "unknown")}</span>'
 
 
@@ -251,9 +251,24 @@ def session_page(info: dict, events: list[dict], ident: Identity, csrf: str, pen
         + (f'<a class="btn secondary" href="/sessions/{u(sid)}/report">What I checked</a>' if info.get("report") else "")
         + f'<a class="btn secondary" href="/sessions/{u(sid)}/file/events.jsonl">Raw audit log</a>'
         + f'<form method="post" action="/sessions/{u(sid)}/stop" data-confirm="Stop this session before its next action?">{csrf_input(csrf)}'
-        + f'<button type=submit class="danger" {"disabled" if final or info.get("stopped") else ""}>Kill switch: stop</button></form></p></div>'
+        + f'<button type=submit class="danger" {"disabled" if final or info.get("stopped") else ""}>Kill switch: stop</button></form>'
+        + (
+            f'<form method="post" action="/sessions/{u(sid)}/resume" data-confirm="Resume this session from its last checkpoint? Verified steps are skipped and the plan needs approval again.">{csrf_input(csrf)}'
+            '<button type=submit>Resume from checkpoint</button></form>'
+            if info.get("resumable") else ""
+        )
+        + "</p></div>"
     )
     parts = [head]
+    if info.get("orphaned"):
+        parts.append(
+            '<div class="card"><div class="row"><strong>Orphaned — run was interrupted</strong>' + badge("orphaned") + "</div>"
+            '<p class="muted">The portal restarted while these were waiting. They were declined (never auto-approved).'
+            + (" The session can be resumed from its last checkpoint." if info.get("resumable") else "")
+            + "</p><ul>"
+            + "".join(f'<li>{h(o["what"])} <span class="muted">({h(ts(o["ts"]))})</span></li>' for o in info["orphaned"])
+            + "</ul></div>"
+        )
     if pending:
         parts.append("<h2>Waiting for approval</h2>" + "".join(approval_card(p, ident, csrf, show_session=False) for p in pending))
     if question:
@@ -305,7 +320,7 @@ def approvals_page(pending: list, history: list, ident: Identity, csrf: str) -> 
     if history:
         body += '<h2>Recent decisions</h2><div class="card scroll"><table><tr><th>When</th><th>Session</th><th>Step</th><th>Action</th><th>Decision</th><th>By</th><th>Note</th></tr>' + "".join(
             f'<tr><td>{h(ts(x.decision.decided_at))}</td><td><a href="/sessions/{u(x.session_id)}">{h(x.session_id)}</a></td><td>{h(x.req.step_id)}</td><td>{h(x.req.action_class)}</td>'
-            f'<td>{badge("approved" if x.decision.approved else ("timeout" if x.decision.by == "timeout" else "declined"))}</td><td>{h(x.decision.by)}</td><td>{h(x.decision.note)}</td></tr>'
+            f'<td>{badge("orphaned" if x.outcome == "orphaned" else "approved" if x.decision.approved else ("timeout" if x.decision.by == "timeout" else "declined"))}</td><td>{h(x.decision.by)}</td><td>{h(x.decision.note)}</td></tr>'
             for x in history if x.decision
         ) + "</table></div>"
     return body

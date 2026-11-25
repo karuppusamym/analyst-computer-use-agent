@@ -3,6 +3,11 @@
 A run thread calls WebApprover.request() (or the ask callback); that queues an
 item the portal shows and then blocks until a person decides or the timeout
 expires. A timeout is always a decline: nothing is ever auto-approved.
+
+With a PendingStore, every item is written to disk before it is shown and its
+decision is written before the run thread is released, so a portal restart
+never loses a decision. Items left pending by a dead portal are closed as
+orphaned (declined) when the next portal starts.
 """
 
 from __future__ import annotations
@@ -14,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from ..policy import ApprovalDecision, ApprovalRequest
+from .state import PendingStore
 
 
 @dataclass
@@ -25,6 +31,7 @@ class PendingApproval:
     created_at: float
     timeout_s: float
     decision: ApprovalDecision | None = None
+    outcome: str = ""  # approved / declined / timeout / orphaned, once decided
     _event: threading.Event = field(default_factory=threading.Event, repr=False)
 
     @property
@@ -32,22 +39,52 @@ class PendingApproval:
         return self.created_at + self.timeout_s
 
 
+def _outcome(d: ApprovalDecision) -> str:
+    return "approved" if d.approved else ("timeout" if d.by == "timeout" else "declined")
+
+
 class ApprovalInbox:
-    def __init__(self, on_decided: Callable[[PendingApproval], None] | None = None, keep_history: int = 200):
+    def __init__(self, on_decided: Callable[[PendingApproval], None] | None = None, keep_history: int = 200, store: PendingStore | None = None):
         self._items: dict[str, PendingApproval] = {}
         self._history: list[PendingApproval] = []
         self._lock = threading.Lock()
         self._on_decided = on_decided
         self._keep = keep_history
+        self.store = store
+
+    def _persist_close(self, item: PendingApproval) -> bool:
+        if self.store is None:
+            return True
+        d = item.decision
+        return self.store.close("approval", item.id, item.outcome, d.by, d.note, approved=d.approved)
 
     def submit(self, session_id: str, requested_by: str, req: ApprovalRequest, timeout_s: float) -> ApprovalDecision:
         item = PendingApproval(secrets.token_hex(8), session_id, requested_by, req, time.time(), float(timeout_s))
+        if self.store is not None:
+            try:
+                self.store.open("approval", item.id, {
+                    "session_id": session_id, "requested_by": requested_by, "created_at": item.created_at, "timeout_s": item.timeout_s,
+                    "step_id": req.step_id, "action_class": req.action_class, "summary": req.summary, "preview": req.preview, "approver": req.approver,
+                })
+            except OSError as e:  # fail closed: a request that cannot be recorded is declined
+                item.decision = ApprovalDecision(False, "portal", f"could not record the request ({e}); declined")
+                item.outcome = "declined"
+                with self._lock:
+                    self._finish(item)
+                if self._on_decided:
+                    self._on_decided(item)
+                return item.decision
         with self._lock:
             self._items[item.id] = item
         item._event.wait(timeout=max(0.0, item.timeout_s))
         with self._lock:
             if item.decision is None:
                 item.decision = ApprovalDecision(False, "timeout", f"no decision within {int(item.timeout_s)} s; declined (never auto-approved)")
+                item.outcome = "timeout"
+                try:
+                    self._persist_close(item)
+                except OSError:
+                    pass  # a decline needs no durable record to be safe
             self._finish(item)
         if self._on_decided:
             self._on_decided(item)
@@ -77,6 +114,15 @@ class ApprovalInbox:
             if item is None or item.decision is not None:
                 return None
             item.decision = ApprovalDecision(bool(approved), by, note or "decided in portal")
+            item.outcome = _outcome(item.decision)
+            try:
+                closed = self._persist_close(item)  # durable before the run thread is released
+            except OSError:
+                item.decision, item.outcome = None, ""
+                raise
+            if not closed:  # another portal instance already closed it on disk
+                item.decision, item.outcome = None, ""
+                return None
         item._event.set()
         return item
 
@@ -86,6 +132,21 @@ class ApprovalInbox:
             if self.decide(item.id, False, by, note):
                 n += 1
         return n
+
+    def load_history(self, records: list[dict]) -> None:
+        """Closed approval records from disk (earlier portal runs) for the 'Recent decisions' table."""
+        items = []
+        for r in records:
+            if r.get("kind") != "approval" or r.get("status") != "closed":
+                continue
+            req = ApprovalRequest(str(r.get("step_id", "")), str(r.get("action_class", "")), str(r.get("summary", "")), str(r.get("preview", "")), str(r.get("approver", "")))
+            d = ApprovalDecision(bool(r.get("approved")), str(r.get("by", "")), str(r.get("note", "")), float(r.get("decided_at") or 0))
+            items.append(PendingApproval(r["id"], str(r.get("session_id", "")), str(r.get("requested_by", "")), req, float(r.get("created_at") or 0), float(r.get("timeout_s") or 0), d, str(r.get("outcome", ""))))
+        items.sort(key=lambda i: i.decision.decided_at)
+        with self._lock:
+            known = {i.id for i in self._history}
+            self._history = [i for i in items if i.id not in known][-self._keep :] + self._history
+            del self._history[: -self._keep]
 
 
 class WebApprover:
@@ -110,6 +171,8 @@ class PendingQuestions:
     timeout_s: float
     answers: dict[str, str] | None = None
     answered_by: str = ""
+    id: str = field(default_factory=lambda: secrets.token_hex(8))
+    closed: bool = False
     _event: threading.Event = field(default_factory=threading.Event, repr=False)
 
     @property
@@ -120,18 +183,33 @@ class PendingQuestions:
 class QuestionBox:
     """Clarifying questions from the planner, one open set per session."""
 
-    def __init__(self):
+    def __init__(self, store: PendingStore | None = None):
         self._items: dict[str, PendingQuestions] = {}
         self._lock = threading.Lock()
+        self.store = store
 
     def asker(self, session_id: str, user: str, timeout_s: float) -> Callable[[list[str]], dict[str, str] | None]:
         def ask(questions: list[str]) -> dict[str, str] | None:
             item = PendingQuestions(session_id, user, list(questions), time.time(), float(timeout_s))
+            if self.store is not None:
+                try:
+                    self.store.open("question", item.id, {"session_id": session_id, "asked_by": user, "questions": item.questions, "created_at": item.created_at, "timeout_s": item.timeout_s})
+                except OSError:
+                    return None  # unanswered: the run stops with needs_input
             with self._lock:
                 self._items[session_id] = item
             item._event.wait(timeout=max(0.0, item.timeout_s))
             with self._lock:
-                self._items.pop(session_id, None)
+                if not item.closed:
+                    item.closed = True
+                    item.answers = None
+                    if self.store is not None:
+                        try:
+                            self.store.close("question", item.id, "timeout", "timeout", f"no answers within {int(item.timeout_s)} s")
+                        except OSError:
+                            pass
+                if self._items.get(session_id) is item:
+                    self._items.pop(session_id, None)
             return item.answers
 
         return ask
@@ -147,8 +225,14 @@ class QuestionBox:
     def answer(self, session_id: str, answers: dict[str, str] | None, by: str) -> bool:
         with self._lock:
             item = self._items.get(session_id)
-            if item is None or item._event.is_set():
+            if item is None or item.closed:
                 return False
+            if self.store is not None:
+                # Who answered is durable before the run thread continues; the answers themselves
+                # go into the run's parameters and audit log, not into portal_state.
+                if not self.store.close("question", item.id, "answered" if answers else "declined", by, "" if answers else "declined in portal"):
+                    return False
+            item.closed = True
             item.answers = answers
             item.answered_by = by
         item._event.set()
