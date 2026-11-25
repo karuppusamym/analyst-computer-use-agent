@@ -10,7 +10,7 @@
   python -m analyst_agent portal [--host 127.0.0.1] [--port 8765] (web portal)
   python -m analyst_agent portal-user add <name> --role analyst|reviewer|admin
   python -m analyst_agent vault set <name> --allow-host h       (value is prompted, never on argv)
-  python -m analyst_agent vault list | vault remove <name>
+  python -m analyst_agent vault list | check | rotate <name> | rollback <name> | remove <name>
   python -m analyst_agent teach from-session|record|promote|drafts   (draft playbooks; see teach.py)
   python -m analyst_agent schedule list|add|remove|run-due|daemon|install-hint   (see scheduler.py)
 """

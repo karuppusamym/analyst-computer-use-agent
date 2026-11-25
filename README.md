@@ -108,6 +108,8 @@ python -m analyst_agent stop <session-id>
 ```powershell
 python -m analyst_agent vault set portal-pw --allow-host portal.example.com
 python -m analyst_agent vault list
+python -m analyst_agent vault check
+python -m analyst_agent vault rotate portal-pw
 python -m analyst_agent vault remove portal-pw
 ```
 
@@ -226,6 +228,31 @@ Run `python samples/make_samples.py` to regenerate the sample ERP/CRM exports an
 - Values are replaced with `[REDACTED:name]` in audit events, tool results sent to the model, reports and checkpoints. The audit log records `secret_used` (name, target, step) without the value. Browser snapshots mask password fields.
 - **Limit:** screenshots are not redacted. A secret typed into a visible plain-text field can appear in a screenshot.
 
+#### Central stores
+
+`vault.backend: "hashicorp"` or `"azure_keyvault"` keeps secrets in a central store instead of on the machine. Both use stdlib `urllib` (no SDK). Credentials come only from environment variables named in the config, never from the config file. Base URLs must be `https://`, except loopback hosts. `ca_bundle` sets a CA file for a private CA. Values are cached in memory only, for `cache_ttl_s` (default 60 s, 0 turns it off), and never written to disk.
+
+| Backend | Config (`vault.<backend>`) | Auth | Metadata | Versions |
+|---|---|---|---|---|
+| `hashicorp` | `url` (or `VAULT_ADDR`), `mount` (`secret`), `path_prefix` (`analyst_agent/`), `namespace` (or `VAULT_NAMESPACE`) | Token from `token_env` (`VAULT_TOKEN`), or AppRole: `role_id_env` / `secret_id_env` (`VAULT_ROLE_ID` / `VAULT_SECRET_ID`) at `approle_mount`. It logs in again when the lease runs out or a request gets 403. | KV v2 `custom_metadata` | KV v2 versions |
+| `azure_keyvault` | `vault_url`, `tenant_id`, `client_id` (or `AZURE_TENANT_ID` / `AZURE_CLIENT_ID`), `api_version` (`7.4`) | `auth: client_secret` (client credentials against `login.microsoftonline.com/{tenant}`, scope `https://vault.azure.net/.default`, secret from `client_secret_env`), `managed_identity` (IMDS), or `auto` (client secret if its env var is set). It gets a new token when the old one expires or a request gets 401. | Tags. `_` and `.` in a name become `-` in Key Vault; tag `agent_name` keeps the real name and stops collisions. A native expiry set in Key Vault counts as `expires_at`. | Key Vault versions. `remove` is Key Vault's soft delete. |
+
+The store's own access control decides who can read a value. The allowlists and sharing lists live in the store's metadata and this agent enforces them at use time, so anyone who can write a secret's metadata can widen them. Give metadata write access only to the secret's owners (a HashiCorp policy on `<mount>/metadata/...`, or Key Vault RBAC). On the `dpapi` backend these fields are bound into the encryption entropy instead, as the allowlists are.
+
+#### Rotation
+
+- `vault set` takes `--rotate-after-days N` and `--expires-at YYYY-MM-DD` (or `--expires-in-days N`). For the `env` backend, use `AGENT_SECRET_<NAME>__ROTATE_AFTER_DAYS`, `__EXPIRES_AT` and `__UPDATED` (the date the value was set).
+- `vault list` shows each secret's age and status: `ok`, `rotate-soon` (a deadline within 7 days), `rotate-due` (older than `rotate_after_days`; still usable) or `expired`.
+- An expired secret is refused when a tool tries to use it. The error says to rotate it, and the audit log records `secret_expired`.
+- `vault check [--warn-days 7]` prints the secrets that are not `ok` and exits 1 if any are expired or due (or the store can't be reached). Run it from a daily scheduled task (`schtasks /Create /SC DAILY ...`, with full paths as in the command `schedule install-hint` prints).
+- `vault rotate <name>` prompts twice (getpass) for the new value. It refuses the current value and keeps the allowlists, sharing and rotation period. It keeps the expiry unless you pass a new one, and clears an expiry that has passed. `hashicorp` and `azure_keyvault` keep earlier versions. `dpapi` keeps one previous value. `vault rollback <name>` restores the previous value as a new version. `keyring` keeps no previous value, and `env` is read-only.
+
+#### Sharing
+
+- `vault set --owner USER` (may use and manage) and `--user USER` (may use) are repeatable, case-insensitive fnmatch patterns such as `schedule:*`. If both lists are empty, any run user may use the secret, which is how secrets made before this feature behave.
+- At use time the run's user must match. That user is the orchestrator's `user`: the portal login, `schedule:<owner>` for scheduled runs, or `analyst` for CLI runs. A `ToolContext.user`, if set, takes precedence. A refusal raises an error and is audited as `secret_denied` with the user.
+- `vault rotate`, `rollback`, `remove` and overwriting `set` need the CLI user to be an owner when the secret has owners. The CLI user is `AGENT_USER` or the OS account name. This check is a guard against mistakes and is easy to bypass. The real control is the store's ACL.
+
 ### Code tier containment
 
 `run_python` starts `python -I -B -X utf8` with an allowlisted environment: SYSTEMROOT, a minimal PATH, and TEMP/HOME inside the workdir. No tokens or secrets are passed. The user site-packages folder is added back so `pip --user` installs of pandas and openpyxl still work. Two layers apply:
@@ -267,7 +294,8 @@ analyst_agent/
   orchestrator.py  clarify → plan → approve → steps → verify → checkpoint → recover → report
   router.py     tier selection and fallbacks
   tools/        connectors, code (+ sandbox Job Object, _sandbox_guard audit hook), browser, desktop_uia, computer (+ screen_win ctypes)
-  vault.py      credential vault (DPAPI / env / keyring), {{secret:name}} resolution
+  vault.py      credential vault (DPAPI / env / keyring), rotation, sharing, {{secret:name}} resolution
+  vault_remote.py  central vault backends: HashiCorp Vault KV v2, Azure Key Vault (stdlib urllib)
   playbook.py checks.py policy.py audit.py checkpoint.py report.py evals.py gateway_check.py
   teach.py      teach mode: drafts from sessions, browser recorder, promote
   scheduler.py  cron parser, schedules, unattended run-due
@@ -290,7 +318,7 @@ tests/          unit, integration and live desktop tests
   - The live view shows screenshots, not an interactive remote desktop.
   - A restart can't reconnect a waiting run. Its pending requests are declined as orphaned, and the session has to be resumed from its last checkpoint. The plan is approved again, and an unverified step that was in progress runs again.
   - Visibility is per user, not per team. Sharing a session, or limiting reviewers to particular playbooks or approvers, is not built yet.
-- **Later-phase features:** a Guacamole/noVNC interactive desktop is still a Phase 3 item. The credential vault is local only (DPAPI, env or keyring). There is no central secret store, rotation or per-user sharing yet.
+- **Later-phase features:** a Guacamole/noVNC interactive desktop is still a Phase 3 item. The central vault backends (HashiCorp Vault, Azure Key Vault) have been tested only against local fake servers that mimic their APIs, not against a real Vault or Key Vault. Rotation is manual (`vault rotate`). Nothing changes the password on the target system itself. Sharing is per user, not per portal group or team.
 - **Teach recorder:** records the first tab only and has been tested by driving the page in code, not with a person clicking in a headed window.
 - **The code tier is contained, not sandboxed.** The Job Object and the audit-hook guard limit it, but they are not an isolation boundary. Production needs the disposable per-task VM or container from the design, with network egress blocked there, since Windows Home can't block network per process without the firewall.
 - **Pixel-tier evals.** The 2 approved legacy-ledger entry tasks need the pixel tier, which moves the real mouse, so they have not run with a real model here. Run them on the isolated agent VM with `tiers.desktop_pixels.enabled`.
