@@ -6,7 +6,6 @@ from __future__ import annotations
 import contextlib
 import io
 import json
-import re
 import threading
 import time
 import unittest
@@ -21,7 +20,7 @@ from analyst_agent.portal.cli import run_teams_check
 from analyst_agent.portal.teams import ReviewerLimits, SsoGroupDirectory, Teams, parse_amount
 
 from .helpers import TempWorkspace
-from .test_portal import FAST, Client, PortalCase, _FakeIdp, test_key, wait_for
+from .test_portal import Client, PortalCase, _FakeIdp, test_key
 
 PAYMENT_PLAYBOOK = {
     "name": "vendor-payment",
@@ -256,8 +255,11 @@ class LocalLimitsPortalTests(PortalCase):
         ident = self.app.auth.resolve({"u": "alice", "r": "analyst", "src": "oidc", "g": ["fin-analysts"], "n": "x", "exp": time.time() + 60}, {}, "127.0.0.1")
         self.assertEqual(ident.groups, ())
         alice = self.client("alice")
-        s, _, _ = alice.post("/tasks", {"csrf": alice.csrf("/"), "request": "x", "playbook": "vendor-payment", "params": "vendor=a\namount=1","groups": "fin-approvers"})
+        s, h, _ = alice.post("/tasks", {"csrf": alice.csrf("/"), "request": "x", "playbook": "vendor-payment", "params": "vendor=a\namount=1", "groups": "fin-approvers"})
         self.assertEqual(s, 303)
+        sid = parse_qs(urlsplit(h["Location"]).query)["session"][0]
+        self.pending(sid, "plan")  # so teardown declines it (the run must not outlive the test)
+        self.assertFalse(self.app.rights(Identity("alice", "analyst"), self.app.inbox.pending(sid)[0]).decide)
 
 
 class TrustedHeaderGroupsPortalTests(PortalCase):
