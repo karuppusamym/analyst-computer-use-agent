@@ -409,7 +409,7 @@ To include the live desktop tests, set the variable first. They move the mouse f
 $env:RUN_DESKTOP_TESTS = "1"
 ```
 
-Current result: **344 tests**. Without `RUN_DESKTOP_TESTS` and without a running Docker daemon, 334 pass and 10 skip: the live desktop tests (including live takeover), the 6 live container tests (they need a Linux-containers daemon), and the clipboard test when the clipboard is empty. Offline, the eval run passes all 44 graded tasks and skips 6 (4 `needs_model`, 2 `needs_tier`). On OpenRouter all 48 graded tasks pass. CI (`.github/workflows/tests.yml`) runs the suite on Windows with and without the optional packages.
+Current result: **368 tests**. Without `RUN_DESKTOP_TESTS` and without a running Docker daemon, 358 pass and 10 skip: the live desktop tests (including live takeover), the 6 live container tests (they need a Linux-containers daemon), and the clipboard test when the clipboard is empty. Offline, the eval run passes all 44 graded tasks and skips 6 (4 `needs_model`, 2 `needs_tier`). On OpenRouter all 48 graded tasks pass. CI (`.github/workflows/tests.yml`) runs the suite on Windows with and without the optional packages.
 
 The live desktop end-to-end test runs playbook → approval → router → executor → real pixel tier → test app → verifier.
 
