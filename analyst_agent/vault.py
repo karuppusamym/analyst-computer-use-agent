@@ -12,7 +12,9 @@ Backends (config section `vault`):
             allowlists are AGENT_SECRET_PORTAL_PW__HOSTS and __APPS
             (comma-separated). No allowlist means the secret cannot be used.
 - "keyring" Only when the `keyring` package is installed: the value lives in
-            the OS keyring, the metadata in vault.json.
+            the OS keyring, the metadata in vault.json. The keyring entry also
+            holds a digest of the allowlists and sharing, so editing them in
+            vault.json gets the value refused instead of widening access.
 - "hashicorp" / "azure_keyvault"  Central stores over stdlib HTTPS (see
             vault_remote.py). Metadata lives in the remote store as custom
             metadata / tags; values are cached in memory only, briefly.
@@ -36,6 +38,8 @@ from __future__ import annotations
 
 import base64
 import fnmatch
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -279,6 +283,22 @@ class _FileMeta:
 _KEEP = object()
 
 
+def policy_binding(name: str, rec: dict) -> bytes:
+    """The fields that decide who and what may receive a secret, canonically encoded: its name,
+    allowlists and (when set) sharing and expiry. A record without the newer fields encodes
+    the same as before they existed. DPAPI uses it as entropy; the keyring backend stores
+    its digest next to the value."""
+    b = {"hosts": sorted(rec.get("allow_hosts", [])), "apps": sorted(rec.get("allow_apps", []))}
+    for k in ("owners", "users"):
+        if rec.get(k):
+            b[k] = sorted(rec[k])
+    for k in ("rotate_after_days", "expires_at"):
+        if rec.get(k):
+            b[k] = repr(float(rec[k]))
+    bound = json.dumps(b, sort_keys=True)
+    return b"analyst_agent/vault/v1\0" + name.encode() + b"\0" + bound.encode()
+
+
 class Vault:
     backend = "base"
     read_only = False
@@ -332,15 +352,7 @@ class DpapiVault(Vault):
         """Binds the blob to its name, allowlists and (when set) sharing and expiry,
         so widening any of them by editing vault.json breaks decryption. A record
         without the newer fields gives the same entropy as before they existed."""
-        b = {"hosts": sorted(rec.get("allow_hosts", [])), "apps": sorted(rec.get("allow_apps", []))}
-        for k in ("owners", "users"):
-            if rec.get(k):
-                b[k] = sorted(rec[k])
-        for k in ("rotate_after_days", "expires_at"):
-            if rec.get(k):
-                b[k] = repr(float(rec[k]))
-        bound = json.dumps(b, sort_keys=True)
-        return b"analyst_agent/vault/v1\0" + name.encode() + b"\0" + bound.encode() + b"\0" + self.extra_entropy
+        return policy_binding(name, rec) + b"\0" + self.extra_entropy
 
     def list(self) -> list[SecretMeta]:
         return [_FileMeta.meta(n, r, self.backend) for n, r in sorted(self.store.load()["secrets"].items())]
@@ -455,12 +467,33 @@ class KeyringVault(Vault):
     def list(self):
         return [_FileMeta.meta(n, r, self.backend) for n, r in sorted(self.store.load()["secrets"].items())]
 
+    # The keyring entry holds the value and a digest of the secret's policy fields as they were
+    # when it was set. vault.json can be edited by anyone who can write the folder, but the
+    # keyring entry only by the user's own session: a widened allowlist no longer matches the
+    # digest, and the value is refused (the keyring counterpart of the DPAPI entropy binding).
+    ENTRY_VERSION = 2
+
+    @staticmethod
+    def _digest(name: str, rec: dict) -> str:
+        return hashlib.sha256(policy_binding(name, rec)).hexdigest()
+
     def get(self, name):
-        self.meta(name)
-        value = self.keyring.get_password(self.SERVICE, name)
-        if value is None:
+        rec = self.store.load()["secrets"].get(name)
+        if rec is None:
+            raise VaultError(f"no secret named {name!r}")
+        raw = self.keyring.get_password(self.SERVICE, name)
+        if raw is None:
             raise VaultError(f"secret {name!r} is missing from the OS keyring")
-        return value
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            entry = None
+        if not (isinstance(entry, dict) and entry.get("_aa") == self.ENTRY_VERSION and isinstance(entry.get("v"), str)):
+            raise VaultError(f"secret {name!r} was stored without its allowlist binding (an older version); set it again with `vault set {name}`")
+        if not hmac.compare_digest(str(entry.get("b", "")), self._digest(name, rec)):
+            raise VaultError(f"the allowlists or sharing of secret {name!r} in {self.store.file} were changed outside the vault CLI; "
+                             f"the value is refused. Check the file, then set the secret again with `vault set {name}`")
+        return entry["v"]
 
     def set(self, name, value, allow_hosts=None, allow_apps=None, *, owners=None, users=None, rotate_after_days=None, expires_at=None):
         check_name(name)
@@ -468,8 +501,10 @@ class KeyringVault(Vault):
         data = self.store.load()
         now = time.time()
         old = data["secrets"].get(name, {})
-        self.keyring.set_password(self.SERVICE, name, value)
-        data["secrets"][name] = {**_FileMeta.policy_fields(allow_hosts, allow_apps, owners, users, rotate_after_days, expires_at), "created": old.get("created", now), "updated": now}
+        pol = _FileMeta.policy_fields(allow_hosts, allow_apps, owners, users, rotate_after_days, expires_at)
+        entry = {"_aa": self.ENTRY_VERSION, "v": value, "b": self._digest(name, pol)}
+        self.keyring.set_password(self.SERVICE, name, json.dumps(entry))
+        data["secrets"][name] = {**pol, "created": old.get("created", now), "updated": now}
         self.store.save(data)
         return _FileMeta.meta(name, data["secrets"][name], self.backend)
 

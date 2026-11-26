@@ -196,5 +196,68 @@ class VaultTitleTests(unittest.TestCase):
         self.assertEqual(resolve_secrets("{{secret:sap}}", self.ctx, tool="computer.type", app="saplogon.exe", window="SAP Logon 770"), "S3cr3t-Pa55word!")
 
 
+class _FakeKeyring:
+    def __init__(self):
+        self.d = {}
+
+    def get_password(self, service, name):
+        return self.d.get((service, name))
+
+    def set_password(self, service, name, value):
+        self.d[(service, name)] = value
+
+    def delete_password(self, service, name):
+        self.d.pop((service, name), None)
+
+
+class KeyringTamperTests(unittest.TestCase):
+    def setUp(self):
+        import json
+        import sys
+        import types
+
+        from analyst_agent.vault import KeyringVault, VaultError
+
+        self.json, self.VaultError = json, VaultError
+        self.tmp = tempfile.TemporaryDirectory()
+        self.fake = _FakeKeyring()
+        mod = types.ModuleType("keyring")
+        for n in ("get_password", "set_password", "delete_password"):
+            setattr(mod, n, getattr(self.fake, n))
+        with mock.patch.dict(sys.modules, {"keyring": mod}):
+            self.v = KeyringVault(Path(self.tmp.name) / "vault")
+        self.v.set("portal-pw", "S3cr3t-Pa55word!", allow_hosts=["portal.example.com"], users=["alice"])
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def edit(self, **changes):
+        f = self.v.store.file
+        data = self.json.loads(f.read_text(encoding="utf-8"))
+        data["secrets"]["portal-pw"].update(changes)
+        f.write_text(self.json.dumps(data), encoding="utf-8")
+
+    def test_untouched_metadata_gives_the_value(self):
+        self.assertEqual(self.v.get("portal-pw"), "S3cr3t-Pa55word!")
+        self.assertNotEqual(self.fake.d[("analyst_agent", "portal-pw")], "S3cr3t-Pa55word!")  # stored with its binding
+
+    def test_widened_hosts_or_sharing_refused(self):
+        for change in ({"allow_hosts": ["*"]}, {"allow_apps": ["*"]}, {"users": ["*"]}, {"owners": ["mallory"]}, {"expires_at": 4102444800.0}):
+            self.tearDown()
+            self.setUp()  # a fresh vault for each edit
+            self.edit(**change)
+            with self.assertRaises(self.VaultError, msg=str(change)) as e:
+                self.v.get("portal-pw")
+            self.assertIn("changed outside the vault CLI", str(e.exception))
+
+    def test_rotate_keeps_the_binding_and_legacy_entries_are_refused(self):
+        self.v.rotate("portal-pw", "N3w-Pa55word-2026!")
+        self.assertEqual(self.v.get("portal-pw"), "N3w-Pa55word-2026!")
+        self.fake.d[("analyst_agent", "portal-pw")] = "plain-old-value-1234"  # written by an older version
+        with self.assertRaises(self.VaultError) as e:
+            self.v.get("portal-pw")
+        self.assertIn("set it again", str(e.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
