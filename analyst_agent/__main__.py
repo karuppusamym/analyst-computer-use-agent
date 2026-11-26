@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 
 from .config import load_settings
-from .gateway_check import format_results, run_gateway_check
+from .gateway_check import config_error, format_results, run_gateway_check, write_report
 from .orchestrator import Orchestrator
 from .playbook import PlaybookRegistry
 from .policy import ConsoleApprover, UnattendedApprover
@@ -61,7 +61,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--config", help="settings JSON (default config/default.json)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status", help="show which tool tiers are available")
-    sub.add_parser("gateway-check", help="run the 5-check gateway test (costs a few cents)")
+    gw = sub.add_parser("gateway-check", help="run the 5-check gateway test (costs a few cents); exit 0 ok, 1 a check failed, 2 config error")
+    gw.add_argument("--report", help="where to write the JSON report (default workspace/gateway_report.json)")
     sub.add_parser("playbooks", help="list playbooks")
     run = sub.add_parser("run", help="run a task")
     run.add_argument("request")
@@ -103,8 +104,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nmodel backend: {s['gateway']['backend']}  gateway: {s['gateway']['base_url']}  token set: {bool(s.gateway_token())}")
         return 0
     if args.cmd == "gateway-check":
+        problem = config_error(s)
+        if problem:
+            print(f"gateway-check: configuration error: {problem}")
+            return 2
         results = run_gateway_check(s)
         print(format_results(results))
+        report = write_report(results, s, Path(args.report) if args.report else s.workspace_root / "gateway_report.json")
+        print(f"\nreport for the gateway team: {report}")
         return 0 if all(r.passed for r in results) else 1
     if args.cmd == "playbooks":
         for pb in registry.all():

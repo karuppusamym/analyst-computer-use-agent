@@ -40,12 +40,25 @@ Edit `config/default.json`:
 - Set `auth_style` to `"bearer"` if the gateway expects `Authorization: Bearer`.
 - Put the token in the environment variable that `token_env` names. Never put it in the file.
 - Set `"fallbacks": null` if the gateway rejects the server-side refusal fallback.
+- Add `"extra_headers": {...}` for headers the gateway needs (team id, cost tag).
 
 Then run the week-1 gateway test from design-doc Risk 1. It costs a few cents:
 
 ```powershell
 python -m analyst_agent gateway-check
 ```
+
+| # | Check | Passes when |
+|---|---|---|
+| 1 | Computer-use toolset | `computer_toolset_20260801` is accepted by the executor and planner models. If not, 1c tries the custom computer tool as a fallback. |
+| 2 | Beta headers pass through | The cache-diagnosis beta's `diagnostics` field comes back, so the header reached the provider |
+| 3 | Prompt caching | A second identical call reads tokens from the cache |
+| 4 | Thinking round-trip | Thinking blocks come back signed and are accepted when sent back unchanged with a `tool_result` |
+| 5 | Streaming | A ~2,500-word answer streams live to `end_turn` |
+
+Each check prints PASS, WARN or FAIL. A WARN means the call worked but something looked off, for example the stream arrived in a few large chunks instead of live; re-run once, and if it repeats, raise it with the gateway team. Failed checks print the likely fix.
+
+The command writes `workspace/gateway_report.json` (change it with `--report PATH`) to share with the gateway team. It holds the URL, models, verdict and per-check details, never the token. Exit code: 0 all passed, 1 a check failed, 2 configuration error.
 
 ## Using OpenRouter
 
@@ -56,7 +69,7 @@ python -m analyst_agent gateway-check
 
 Add `--config config/openrouter.json` to any command.
 
-Gateway check on OpenRouter (24 Nov 2026):
+Gateway check on OpenRouter (24 Nov 2026, before checks 2, 4 and 5 were made stricter; not re-run since):
 
 | Check | Result |
 | --- | --- |
