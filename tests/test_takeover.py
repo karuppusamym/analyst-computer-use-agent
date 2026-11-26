@@ -264,6 +264,7 @@ class FakeScreen:
             mock.patch.object(sw, "key_combo", lambda combo, repeat=1: self.sent.append(("key", combo, repeat))),
             mock.patch.object(sw, "scroll", lambda x, y, d, amount=3, modifiers=None: self.sent.append(("scroll", x, y, d, amount))),
             mock.patch.object(sw, "move", lambda x, y: self.sent.append(("move", x, y))),
+            mock.patch.object(sw, "drag", lambda start, end, modifiers=None: self.sent.append(("drag", tuple(start), tuple(end), tuple(modifiers or ())))),
         ]
 
     def capture(self, size):
@@ -388,7 +389,8 @@ class PortalTakeoverTests(TakeoverPortalCase):
         # Never from a person: vault placeholders, Windows-key combos, unknown actions or keys.
         self.assertFalse(self.send(rita, sid, action="type", text="{{secret:portal-pw}}")[1]["ok"])
         self.assertFalse(self.send(rita, sid, action="key", text="win+r")[1]["ok"])
-        self.assertEqual(self.send(rita, sid, action="drag", x="1", y="1")[0], 400)
+        self.assertEqual(self.send(rita, sid, action="drag", x="1", y="1")[0], 400)  # a drag needs an end point
+        self.assertEqual(self.send(rita, sid, action="paste", text="x")[0], 400)  # no clipboard action
         self.assertEqual(self.send(rita, sid, action="key", text="notakey")[0], 400)
         self.assertEqual(len(self.screen.sent), n_sent)
 

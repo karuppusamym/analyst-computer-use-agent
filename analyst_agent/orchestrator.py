@@ -7,6 +7,7 @@ the error -> re-plan the rest -> stop and ask the human a precise question.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from dataclasses import dataclass, field, replace
@@ -23,9 +24,25 @@ from .playbook import Playbook, Step
 from .policy import ApprovalDecision, ApprovalRequest, Approver, ConsoleApprover, PolicyEngine
 from .report import write_report
 from .router import RouteError, Router
-from .takeover import HUMAN_KINDS, PAUSE_FILE, human_note, pause_info
+from .takeover import HUMAN_KINDS, PAUSE_FILE, clear_pause, human_note, pause_info
 from .tools.base import ToolContext, ToolOutput
 from .tools.code import run_python
+
+
+def plan_fingerprint(request: str, playbook: Playbook | None, plan: Plan, params: dict, preview: str) -> str:
+    """sha256 over everything a plan approval is about: the request, the playbook and its version,
+    the bound steps, the final checks, the parameters and the preview the reviewer saw. A plan
+    approval carried over a portal restart is reused only for a run whose plan has the same value."""
+    body = {
+        "request": request,
+        "playbook": playbook.name if playbook else None,
+        "playbook_version": playbook.version if playbook else None,
+        "steps": [st.to_dict() for st in plan.steps],
+        "final_checks": plan.final_checks,
+        "params": params,
+        "preview": preview,
+    }
+    return hashlib.sha256(json.dumps(body, sort_keys=True, default=str, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
 class _StepAmountApprover:
@@ -95,6 +112,7 @@ class Orchestrator:
         self.pause_poll_s = 0.25
         self._human_note = ""
         self._pause_end = ""
+        self._held_s = 0.0  # time spent waiting for human takeovers; added to the task deadline
 
     # ------------------------------------------------------------------ helpers
     def _knowledge(self) -> str:
@@ -103,7 +121,10 @@ class Orchestrator:
         return "\n\n".join(p.read_text(encoding="utf-8")[:6000] for p in sorted(self.knowledge_dir.glob("*.md")))
 
     def _approve(self, audit: AuditLog, approvals: list, req: ApprovalRequest) -> bool:
-        audit.event("approval_requested", step=req.step_id, action_class=req.action_class, summary=req.summary, **({"amount": req.amount} if req.amount is not None else {}))
+        extra = {"amount": req.amount} if req.amount is not None else {}
+        if req.fingerprint:
+            extra["plan_fingerprint"] = req.fingerprint
+        audit.event("approval_requested", step=req.step_id, action_class=req.action_class, summary=req.summary, **extra)
         decision = self.approver.request(req)
         audit.event("approval_decided", step=req.step_id, approved=decision.approved, by=decision.by, note=decision.note)
         approvals.append({"step": req.step_id, "action": req.action_class, "approved": decision.approved, "by": decision.by})
@@ -117,31 +138,59 @@ class Orchestrator:
         """Block while a human holds this session (PAUSE file). Like STOP, but resumable.
 
         Returns False when the run must stop instead (kill switch, or no hand-back within
-        limits.takeover_timeout_s); self._pause_end says why. On hand-back the human's
-        audited actions become a note for the executor's next turn (self._human_note)."""
+        limits.takeover_timeout_s); self._pause_end says why. A hold older than
+        limits.takeover_max_hold_s (0 = no limit) expires: the run removes PAUSE, logs
+        takeover_expired and goes on as after a hand-back. The time spent waiting is added to
+        the task deadline (self._held_s). On hand-back the human's audited actions become a note
+        for the executor's next turn (self._human_note)."""
         if not (audit.dir / PAUSE_FILE).exists():
             return True
         info = pause_info(audit.dir) or {}
         start = audit.event("takeover_paused", step=step_id, by=info.get("by"))
-        limit = float(self.settings["limits"].get("takeover_timeout_s", 1800))
+        limits = self.settings["limits"]
+        limit = float(limits.get("takeover_timeout_s", 1800))
+        max_hold = float(limits.get("takeover_max_hold_s", 0) or 0)
         t0 = time.time()
+        try:
+            held_since = min(t0, float(info.get("at") or t0))
+        except (TypeError, ValueError):
+            held_since = t0
+        expired = False
         while (audit.dir / PAUSE_FILE).exists():
             if self._stop_requested(audit):
                 self._pause_end = "stopped by kill switch"
                 audit.event("takeover_wait_ended", step=step_id, reason="kill switch")
+                self._held_s += time.time() - t0
                 return False
-            if time.time() - t0 > limit:
+            now = time.time()
+            if max_hold > 0 and now - held_since > max_hold:
+                cur = pause_info(audit.dir)
+                if cur is not None and cur.get("at") == info.get("at"):
+                    # Log first: the portal treats the hold as over as soon as PAUSE is gone.
+                    audit.event("takeover_expired", step=step_id, by=info.get("by"), held_s=round(now - held_since, 1), max_hold_s=max_hold)
+                    clear_pause(audit.dir)
+                    expired = True
+                    break
+                info = cur or {}  # handed back and taken over again in between: time the new hold
+                held_since = now
+                continue
+            if now - t0 > limit:
                 self._pause_end = f"stopped: human takeover was not handed back within {int(limit)} s"
-                audit.event("takeover_timeout", step=step_id, by=info.get("by"), waited_s=round(time.time() - t0, 1))
+                audit.event("takeover_timeout", step=step_id, by=info.get("by"), waited_s=round(now - t0, 1))
+                self._held_s += now - t0
                 return False
             time.sleep(self.pause_poll_s)
+        waited = time.time() - t0
+        self._held_s += waited
         after = [e for e in audit.events() if int(e.get("seq", 0) or 0) > int(start.get("seq", 0))]
         actions = [e for e in after if e.get("kind") in HUMAN_KINDS]
-        ended_by = next((e.get("by") for e in reversed(after) if e.get("kind") == "takeover_ended"), None)
+        ended_by = None if expired else next((e.get("by") for e in reversed(after) if e.get("kind") == "takeover_ended"), None)
         note = human_note(after, str(info.get("by") or ""))
+        if expired:
+            note = f"The takeover hold expired after {int(max_hold)} s without a hand-back.\n" + note
         self._human_note = note if not self._human_note else self._human_note + "\n\n" + note
-        audit.event("takeover_resumed", step=step_id, by=info.get("by"), handed_back_by=ended_by, human_actions=sum(1 for e in actions if e["kind"] == "human_action"),
-                    human_refused=sum(1 for e in actions if e["kind"] == "human_action_refused"), paused_s=round(time.time() - t0, 1))
+        audit.event("takeover_resumed", step=step_id, by=info.get("by"), handed_back_by=ended_by, expired=expired, human_actions=sum(1 for e in actions if e["kind"] == "human_action"),
+                    human_refused=sum(1 for e in actions if e["kind"] == "human_action_refused"), paused_s=round(waited, 1), deadline_extended_s=round(waited, 1), held_total_s=round(self._held_s, 1))
         return True
 
     def _pause_hook(self, audit: AuditLog, step_id: str) -> tuple[bool, str]:
@@ -159,6 +208,7 @@ class Orchestrator:
         given to the planner as a reference so the plan covers everything the request asks."""
         self._guide = guide
         self._human_note = ""
+        self._held_s = 0.0
         s = self.settings
         s.output_dir.mkdir(parents=True, exist_ok=True)
         audit = AuditLog(s.audit_dir, session_id=session_id, user=self.user)
@@ -191,7 +241,8 @@ class Orchestrator:
 
         if self.require_plan_approval:
             preview = "\n".join(f"{i + 1}. [{st.tier}] {st.intent}" + (("  (needs approval" + (f", amount {st.approval_amount}" if st.approval_amount else "") + ")") if st.approval == "required" or policy.needs_approval(st.action_class) else "") for i, st in enumerate(plan.steps))
-            if not self._approve(audit, approvals, ApprovalRequest("plan", "plan", f"Plan for: {request}", preview)):
+            fp = plan_fingerprint(request, playbook, plan, params, preview)
+            if not self._approve(audit, approvals, ApprovalRequest("plan", "plan", f"Plan for: {request}", preview, fingerprint=fp)):
                 return TaskResult("rejected", audit.session_id, [], message="plan was not approved", usage=self._usage(), approvals=approvals)
 
         records = [StepRecord(st) for st in plan.steps]
@@ -219,7 +270,7 @@ class Orchestrator:
                 rec.status = "blocked"
                 rec.summary = self._pause_end
                 break
-            if time.time() > deadline:
+            if time.time() > deadline + self._held_s:  # time held by a human takeover does not count
                 rec.status = "failed"
                 rec.summary = "task time-out reached"
                 break
@@ -350,7 +401,7 @@ class Orchestrator:
                 run = self._run_script(step, route.tier, ctx)
             else:
                 try:
-                    run = Executor(self.client).run(step, route.tier, ctx, prior=prior, error=error, deadline=deadline, stop_flag=lambda: self._stop_requested(audit),
+                    run = Executor(self.client).run(step, route.tier, ctx, prior=prior, error=error, deadline=lambda: deadline + self._held_s, stop_flag=lambda: self._stop_requested(audit),
                                                    pause_hook=lambda: self._pause_hook(audit, step.id), paused=lambda: (audit.dir / PAUSE_FILE).exists())
                 except ModelError as e:
                     # Keep the real cause from the scripted attempt; the model retry is only a fallback.

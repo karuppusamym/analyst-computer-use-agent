@@ -112,7 +112,13 @@ JS = """
         .catch(function(){ msg.textContent='Could not reach the portal.'; }); }
     function point(e){ var r=img.getBoundingClientRect(); var sx=img.naturalWidth/r.width, sy=img.naturalHeight/r.height;
       return {x:Math.round((e.clientX-r.left)*sx), y:Math.round((e.clientY-r.top)*sy)}; }
-    img.addEventListener('click',function(e){ var p=point(e); last=p; var mode=document.getElementById('tk-mode').value;
+    var down=null, dragged=false;
+    img.addEventListener('dragstart',function(e){ e.preventDefault(); });
+    img.addEventListener('mousedown',function(e){ if(e.button===0){ down=point(e); dragged=false; } });
+    img.addEventListener('mouseup',function(e){ if(e.button!==0||!down) return; var p=point(e), s=down; down=null;
+      if(Math.abs(p.x-s.x)+Math.abs(p.y-s.y)>6){ dragged=true; last=p;
+        send({action:'drag',x:s.x,y:s.y,x2:p.x,y2:p.y,modifiers:document.getElementById('tk-mods').value}); } });
+    img.addEventListener('click',function(e){ if(dragged){ dragged=false; return; } var p=point(e); last=p; var mode=document.getElementById('tk-mode').value;
       send({action:mode,x:p.x,y:p.y,modifiers:document.getElementById('tk-mods').value}); });
     img.addEventListener('contextmenu',function(e){ e.preventDefault(); var p=point(e); last=p; send({action:'right_click',x:p.x,y:p.y}); });
     img.addEventListener('wheel',function(e){ e.preventDefault(); var p=point(e); send({action:'scroll',x:p.x,y:p.y,direction:e.deltaY<0?'up':'down',amount:3}); },{passive:false});
@@ -121,6 +127,14 @@ JS = """
     document.getElementById('tk-key').addEventListener('submit',function(e){ e.preventDefault(); var k=document.getElementById('tk-keytext');
       if(k.value) send({action:'key',text:k.value}); });
     tk.querySelectorAll('button[data-key]').forEach(function(b){ b.addEventListener('click',function(){ send({action:'key',text:b.getAttribute('data-key')}); }); });
+    var chord=document.getElementById('tk-chord');
+    if(chord){ var names={Enter:'Return',Escape:'Escape',Backspace:'BackSpace',Delete:'Delete',Tab:'Tab',ArrowLeft:'Left',ArrowRight:'Right',ArrowUp:'Up',ArrowDown:'Down',
+        Home:'Home',End:'End',PageUp:'Page_Up',PageDown:'Page_Down',Insert:'Insert',' ':'space'};
+      chord.addEventListener('keydown',function(e){ if(['Control','Shift','Alt','Meta','OS'].indexOf(e.key)>=0) return; e.preventDefault();
+        var k=names[e.key]||(/^F[0-9]{1,2}$/.test(e.key)?e.key:(e.key.length===1?e.key.toLowerCase():''));
+        if(!k){ msg.textContent='That key cannot be sent.'; return; }
+        var parts=[]; if(e.ctrlKey) parts.push('ctrl'); if(e.altKey) parts.push('alt'); if(e.shiftKey) parts.push('shift'); parts.push(k);
+        var combo=parts.join('+'); chord.value=combo; send({action:'key',text:combo}); }); }
   }
 })();
 """
@@ -277,6 +291,8 @@ def approval_card(item, ident: Identity, csrf: str, show_session: bool = True, m
         + (f' &middot; amount <strong>{h(r.amount)}</strong>' if getattr(r, "amount", None) not in (None, "") else "")
         + f' &middot; requested {h(ts(item.created_at))} &middot; '
         f'declined automatically in {left // 60} min {left % 60} s</div>'
+        + ('<p class="msg ok">Carried over a portal restart: no run is waiting on this plan. Approving it resumes the session from its last checkpoint; '
+           'the resumed run uses this approval only if its plan is exactly this one (otherwise it asks again).</p>' if getattr(item, "parked", False) else "")
         + (f"<pre>{h(r.preview)}</pre>" if r.preview else "")
         + form + "</div>"
     )
@@ -299,13 +315,22 @@ def share_card(sid: str, csrf: str, viewers: list[str], may_share: bool) -> str:
     return '<h2>Shared with</h2><div class="card">' + (f"<ul>{rows}</ul>" if rows else '<p class="muted">Not shared with anyone. Team members of the owner see it anyway.</p>') + form + "</div>"
 
 
-def session_page(info: dict, events: list[dict], ident: Identity, csrf: str, pending: list, question, may_decide=None, viewers: list[str] | None = None, may_share: bool = False) -> str:
+def hold_label(info: dict) -> str:
+    who = h((info.get("takeover") or {}).get("by") or "someone")
+    if info.get("takeover_from_restart"):
+        return f"held by {who} (from before restart)"
+    if info.get("takeover_stale"):
+        return f"held by {who} (the run is no longer running)"
+    return f"taken over by {who}"
+
+
+def session_page(info: dict, events: list[dict], ident: Identity, csrf: str, pending: list, question, may_decide=None, viewers: list[str] | None = None, may_share: bool = False, may_release: bool = False) -> str:
     sid = info["id"]
     final = info.get("status") in FINAL
     head = (
         f'<h1>Session {h(sid)}</h1><div class="card"><div class="row">{badge(info.get("status", ""))}'
         + (' <span class="badge b-bad">STOP requested</span>' if info.get("stopped") else "")
-        + (f' <span class="badge b-warn">taken over by {h((info.get("takeover") or {}).get("by") or "someone")}</span>' if info.get("takeover") is not None else "")
+        + (f' <span class="badge b-warn">{hold_label(info)}</span>' if info.get("takeover") is not None else "")
         + f'</div><p>{h(info.get("request"))}</p><div class="muted">by {h(info.get("user"))} &middot; started {h(ts(info.get("started")))}'
         + (f' &middot; playbook {h(info.get("playbook"))}' if info.get("playbook") else "")
         + (f' &middot; params {h(json.dumps(info.get("params") or {}))}' if info.get("params") else "")
@@ -319,9 +344,17 @@ def session_page(info: dict, events: list[dict], ident: Identity, csrf: str, pen
         + (
             f'<form method="post" action="/sessions/{u(sid)}/resume" data-confirm="Resume this session from its last checkpoint? Verified steps are skipped and the plan needs approval again.">{csrf_input(csrf)}'
             '<button type=submit>Resume from checkpoint</button></form>'
-            if info.get("resumable") else ""
+            if info.get("resumable") else
+            f'<form method="post" action="/sessions/{u(sid)}/resume" data-confirm="Release the takeover hold and resume this session from its last checkpoint? The release is audited under your name.">{csrf_input(csrf)}'
+            '<button type=submit>Release hold and resume</button></form>'
+            if info.get("resumable_after_release") and may_release else ""
         )
-        + "</p></div>"
+        + "</p>"
+        + (f'<p class="muted">This session is {hold_label(info)}. Resume needs the hold released first: '
+           + ("you can release it (Release hold on the live view, or Release hold and resume here)." if may_release else
+              f'{h((info.get("takeover") or {}).get("by") or "an admin")} or an admin must release it.') + "</p>"
+           if info.get("takeover_stale") else "")
+        + "</div>"
     )
     parts = [head]
     if info.get("orphaned"):
@@ -370,7 +403,19 @@ def takeover_panel(sid: str, csrf: str, tk: dict) -> str:
     if tk.get("may_end"):
         buttons += (f'<form method="post" action="/sessions/{u(sid)}/handback" data-confirm="Hand the session back to the agent?">{csrf_input(csrf)}'
                     '<button type=submit class="secondary">Hand back</button></form>')
-    if tk.get("active"):
+    if tk.get("may_release"):
+        buttons += (f'<form method="post" action="/sessions/{u(sid)}/handback" data-confirm="Release this takeover hold? No run is waiting for it. The release is audited under your name.">{csrf_input(csrf)}'
+                    '<button type=submit class="secondary">Release hold</button></form>')
+        if tk.get("resumable_after_release"):
+            buttons += (f'<form method="post" action="/sessions/{u(sid)}/resume" data-confirm="Release the hold and resume this session from its last checkpoint?">{csrf_input(csrf)}'
+                        '<button type=submit>Release hold and resume</button></form>')
+    if tk.get("active") and tk.get("stale"):
+        who = h(tk.get("holder") or "someone")
+        since = f" since {h(ts(tk.get('since')))}" if tk.get("since") else ""
+        where = "from before restart" if tk.get("from_restart") else "the run is no longer running"
+        state = (f'<strong>Held by {who} ({where}){since}.</strong> No agent is waiting for a hand-back, so there is no screen or input. '
+                 + ("Release the hold to resume the session." if tk.get("may_release") else f"{who} or an admin can release it."))
+    elif tk.get("active"):
         state = f'<strong>Paused: taken over by {h(tk.get("holder") or "someone")}.</strong> The agent waits until they hand back.'
     elif tk.get("may"):
         state = '<span class="muted">Take over pauses the agent before its next action so you can drive the desktop yourself.</span>'
@@ -387,11 +432,14 @@ def takeover_panel(sid: str, csrf: str, tk: dict) -> str:
                 '<div class="row tk-tools"><label for=tk-mode class="inline">Click</label><select id=tk-mode><option value=click>left click</option><option value=double_click>double click</option>'
                 '<option value=right_click>right click</option><option value=move>move only</option></select>'
                 '<label for=tk-mods class="inline">with</label><select id=tk-mods><option value="">no modifier</option><option value=shift>shift</option><option value=ctrl>ctrl</option><option value=alt>alt</option></select>'
-                '<span class="muted">Right-click and the wheel on the image also work.</span></div>'
+                '<span class="muted">Right-click, the wheel and dragging (press, move, release) on the image also work.</span></div>'
                 '<form id=tk-type class="row tk-tools"><label for=tk-text class="inline">Type</label><input type=text id=tk-text autocomplete=off><button type=submit>Type</button></form>'
                 '<form id=tk-key class="row tk-tools"><label for=tk-keytext class="inline">Key</label><input type=text id=tk-keytext placeholder="ctrl+s, Return, Tab" autocomplete=off><button type=submit>Press</button>'
                 + "".join(f'<button type=button class="secondary" data-key="{k}">{k}</button>' for k in ("Return", "Tab", "Escape", "BackSpace"))
                 + "</form>"
+                '<div class="row tk-tools"><label for=tk-chord class="inline">Chord</label><input type=text id=tk-chord placeholder="click here, then press e.g. Ctrl+C" autocomplete=off readonly>'
+                + "".join(f'<button type=button class="secondary" data-key="{k}">{k}</button>' for k in ("ctrl+c", "ctrl+v", "ctrl+x", "ctrl+a", "ctrl+z", "ctrl+s", "shift+Tab"))
+                + "</div>"
                 if tk.get("controls") else '<p class="muted">You are watching; only the person holding the takeover can send input.</p>'
             )
             out += (

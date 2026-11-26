@@ -54,6 +54,9 @@ FLASH = {
     "resumed": ("Resuming from the last checkpoint. Verified steps are skipped; the plan goes to the approval inbox again.", True),
     "takeover": ("You have taken over. The agent pauses before its next action and waits until you hand back.", True),
     "handback": ("Handed back. The agent continues and is told what you did.", True),
+    "released": ("Hold released. No run was waiting for it; the session can be resumed if it has a checkpoint.", True),
+    "resumed_released": ("Hold released and resuming from the last checkpoint. Verified steps are skipped; the plan goes to the approval inbox again.", True),
+    "plan_resumed": ("Plan approved. The session resumes from its checkpoint and uses this approval if the plan is unchanged.", True),
     "shared": ("Sharing updated.", True),
 }
 
@@ -124,10 +127,12 @@ class PortalApp:
         self.teams = Teams(self.cfg.get("teams"), groups_of=self.sso_groups.get if self.sso_groups else None)
         self.auth.session_groups = self.teams.known_groups()
         self.team_warnings = self._check_teams()
-        self.takeover = TakeoverManager(settings, self.runs, self.audit, tier_factory=desktop_factory, capture=capture)
+        self.runs.instance = self.state.instance
+        self.takeover = TakeoverManager(settings, self.runs, self.audit, tier_factory=desktop_factory, capture=capture, store=self.state, instance=self.state.instance)
         allowed = self.cfg.get("allowed_hosts") or []
         self.allowed_hosts = {h.lower() for h in allowed} or (LOOPBACK_NAMES | {host.lower()} if is_loopback(host) else set())
         self._close_orphans()
+        self.takeover.detect_stale()
         self.state.prune()
         self.inbox.load_history(self.state.records("approval"))
 
@@ -150,10 +155,34 @@ class PortalApp:
             if self.sso_groups.record(ident.name, [g for g in ident.groups if g in known], ident.source):
                 self.audit.event("sso_groups_seen", by=ident.name, source=ident.source, groups=sorted(g for g in ident.groups if g in known), teams=self.teams.teams_of(ident.name, ident.groups))
 
+    def _parkable(self, rec: dict) -> bool:
+        """A plan approval from a dead portal that may wait for a decision again (see ApprovalInbox.park):
+        it carries a plan fingerprint, and its session exists, was not stopped and has not finished."""
+        sid = str(rec.get("session_id", ""))
+        if rec.get("kind") != "approval" or rec.get("step_id") != "plan" or rec.get("action_class") != "plan" or not rec.get("fingerprint"):
+            return False
+        if not bool(self.cfg.get("carry_plan_approvals", True)) or not valid_session_id(sid):
+            return False
+        d = self.settings.audit_dir / sid
+        if not d.is_dir() or (d / "STOP").exists():
+            return False
+        kinds = [e.get("kind") for e in read_events(d)]
+        return "task_started" in kinds and "task_finished" not in kinds
+
     def _close_orphans(self) -> None:
-        """Requests left pending by a previous portal: their run thread is gone, so decline them."""
+        """Requests left pending by a previous portal: their run thread is gone, so decline them.
+        A plan approval with a fingerprint is parked instead: approving it resumes the session."""
         for rec in self.state.orphans():
             kind, sid = rec.get("kind"), str(rec.get("session_id", ""))
+            if self._parkable(rec):
+                adopted = self.state.adopt("approval", rec["id"], parked_at=time.time())
+                if adopted is not None:
+                    self.inbox.park(adopted, self.runs.approval_timeout)
+                    info = dict(request_id=rec["id"], step="plan", summary=rec.get("summary"), fingerprint=rec.get("fingerprint"), requested_by=rec.get("requested_by"),
+                                note="the portal restarted while this plan waited; it waits again. Approving it resumes the session from its checkpoint; the approval is used only if the plan is unchanged")
+                    self.audit.event("approval_parked", session=sid, **info)
+                    append_session_event(self.settings.audit_dir / sid, "approval_parked", **info)
+                    continue
             if not self.state.close(str(kind), rec["id"], "orphaned", ORPHAN_BY, ORPHAN_NOTE, approved=False):
                 continue
             d = self.settings.audit_dir / sid if valid_session_id(sid) else None
@@ -224,7 +253,13 @@ class PortalApp:
     def _approval_logged(self, item) -> None:
         d = item.decision
         extra = {"amount": item.req.amount} if item.req.amount is not None else {}
+        if getattr(item, "parked", False):
+            extra["parked"] = True
         self.audit.event("approval_decided", session=item.session_id, step=item.req.step_id, action_class=item.req.action_class, summary=item.req.summary, approved=d.approved, by=d.by, note=d.note, **extra)
+        if getattr(item, "parked", False) and valid_session_id(item.session_id):
+            # No run thread logs this decision in the session (the resumed run logs its own plan approval).
+            append_session_event(self.settings.audit_dir / item.session_id, "approval_parked_decided", d.by, step=item.req.step_id, request_id=item.id, approved=d.approved, outcome=item.outcome,
+                                 by=d.by, note=d.note, fingerprint=item.req.fingerprint)
 
     # ------------------------------------------------------------------ plumbing
     def _host_ok(self, host_header: str | None) -> bool:
@@ -554,7 +589,7 @@ class PortalApp:
         info = self.runs.session_info(sid)
         events = read_events(self.settings.audit_dir / sid)
         body = V.session_page(info, events, ctx.ident, ctx.csrf, self.inbox.pending(sid), self.questions.get(sid), may_decide=lambda item: self.rights(ctx.ident, item),
-                              viewers=self.runs.viewers(sid), may_share=self.may_share(ctx.ident, sid))
+                              viewers=self.runs.viewers(sid), may_share=self.may_share(ctx.ident, sid), may_release=self.takeover.may_release(ctx.ident, sid))
         return self._page(ctx, 200, f"Session {sid}", body, "sessions", poll=f"/api/sessions/{quote(sid)}/state")
 
     def r_stop(self, ctx: Ctx, sid: str) -> Response:
@@ -563,14 +598,36 @@ class PortalApp:
         ok = self.runs.stop(sid, ctx.ident.name)
         return self._redirect(f"/sessions/{quote(sid)}?m={'stopped' if ok else 'nostop'}")
 
+    def _release_for_resume(self, ctx: Ctx, sid: str, carried: bool = False) -> str:
+        """A leftover takeover hold blocks Resume. The holder or an admin resuming releases it on the
+        way (audited as takeover_released, reason "resume"); anyone else gets the reason. Returns
+        "" when nothing blocks any more, else why not."""
+        stale = self.takeover.stale(sid)
+        if stale is None:
+            return ""
+        if not self.takeover.may_release(ctx.ident, sid):
+            return self.runs.resume_problem(sid, carried=carried)
+        problem = self.runs.resume_problem(sid, carried=carried, ignore_pause=True)
+        if problem:
+            return problem  # don't release a hold for a resume that would fail anyway
+        try:
+            self.takeover.release(ctx.ident, sid, "resume")
+        except TakeoverError as e:
+            return str(e)
+        return ""
+
     def r_resume(self, ctx: Ctx, sid: str) -> Response:
         if not self._visible(ctx, sid):
             return self._error(ctx, 404, "no such session")
+        released = self.takeover.stale(sid) is not None
+        problem = self._release_for_resume(ctx, sid)
+        if problem:
+            return self._error(ctx, 409, f"cannot resume: {problem}")
         try:
             self.runs.resume(sid, ctx.ident.name)
         except PlaybookError as e:
             return self._error(ctx, 409, f"cannot resume: {e}")
-        return self._redirect(f"/sessions/{quote(sid)}?m=resumed")
+        return self._redirect(f"/sessions/{quote(sid)}?m={'resumed_released' if released else 'resumed'}")
 
     def r_live(self, ctx: Ctx, sid: str) -> Response:
         if not self._visible(ctx, sid):
@@ -582,15 +639,21 @@ class PortalApp:
         if may and not (run and run.alive):
             may, why = False, "only a session that is running in this portal can be taken over"
         controls = self.takeover.controls(ctx.ident, sid)
+        stale = bool(info.get("takeover_stale"))
         tk = {
             "active": active,
+            "stale": stale,
+            "from_restart": bool(info.get("takeover_from_restart")),
+            "since": (info.get("takeover") or {}).get("at") if active else None,
+            "may_release": stale and self.takeover.may_release(ctx.ident, sid),
+            "resumable_after_release": bool(info.get("resumable_after_release")),
             "holder": (info.get("takeover") or {}).get("by") if active else None,
             "may": may and not active and not info.get("stopped"),
             "why": why,
             "controls": controls,
-            "may_end": active and (controls or ctx.ident.can("admin")),
-            "watch": active and (controls or ctx.ident.can("admin")),
-            "desktop": self.takeover.desktop() if active else (True, ""),
+            "may_end": active and not stale and (controls or ctx.ident.can("admin")),
+            "watch": active and not stale and (controls or ctx.ident.can("admin")),
+            "desktop": self.takeover.desktop() if active and not stale else (True, ""),
             "interval": int(self.takeover.cfg.get("frame_interval_ms", 1000)),
             "dry_run": bool(self.settings["tiers"]["desktop_pixels"].get("dry_run")),
         }
@@ -610,11 +673,12 @@ class PortalApp:
     def r_handback(self, ctx: Ctx, sid: str) -> Response:
         if not self._visible(ctx, sid):
             return self._error(ctx, 404, "no such session")
+        stale = self.takeover.stale(sid) is not None
         try:
-            self.takeover.end(ctx.ident, sid)
+            self.takeover.end(ctx.ident, sid)  # a stale hold is released instead (takeover_released)
         except TakeoverError as e:
-            return self._error(ctx, e.status, f"cannot hand back: {e}")
-        return self._redirect(f"/sessions/{quote(sid)}/live?m=handback")
+            return self._error(ctx, e.status, f"cannot {'release the hold' if stale else 'hand back'}: {e}")
+        return self._redirect(f"/sessions/{quote(sid)}/live?m={'released' if stale else 'handback'}")
 
     def r_api_takeover_input(self, ctx: Ctx, sid: str) -> Response:
         if not self._visible(ctx, sid):
@@ -751,10 +815,24 @@ class PortalApp:
                 if valid_session_id(pending.session_id):
                     append_session_event(self.settings.audit_dir / pending.session_id, "approval_forbidden", ctx.ident.name, **info)
                 return self._error(ctx, 403, f"you may not {decision} this request: {reason}")
+            if pending.parked and decision == "approve":
+                # No run waits on this plan: approving it resumes the session. Refuse before deciding if that can't work.
+                problem = self._release_for_resume(ctx, pending.session_id, carried=True)
+                if problem:
+                    return self._error(ctx, 409, f"cannot approve: this plan was carried over a portal restart and approving it resumes the session, which is not possible now: {problem}. Reject it instead, or fix that first.")
         item = self.inbox.decide(aid, decision == "approve", ctx.ident.name, full_note)
         if item is None:
             return self._redirect("/approvals?m=gone")
         m = "approved" if decision == "approve" else "rejected"
+        if item.parked and item.decision.approved:
+            carried = {"fingerprint": item.req.fingerprint, "by": ctx.ident.name, "request_id": item.id, "note": full_note}
+            try:
+                self.runs.resume(item.session_id, ctx.ident.name, carried_plan=carried)
+            except PlaybookError as e:
+                self.audit.event("plan_resume_failed", session=item.session_id, request_id=item.id, by=ctx.ident.name, error=str(e))
+                append_session_event(self.settings.audit_dir / item.session_id, "plan_resume_failed", ctx.ident.name, request_id=item.id, by=ctx.ident.name, error=str(e))
+                return self._error(ctx, 409, f"the plan approval was recorded, but the session could not be resumed: {e}")
+            m = "plan_resumed"
         # Decided requests no longer make a session visible to a reviewer, so only go back to pages they keep.
         if ctx.form.get("back") == "session" and self.can_see(ctx.ident, item.session_id):
             return self._redirect(f"/sessions/{quote(item.session_id)}?m={m}")
