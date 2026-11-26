@@ -7,11 +7,15 @@ expires. A timeout is always a decline: nothing is ever auto-approved.
 With a PendingStore, every item is written to disk before it is shown and its
 decision is written before the run thread is released, so a portal restart
 never loses a decision. Items left pending by a dead portal are closed as
-orphaned (declined) when the next portal starts.
+orphaned (declined) when the next portal starts, except a plan approval that
+carries a plan fingerprint: the next portal "parks" it (see park()). Approving a
+parked plan resumes the session, and the resumed run reuses the approval only if
+its plan has the same fingerprint (WebApprover.carried); otherwise it asks again.
 """
 
 from __future__ import annotations
 
+import hmac
 import secrets
 import threading
 import time
@@ -32,11 +36,16 @@ class PendingApproval:
     timeout_s: float
     decision: ApprovalDecision | None = None
     outcome: str = ""  # approved / declined / timeout / orphaned, once decided
+    parked_at: float | None = None  # set for a plan approval carried over a portal restart (no run thread waits on it)
     _event: threading.Event = field(default_factory=threading.Event, repr=False)
 
     @property
+    def parked(self) -> bool:
+        return self.parked_at is not None
+
+    @property
     def deadline(self) -> float:
-        return self.created_at + self.timeout_s
+        return (self.parked_at if self.parked_at is not None else self.created_at) + self.timeout_s
 
 
 def _outcome(d: ApprovalDecision) -> str:
@@ -66,6 +75,7 @@ class ApprovalInbox:
                     "session_id": session_id, "requested_by": requested_by, "created_at": item.created_at, "timeout_s": item.timeout_s,
                     "step_id": req.step_id, "action_class": req.action_class, "summary": req.summary, "preview": req.preview, "approver": req.approver,
                     **({"amount": req.amount} if req.amount is not None else {}),
+                    **({"fingerprint": req.fingerprint} if req.fingerprint else {}),
                 })
             except OSError as e:  # fail closed: a request that cannot be recorded is declined
                 item.decision = ApprovalDecision(False, "portal", f"could not record the request ({e}); declined")
@@ -91,12 +101,43 @@ class ApprovalInbox:
             self._on_decided(item)
         return item.decision
 
+    def park(self, rec: dict, timeout_s: float) -> PendingApproval:
+        """Show a plan approval left pending by an earlier portal again. No run thread waits on it:
+        approving it resumes the session (the portal does that), rejecting it or letting it time out
+        declines it. The store record must already be adopted by this instance."""
+        req = ApprovalRequest(str(rec.get("step_id", "")), str(rec.get("action_class", "")), str(rec.get("summary", "")), str(rec.get("preview", "")), str(rec.get("approver", "")),
+                              None if rec.get("amount") is None else str(rec.get("amount")), str(rec.get("fingerprint") or "") or None)
+        item = PendingApproval(str(rec["id"]), str(rec.get("session_id", "")), str(rec.get("requested_by", "")), req, float(rec.get("created_at") or time.time()), float(timeout_s), parked_at=time.time())
+        with self._lock:
+            self._items[item.id] = item
+        return item
+
+    def _expire_parked(self) -> None:
+        """Parked items have no waiting thread, so their time-out is applied when the inbox is read."""
+        now = time.time()
+        done = []
+        with self._lock:
+            for item in list(self._items.values()):
+                if item.parked and item.decision is None and now > item.deadline:
+                    item.decision = ApprovalDecision(False, "timeout", f"no decision within {int(item.timeout_s)} s after the portal restarted; declined (never auto-approved)")
+                    item.outcome = "timeout"
+                    try:
+                        self._persist_close(item)
+                    except OSError:
+                        pass
+                    self._finish(item)
+                    done.append(item)
+        for item in done:
+            if self._on_decided:
+                self._on_decided(item)
+
     def _finish(self, item: PendingApproval) -> None:
         self._items.pop(item.id, None)
         self._history.append(item)
         del self._history[: -self._keep]
 
     def pending(self, session_id: str | None = None) -> list[PendingApproval]:
+        self._expire_parked()
         with self._lock:
             items = [i for i in self._items.values() if session_id is None or i.session_id == session_id]
         return sorted(items, key=lambda i: i.created_at)
@@ -106,6 +147,7 @@ class ApprovalInbox:
             return list(reversed(self._history[-limit:]))
 
     def get(self, item_id: str) -> PendingApproval | None:
+        self._expire_parked()
         with self._lock:
             return self._items.get(item_id)
 
@@ -124,7 +166,11 @@ class ApprovalInbox:
             if not closed:  # another portal instance already closed it on disk
                 item.decision, item.outcome = None, ""
                 return None
+            if item.parked:
+                self._finish(item)  # no run thread will do it
         item._event.set()
+        if item.parked and self._on_decided:
+            self._on_decided(item)
         return item
 
     def cancel_session(self, session_id: str, by: str, note: str) -> int:
@@ -151,15 +197,31 @@ class ApprovalInbox:
 
 
 class WebApprover:
-    """Approver for one portal run: queues each request in the shared inbox and waits."""
+    """Approver for one portal run: queues each request in the shared inbox and waits.
 
-    def __init__(self, inbox: ApprovalInbox, session_id: str, requested_by: str, timeout_s: float):
+    carried: a plan approval decided after a portal restart ({"fingerprint", "by", "request_id",
+    "note"}). It answers the run's first approval request only if that is the plan and its
+    fingerprint is exactly the approved one; anything else is logged and goes to the inbox.
+    It is used at most once."""
+
+    def __init__(self, inbox: ApprovalInbox, session_id: str, requested_by: str, timeout_s: float, carried: dict | None = None, on_event: Callable[..., None] | None = None):
         self.inbox = inbox
         self.session_id = session_id
         self.requested_by = requested_by
         self.timeout_s = timeout_s
+        self.carried = dict(carried) if carried else None
+        self.on_event = on_event or (lambda *a, **k: None)
 
     def request(self, req: ApprovalRequest) -> ApprovalDecision:
+        c, self.carried = self.carried, None
+        if c is not None:
+            want = str(c.get("fingerprint") or "")
+            got = str(req.fingerprint or "")
+            info = {"request_id": c.get("request_id"), "approved_by": c.get("by"), "step": req.step_id}
+            if req.step_id == "plan" and req.action_class == "plan" and want and got and hmac.compare_digest(want, got):
+                self.on_event("plan_approval_reused", fingerprint=got, **info)
+                return ApprovalDecision(True, str(c.get("by") or ""), f"approved after a portal restart (request {c.get('request_id')}); the plan is unchanged" + (f"; {c['note']}" if c.get("note") else ""))
+            self.on_event("plan_approval_mismatch", expected=want, got=got or None, reason="the plan changed since it was approved" if req.step_id == "plan" else "the first request was not the plan", **info)
         return self.inbox.submit(self.session_id, self.requested_by, req, self.timeout_s)
 
 

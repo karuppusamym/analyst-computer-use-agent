@@ -58,6 +58,8 @@ def _describe(e: dict) -> str:
         what = f"typed {len(str(inp.get('text', '')))} characters"
     elif member == "key":
         what = f"pressed {inp.get('text', '')}"
+    elif member == "left_click_drag":
+        what = f"dragged from {inp.get('start_coordinate')} to {inp.get('coordinate')}"
     elif member == "scroll":
         what = f"scrolled {inp.get('scroll_direction', 'down')} at {inp.get('coordinate')}"
     else:

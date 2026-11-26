@@ -29,6 +29,7 @@ class ApprovalRequest:
     preview: str = ""
     approver: str = ""
     amount: str | None = None  # optional amount the request is about (playbook step "approval_amount"); reviewer limits compare it
+    fingerprint: str | None = None  # plan approvals: sha256 of the plan as shown (see orchestrator.plan_fingerprint)
 
 
 @dataclass

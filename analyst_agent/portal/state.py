@@ -70,6 +70,29 @@ class PendingStore:
             atomic_write_json(self._path(kind, rid), rec)
         return rec
 
+    def get(self, kind: str, rid: str) -> dict | None:
+        rec = read_json(self._path(kind, rid))
+        return rec if isinstance(rec, dict) else None
+
+    def put(self, kind: str, rid: str, record: dict, status: str) -> dict:
+        """Write a record with an explicit status (e.g. "held" for a takeover left over by an
+        earlier portal). Only "pending" records are ever treated as orphans."""
+        rec = {**record, "kind": kind, "id": rid, "status": status, "instance": self.instance, "pid": os.getpid()}
+        with self._lock:
+            atomic_write_json(self._path(kind, rid), rec)
+        return rec
+
+    def adopt(self, kind: str, rid: str, **extra: Any) -> dict | None:
+        """Take over a pending record from a dead portal instance (it stays pending, now ours)."""
+        p = self._path(kind, rid)
+        with self._lock:
+            rec = read_json(p)
+            if not isinstance(rec, dict) or rec.get("status") != "pending":
+                return None
+            rec.update(extra, previous_instance=rec.get("instance"), instance=self.instance, pid=os.getpid())
+            atomic_write_json(p, rec)
+        return rec
+
     def close(self, kind: str, rid: str, outcome: str, by: str, note: str = "", **extra: Any) -> bool:
         """Mark a record decided. False if it was already closed (e.g. by another portal instance)."""
         p = self._path(kind, rid)
