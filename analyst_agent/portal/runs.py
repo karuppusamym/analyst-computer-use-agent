@@ -21,7 +21,9 @@ from .approvals import ApprovalInbox, QuestionBox, WebApprover
 from .state import atomic_write_json, read_json
 
 META_FILE = "portal_meta.json"
-SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$")
+# Lower case only and no trailing dot: Windows paths ignore case and drop trailing dots, so
+# 'ABC' and 'abc.' would open the folder of session 'abc' under a name no in-memory lookup knows.
+SESSION_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_.-]{0,98}[a-z0-9_-])?$")
 
 
 def valid_session_id(sid: str) -> bool:

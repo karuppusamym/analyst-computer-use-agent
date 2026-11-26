@@ -34,6 +34,29 @@ from .base import Tier, Tool, ToolContext, ToolOutput, schema
 
 SECRET_PLACEHOLDER = re.compile(r"\{\{secret:[^}]+\}\}")
 RISKY = re.compile(r"\b(submit|send|pay|delete|remove|confirm|place order|purchase|transfer|sign)\b", re.I)
+# Wording that is risky on a button but routine on a navigation link ("Upload a file", "Orders").
+RISKY_BUTTON = re.compile(r"\b(post|publish|approve|reply|buy|order|checkout|share|upload|accept|reject|unsubscribe|wire|refund|deactivate|terminate)\b", re.I)
+
+# What a click would do, read from the element itself rather than only its wording: an icon-only
+# button or an unlabelled submit still posts a form.
+_CLICK_INFO_JS = r"""
+e => {
+  const t = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const tag = e.tagName;
+  const type = (e.getAttribute('type') || '').toLowerCase();
+  let label = tag === 'INPUT' ? '' : t(e.innerText);
+  for (const a of ['value', 'aria-label', 'title']) if (e.getAttribute(a)) label += ' ' + e.getAttribute(a);
+  const lb = e.getAttribute('aria-labelledby');
+  if (lb) for (const id of lb.split(/\s+/)) { const n = document.getElementById(id); if (n) label += ' ' + t(n.innerText); }
+  if (e.querySelectorAll) e.querySelectorAll('img[alt], svg title').forEach(n => { label += ' ' + t(n.getAttribute('alt') || n.textContent); });
+  const isSubmit = (tag === 'BUTTON' && (type === 'submit' || (!type && !!e.form))) || (tag === 'INPUT' && (type === 'submit' || type === 'image'));
+  if (isSubmit && !t(label)) label = 'Submit';
+  const form = isSubmit ? (e.form || null) : null;
+  const method = form ? ((e.getAttribute('formmethod') || form.getAttribute('method') || 'get').toLowerCase()) : '';
+  const link = tag === 'A' && e.hasAttribute('href') && !e.hasAttribute('download');
+  return {label: t(label), posts: isSubmit && method === 'post', link, action: form ? (e.getAttribute('formaction') || form.action || '') : ''};
+}
+"""
 
 _STABLE_KEY = re.compile(r"[A-Za-z0-9_.-]{1,30}")
 _STABLE_VALUE = re.compile(r"[A-Za-z_-]{1,30}")  # words only; ids, dates, tokens and hashes carry digits
@@ -337,11 +360,15 @@ class BrowserTier(Tier):
         return None
 
     def _approve_if_risky(self, el, ctx: ToolContext, verb: str) -> str | None:
-        label = " ".join(
-            x for x in [el.inner_text() if el.evaluate("e => e.tagName") not in ("INPUT",) else "", el.get_attribute("value") or "", el.get_attribute("aria-label") or ""] if x
-        ).strip()
-        if not RISKY.search(label):
+        info = el.evaluate(_CLICK_INFO_JS)
+        label = info.get("label") or "(unlabelled element)"
+        # Gate a click that posts a form (state-changing, whatever its wording) and any wording on the list.
+        # GET forms (search, filters) are reads and stay ungated.
+        worded = bool(RISKY.search(label) or (not info.get("link") and RISKY_BUTTON.search(label)))
+        if not (info.get("posts") or worded):
             return None
+        if info.get("posts") and not worded:
+            label = f"{label} (posts a form to {info.get('action') or 'this page'})"
         req = ApprovalRequest(step_id=ctx.step_id, action_class="submit", summary=f"Browser wants to {verb} '{label}' on {el.page.url}")
         decision = ctx.approver.request(req)
         ctx.audit.event("approval", step=ctx.step_id, action_class="submit", label=label, approved=decision.approved, by=decision.by, note=decision.note)

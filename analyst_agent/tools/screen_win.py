@@ -398,9 +398,18 @@ def hold(combo: str, seconds: float) -> None:
         _send(*[_key(v, up=True) for v in reversed(vks)])
 
 
-def type_text(text: str, delay: float = 0.005) -> None:
+class FocusChanged(OSError):
+    """The window receiving keystrokes changed part-way through typing; the rest was not sent."""
+
+
+def type_text(text: str, delay: float = 0.005, keep_focus: bool = True) -> None:
+    """Type `text`. With keep_focus, stop (FocusChanged) as soon as another window comes to the
+    front, so a popup or a Return that moves focus never receives the rest of the text."""
     _need_windows()
-    for ch in text.replace("\r\n", "\n"):
+    start = foreground_hwnd() if keep_focus else None
+    for i, ch in enumerate(text.replace("\r\n", "\n")):
+        if keep_focus and foreground_hwnd() != start:
+            raise FocusChanged(f"the foreground window changed after {i} character(s); the rest was not typed")
         if ch == "\n":
             key_combo("Return")
             continue
@@ -459,6 +468,28 @@ def foreground_window() -> tuple[str, str]:
     pid = wintypes.DWORD()
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     return _window_title(hwnd), _exe_for_pid(pid.value)
+
+
+def foreground_hwnd() -> int:
+    _need_windows()
+    return int(user32.GetForegroundWindow() or 0)
+
+
+def window_at(x: int, y: int) -> tuple[str, str]:
+    """(title, executable) of the top-level window under screen point (x, y): the one a click there reaches."""
+    _need_windows()
+    set_dpi_aware()
+    user32.WindowFromPoint.restype = wintypes.HWND
+    user32.WindowFromPoint.argtypes = [wintypes.POINT]
+    user32.GetAncestor.restype = wintypes.HWND
+    user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    hwnd = user32.WindowFromPoint(wintypes.POINT(int(x), int(y)))
+    if not hwnd:
+        return "", ""
+    root = user32.GetAncestor(hwnd, 2) or hwnd  # GA_ROOT
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(root, ctypes.byref(pid))
+    return _window_title(root), _exe_for_pid(pid.value)
 
 
 def find_window(title: str):

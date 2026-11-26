@@ -135,6 +135,20 @@ python -m analyst_agent eval compare -2 -1
   - A replanned set of steps goes to plan approval again.
   - The browser checks every request against the host allowlist before it is sent: navigations, redirects, popups and, unless `tiers.browser.allow_offlist_subresources` is true, images, scripts and fetches too.
   - URLs with a backslash, a space or control character, a user-name part, or a scheme other than http/https are refused.
+  - A browser click that posts a form needs approval, whatever the button says, and so does an icon-only or unlabelled submit button. GET forms (search, filters) stay ungated. More words count on buttons: post, publish, approve, reply, buy, order, share, upload and others. Navigation links are not gated by these words.
+  - Desktop clicks, drags and scrolls are checked against the window under the pointer, not only the foreground window. Typing stops as soon as another window comes to the front.
+  - Teach mode treats a field as secret once it has ever been secret, so a "show password" toggle doesn't expose the value. One-time-code, OTP, PIN and MFA fields count as secrets too.
+  - On the desktop, a vault secret's `apps` patterns are matched against the exe. A window title only counts when the exe is unknown, or for an exe that doesn't show untrusted content: browsers, mail, chat and Office documents never qualify by title.
+  - The HashiCorp and Key Vault backends follow redirects only to the same scheme, host and port, so a token is never sent anywhere else.
+- **Portal hardening (same review):**
+  - Session ids are lower case with no trailing dot, so one session can't be reached under two spellings on Windows.
+  - Connections time out after `portal.request_timeout_s` (30 s), and at most `portal.max_threads` (64) are served at once. Further connections get a 503.
+  - Sign-in is locked after 5 failures per user name and address, and after 20 failures per address. The per-address check runs before the password hash.
+  - Signing out revokes the cookie everywhere it was copied. The list is kept in `portal_state/revoked_sessions.json`, so it survives a restart.
+  - With OIDC:
+    - The role is worked out from the current config on every request.
+    - The `email` claim is used as the user name only when `email_verified` is true; `portal.auth.oidc.allow_unverified_email` turns that check off.
+  - With teams configured, a reviewer publishes or rejects only drafts of playbooks that one of their teams covers.
 - Each run writes its audit log, screenshots, checkpoint and a "what I checked" report to `workspace/audit/<session>/`. Outputs go to `workspace/output/`.
 
 Run `python samples/make_samples.py` to regenerate the sample data (ERP/CRM, budget and GL actuals, PO/receipt/invoice, payments and vendor master, customer master exports, and `warehouse.sqlite`). It is seeded and plants issues with known counts, so the eval graders assert exact numbers; the original pilot files come out byte-identical.

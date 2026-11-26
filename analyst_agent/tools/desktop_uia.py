@@ -130,7 +130,8 @@ class UiaTier(Tier):
         text = inp["text"]
         if has_placeholder(text):
             # _window() already checked the process against the policy app allowlist.
-            text = resolve_secrets(text, ctx, tool="uia_set_text", app=self._proc_name(win), window=win.window_text() or inp["window"])
+            # The real window's title and process only, never the window name the model asked for.
+            text = resolve_secrets(text, ctx, tool="uia_set_text", app=self._proc_name(win), window=win.window_text() or "")
         ctl.set_edit_text(text)
         ctx.audit.event("uia_action", step=ctx.step_id, action="set_text", window=inp["window"], control=ctl.element_info.name, chars=len(inp["text"]))
         return ToolOutput("text set")

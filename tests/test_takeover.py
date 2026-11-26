@@ -259,6 +259,8 @@ class FakeScreen:
         return [
             mock.patch.object(sw, "screen_size", lambda: (1920, 1080)),
             mock.patch.object(sw, "foreground_window", lambda: self.fg),
+            mock.patch.object(sw, "window_at", lambda x, y: self.fg),  # the foreground window fills the fake screen
+            mock.patch.object(sw, "cursor_pos", lambda: (0, 0)),
             mock.patch.object(sw, "click", lambda x, y, button="left", count=1, modifiers=None: self.sent.append(("click", x, y, button, count, tuple(modifiers or ())))),
             mock.patch.object(sw, "type_text", lambda text, delay=0.005: self.sent.append(("type", text))),
             mock.patch.object(sw, "key_combo", lambda combo, repeat=1: self.sent.append(("key", combo, repeat))),

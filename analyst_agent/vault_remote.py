@@ -37,7 +37,23 @@ from datetime import datetime
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
+
+
+def _origin(url: str) -> tuple[str, str, int | None]:
+    u = urlparse(url)
+    return (u.scheme.lower(), (u.hostname or "").lower(), u.port)
+
+
+class _SameOriginRedirects(HTTPRedirectHandler):
+    """urllib copies every header, the Vault token and the bearer token included, to wherever a
+    redirect points. Follow a redirect only to the same scheme, host and port; refuse the rest."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if _origin(newurl) != _origin(req.full_url):
+            raise RemoteError(code, f"refused a redirect from {urlparse(req.full_url).hostname} to {urlparse(newurl).scheme}://{urlparse(newurl).hostname}: "
+                                    "the token is never sent to another host. Point the backend's url at the active node.")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 from .vault import _KEEP, SecretMeta, Vault, VaultError, _num, _validate_value, check_name
 
@@ -101,7 +117,8 @@ def http_json(method: str, url: str, *, headers: dict | None = None, body: Any =
         h["Content-Type"] = "application/json"
     req = Request(url, data=data, headers=h, method=method)
     try:
-        with urlopen(req, timeout=timeout, context=ssl_ctx if url.startswith("https") else None) as r:
+        handlers = [_SameOriginRedirects()] + ([HTTPSHandler(context=ssl_ctx)] if ssl_ctx is not None and url.startswith("https") else [])
+        with build_opener(*handlers).open(req, timeout=timeout) as r:
             raw = r.read()
             return r.status, (json.loads(raw) if raw.strip() else {})
     except HTTPError as e:

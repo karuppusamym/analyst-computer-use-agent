@@ -518,6 +518,18 @@ def has_placeholder(text) -> bool:
     return isinstance(text, str) and bool(PLACEHOLDER_RE.search(text))
 
 
+# Processes whose window title comes from content they display (web pages, documents, chats).
+UNTRUSTED_TITLE_HOSTS = {
+    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe", "iexplore.exe", "vivaldi.exe", "arc.exe",
+    "msedgewebview2.exe", "teams.exe", "ms-teams.exe", "slack.exe", "outlook.exe", "olk.exe", "winword.exe", "acrord32.exe", "acrobat.exe",
+    "explorer.exe", "notepad.exe", "code.exe",
+}
+
+
+def _looks_like_exe(pattern: str) -> bool:
+    return pattern.lower().rstrip("*").endswith(".exe")
+
+
 def _match(value: str, patterns: list[str]) -> bool:
     return bool(value) and any(fnmatch.fnmatch(value.lower(), p.lower()) for p in patterns)
 
@@ -562,7 +574,14 @@ def resolve_secrets(text: str, ctx: "ToolContext", *, tool: str, url: str | None
                 if not _match(host, meta.allow_hosts):
                     raise SecretRefused(f"secret '{name}' is not allowed for host {host or '?'} (its hosts: {meta.allow_hosts or 'none'})")
             elif app or window:
-                if not (_match(app or "", meta.allow_apps) or _match(window or "", meta.allow_apps)):
+                # A window title is set by whatever is in the window: a web page titled "SAP Logon" is
+                # not SAP. Once the exe is known it decides; a title alone counts only when the exe is
+                # unknown, and never for a browser or another host of untrusted content.
+                if app:
+                    ok = _match(app, meta.allow_apps) or (app.lower() not in UNTRUSTED_TITLE_HOSTS and _match(window or "", [p for p in meta.allow_apps if not _looks_like_exe(p)]))
+                else:
+                    ok = _match(window or "", meta.allow_apps)
+                if not ok:
                     raise SecretRefused(f"secret '{name}' is not allowed for window '{window}' ({app or 'unknown exe'}); its apps: {meta.allow_apps or 'none'}")
             else:
                 raise SecretRefused(f"secret '{name}' needs a known target host or window")
