@@ -48,6 +48,7 @@ class ApprovalRequest:
     preview: str = ""
     approver: str = ""
     amount: str | None = None  # optional amount the request is about (playbook step "approval_amount"); reviewer limits compare it
+    fingerprint: str | None = None  # plan approvals: sha256 of the plan as shown (see orchestrator.plan_fingerprint)
 
 
 @dataclass
@@ -124,6 +125,7 @@ class PolicyEngine:
             ws / auth.get("users_file", "portal_users.json"),
             ws / portal.get("state_dir", "portal_state"),
             ws / "portal_audit",
+            ws / "portal_sso_groups.json",  # last-seen SSO groups: decide team membership and vault team: sharing
             settings.path(settings.data.get("schedules", {}).get("state_dir", "./workspace/schedules")),
         ]
         self.audit_root = settings.audit_dir

@@ -80,6 +80,8 @@ class HttpBackend:
         self.max_retries = g["max_retries"]
         self.extra_headers = dict(g.get("extra_headers") or {})
         self.last_headers: dict[str, str] = {}
+        # Timing of the last stream, used by gateway-check to spot buffering.
+        self.last_stream: dict[str, float | int | None] = {}
 
     def _headers(self, betas: list[str]) -> dict[str, str]:
         h = {
@@ -103,11 +105,18 @@ class HttpBackend:
         while True:
             req = urllib.request.Request(self.url, data=payload, headers=self._headers(betas), method="POST")
             try:
+                start = time.monotonic()
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     self.last_headers = {k.lower(): v for k, v in resp.headers.items()}
                     acc = MessageAccumulator()
+                    text_events, first_text = 0, None
                     for event, data in iter_sse(resp):
+                        if '"text_delta"' in data:
+                            text_events += 1
+                            if first_text is None:
+                                first_text = time.monotonic()
                         acc.feed(event, data)
+                    self.last_stream = _stream_stats(start, text_events, first_text)
                     return acc.result()
             except urllib.error.HTTPError as e:
                 detail = e.read().decode("utf-8", "replace")[:2000]
@@ -127,6 +136,14 @@ class HttpBackend:
                 raise err
             attempt += 1
             time.sleep(wait if wait is not None else min(60.0, 2**attempt + random.random()))
+
+
+def _stream_stats(start: float, text_events: int, first_text: float | None) -> dict:
+    return {
+        "text_events": text_events,
+        "seconds_to_first_text": round(first_text - start, 1) if first_text is not None else None,
+        "seconds_total": round(time.monotonic() - start, 1),
+    }
 
 
 def _retry_after(value: str | None) -> float | None:
@@ -156,14 +173,22 @@ class SdkBackend:
         )
         self._anthropic = anthropic
         self.last_headers: dict[str, str] = {}
+        self.last_stream: dict[str, float | int | None] = {}
 
     def send(self, body: dict, betas: list[str]) -> dict:
         kwargs = {k: v for k, v in body.items() if k in self._KWARGS}
         extra = {k: v for k, v in body.items() if k not in self._KWARGS}
         headers = {"anthropic-beta": ",".join(betas)} if betas else None
         try:
+            start = time.monotonic()
             with self.client.messages.stream(**kwargs, extra_body=extra or None, extra_headers=headers) as stream:
+                text_events, first_text = 0, None
+                for _ in stream.text_stream:
+                    text_events += 1
+                    if first_text is None:
+                        first_text = time.monotonic()
                 msg = stream.get_final_message()
+            self.last_stream = _stream_stats(start, text_events, first_text)
         except self._anthropic.APIStatusError as e:
             raise ModelError(f"HTTP {e.status_code}: {e.message}", status=e.status_code) from e
         except self._anthropic.APIConnectionError as e:
@@ -178,6 +203,7 @@ class MockBackend:
         self.script = list(script or [])
         self.requests: list[dict] = []
         self.last_headers: dict[str, str] = {}
+        self.last_stream: dict = {}
 
     def push(self, *items: dict | Callable[[dict], dict]) -> None:
         self.script.extend(items)
@@ -189,6 +215,8 @@ class MockBackend:
         item = self.script.pop(0)
         reply = item(body) if callable(item) else item
         reply = json.loads(json.dumps(reply))
+        # A scripted reply may carry "_stream" stats to simulate stream timing.
+        self.last_stream = reply.pop("_stream", {})
         reply.setdefault("role", "assistant")
         reply.setdefault("stop_reason", "end_turn")
         reply.setdefault("usage", {"input_tokens": 0, "output_tokens": 0})

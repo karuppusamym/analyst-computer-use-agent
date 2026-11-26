@@ -22,7 +22,7 @@ class ControlFileTests(Base):
         p = PolicyEngine(self.s)
         ws = self.s.workspace_root
         for target in [ws / "portal_secret.key", ws / "portal_users.json", ws / "portal_state" / "a.json",
-                       ws / "portal_audit" / "portal" / "events.jsonl", ws / "schedules" / "state.json",
+                       ws / "portal_audit" / "portal" / "events.jsonl", ws / "schedules" / "state.json", ws / "portal_sso_groups.json",
                        self.s.audit_dir / "sess" / "checkpoint.json", self.s.audit_dir / "sess" / "STOP", self.s.audit_dir]:
             with self.assertRaises(PolicyViolation, msg=str(target)):
                 p.check_path(target)

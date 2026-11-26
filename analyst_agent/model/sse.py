@@ -92,6 +92,10 @@ class MessageAccumulator:
                 self.message[key] = value
             usage = payload.get("usage") or {}
             self.message.setdefault("usage", {}).update({k: v for k, v in usage.items() if v is not None})
+            # Keep other top-level fields (beta-only ones such as diagnostics).
+            for key, value in payload.items():
+                if key not in ("type", "delta", "usage"):
+                    self.message[key] = value
         elif kind == "error":
             err = payload.get("error", {})
             raise StreamError(f"{err.get('type', 'error')}: {err.get('message', data)}")

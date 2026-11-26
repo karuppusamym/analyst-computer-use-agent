@@ -15,7 +15,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .audit import redact
 from .checks import CheckOutcome, run_deterministic
@@ -215,7 +215,7 @@ class Executor:
             parts.append(f"You already made progress on this step in an earlier context:\n{progress}\nContinue from there.")
         return "\n\n".join(parts)
 
-    def run(self, step: Step, tier: Tier, ctx: ToolContext, prior: str = "", error: str = "", deadline: float | None = None, stop_flag=None, pause_hook=None, paused=None) -> StepRun:
+    def run(self, step: Step, tier: Tier, ctx: ToolContext, prior: str = "", error: str = "", deadline: float | Callable[[], float] | None = None, stop_flag=None, pause_hook=None, paused=None) -> StepRun:
         """pause_hook(): blocks while a human holds the session; returns (False, reason) to stop
         or (True, note) where a non-empty note goes into the next model turn."""
         limits = ctx.settings["limits"]
@@ -238,7 +238,8 @@ class Executor:
                     if note:
                         _add_note(messages, note)
                         self.must_look = tier.name == "desktop_pixels"
-                if deadline and time.time() > deadline:
+                limit_at = deadline() if callable(deadline) else deadline  # moves while a human holds the session
+                if limit_at and time.time() > limit_at:
                     return StepRun("failed", "task time-out reached", files, last_png, turns_total)
                 reply = self.client.create(self.role, messages, system=EXECUTOR_SYSTEM, tools=tools)
                 turns_total += 1

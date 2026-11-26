@@ -125,6 +125,9 @@ def summarize_events(events: list[dict]) -> dict[str, Any]:
                     steps[sid]["status"] = "verified"
         elif k == "approval_decided":
             info["approvals"].append({"step": e.get("step"), "approved": e.get("approved"), "by": e.get("by"), "note": e.get("note", ""), "ts": e.get("ts")})
+        elif k == "approval_parked_decided" and not e.get("approved"):
+            # A plan approval carried over a restart and then declined (or timed out): no run logs it.
+            info["approvals"].append({"step": e.get("step"), "approved": False, "by": e.get("by"), "note": e.get("note", ""), "ts": e.get("ts")})
         elif k in ("approval_orphaned", "question_orphaned"):
             if k == "approval_orphaned":
                 what = f"approval for step {e.get('step')}: {e.get('summary', '')}"
@@ -167,6 +170,7 @@ class Run:
     thread: threading.Thread | None = None
     finished_at: float | None = None
     resume: bool = False
+    carried_plan: dict | None = None  # a plan approval decided after a portal restart (WebApprover.carried)
 
     @property
     def alive(self) -> bool:
@@ -195,6 +199,7 @@ class RunManager:
         self.on_event = on_event or (lambda *a, **k: None)
         self.runs: dict[str, Run] = {}
         self._lock = threading.Lock()
+        self.instance = ""  # the portal instance id (PortalApp sets it); tells holds from before a restart apart
 
     @property
     def approval_timeout(self) -> float:
@@ -280,10 +285,19 @@ class RunManager:
             write_meta(d, meta)
 
     # ---- resume (the portal's `run --resume <session>`)
-    def resume_problem(self, sid: str, info: dict | None = None) -> str:
-        """Why this session cannot be resumed, or "" if it can."""
+    def hold_from_restart(self, sid: str) -> bool:
+        """The session's PAUSE file was written by an earlier portal (or by hand), not by this one."""
+        info = pause_info(self.settings.audit_dir / sid) if valid_session_id(sid) else None
+        return info is not None and info.get("portal_instance") != self.instance
+
+    def resume_problem(self, sid: str, info: dict | None = None, carried: bool = False, ignore_pause: bool = False) -> str:
+        """Why this session cannot be resumed, or "" if it can.
+
+        carried: for a plan approval carried over a restart, which resumes a session that may not
+        have a checkpoint yet (it was waiting on the plan) and is still listed as waiting.
+        ignore_pause: the caller releases a leftover takeover hold first."""
         d = self.settings.audit_dir / sid
-        if not valid_session_id(sid) or not (d / "checkpoint.json").is_file():
+        if not valid_session_id(sid) or not (carried or (d / "checkpoint.json").is_file()):
             return "this session has no checkpoint (no step was verified yet)"
         run = self.runs.get(sid)
         if run and (run.alive or run.status == "starting"):
@@ -292,25 +306,30 @@ class RunManager:
         status = str(info.get("status") or "")
         if status == "success":
             return "this session already finished successfully"
-        if status.startswith("waiting"):
+        if status.startswith("waiting") and not carried:
             return "this session is waiting for a decision"
         if (d / "STOP").exists():
             return "the kill switch was pressed for this session, so it is not resumed from the portal"
-        if (d / PAUSE_FILE).exists():
-            return "a person has taken over this session; hand it back first"
+        if (d / PAUSE_FILE).exists() and not ignore_pause:
+            who = (pause_info(d) or {}).get("by") or ""
+            when = " from before the portal restarted" if self.hold_from_restart(sid) else ""
+            if who:
+                return f"{who} holds a takeover of this session{when}; {who} or an admin must release it first (Release hold on the live view)"
+            return f"a PAUSE file holds this session{when}; an admin must release it first (Release hold on the live view)"
         if not info.get("request"):
             return "the original request is not in the audit log"
         return ""
 
-    def resume(self, sid: str, by: str) -> Run:
+    def resume(self, sid: str, by: str, carried_plan: dict | None = None) -> Run:
         """Continue a session from its last checkpoint in a background thread.
 
         Calls Orchestrator.run(..., session_id=sid, resume=True), as `run --resume` does:
-        verified steps are skipped and the plan goes to the approval inbox again.
+        verified steps are skipped and the plan goes to the approval inbox again, unless
+        carried_plan holds a plan approval made after a restart for exactly the same plan.
         """
         with self._lock:
             info = self.session_info(sid, _resume_check=False)
-            problem = self.resume_problem(sid, info)
+            problem = self.resume_problem(sid, info, carried=carried_plan is not None)
             if problem:
                 raise PlaybookError(problem)
             d = self.settings.audit_dir / sid
@@ -326,14 +345,21 @@ class RunManager:
                     raise PlaybookError(f"the session's playbook {info['playbook']} is no longer an approved playbook")
             meta = read_meta(d)
             owner = meta.get("owner") or info.get("user") or by
-            run = Run(sid, info.get("request") or str(cp.get("request", "")), str(owner), pb.name if pb else None, params, resume=True)
+            run = Run(sid, info.get("request") or str(cp.get("request", "")), str(owner), pb.name if pb else None, params, resume=True, carried_plan=carried_plan)
             if meta:
-                meta.setdefault("resumes", []).append({"by": by, "at": run.started_at})
+                meta.setdefault("resumes", []).append({"by": by, "at": run.started_at, **({"plan_request": carried_plan.get("request_id")} if carried_plan else {})})
                 write_meta(d, meta)
             self.runs[sid] = run
             self._launch(run, pb)
-        self.on_event("run_resumed", session=sid, by=by, owner=owner, playbook=run.playbook)
+        self.on_event("run_resumed", session=sid, by=by, owner=owner, playbook=run.playbook, **({"carried_plan_request": carried_plan.get("request_id")} if carried_plan else {}))
         return run
+
+    def _run_event(self, sid: str):
+        def ev(kind: str, **data: Any) -> None:
+            append_event(self.settings.audit_dir / sid, kind, "portal", **data)
+            self.on_event(kind, session=sid, **data)
+
+        return ev
 
     def _run(self, run: Run, pb: Playbook | None) -> None:
         from ..orchestrator import Orchestrator
@@ -348,7 +374,7 @@ class RunManager:
                 kwargs["router"] = self.router_factory(self.settings)
             orch = Orchestrator(
                 self.settings,
-                approver=WebApprover(self.inbox, run.session_id, run.user, self.approval_timeout),
+                approver=WebApprover(self.inbox, run.session_id, run.user, self.approval_timeout, carried=run.carried_plan, on_event=self._run_event(run.session_id)),
                 user=run.user,
                 ask=self.questions.asker(run.session_id, run.user, self.question_timeout),
                 knowledge_dir=self.knowledge_dir,
@@ -407,6 +433,9 @@ class RunManager:
         info["takeover"] = pause_info(d)
         info["owner"] = self.owner(sid)
         run = self.runs.get(sid)
+        # A hold with no live run behind it: left over from before a restart, or the run ended meanwhile.
+        info["takeover_stale"] = info["takeover"] is not None and not (run and run.alive)
+        info["takeover_from_restart"] = info["takeover_stale"] and (info["takeover"] or {}).get("portal_instance") != self.instance
         if run:
             info["request"] = info["request"] or run.request
             info["user"] = info["user"] or run.user
@@ -431,7 +460,10 @@ class RunManager:
             info["status"] = "waiting for answers"
         info["outputs"] = self.outputs(sid)
         if _resume_check:
-            info["resumable"] = not self.resume_problem(sid, info)
+            info["resume_problem"] = self.resume_problem(sid, info)
+            info["resumable"] = not info["resume_problem"]
+            # Resumable once a leftover hold is released (the holder or an admin may do both at once).
+            info["resumable_after_release"] = bool(info["takeover_stale"]) and not self.resume_problem(sid, info, ignore_pause=True)
         return info
 
     def outputs(self, sid: str) -> list[dict]:

@@ -338,6 +338,13 @@ class FakeAzure(FakeServer):
             if r["method"] == "DELETE":
                 del self.secrets[name]
                 return 200, {"recoveryId": f"{self.url}/deletedsecrets/{name}"}
+            if r["method"] == "PATCH" and len(parts) == 3:  # Update Secret: attributes / tags of one version
+                for x in vers:
+                    if x["version"] == parts[2]:
+                        x["tags"] = json.loads(r["raw"]).get("tags", x["tags"])
+                        x["attributes"]["updated"] = int(self.clock())
+                        return 200, self._bundle(name, x, False)
+                return 404, {"error": {"code": "SecretNotFound", "message": "version not found"}}
             if len(parts) == 3 and parts[2] == "versions":
                 return 200, {"value": [{k: v for k, v in self._bundle(name, x, False).items()} for x in vers]}
             if len(parts) == 3:
