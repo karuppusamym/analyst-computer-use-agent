@@ -19,9 +19,11 @@ Backends (config section `vault`):
 
 Every secret can also carry rotation metadata (`rotate_after_days`,
 `expires_at`; see secret_status) and a sharing list (`owners`, `users`: run
-users allowed to use it; both empty = any run user). An expired secret, or one
-the run's user may not use, is refused at use time and audited as
-`secret_expired` / `secret_denied`.
+users allowed to use it; both empty = any run user). Entries are user fnmatch
+patterns, `team:<name>` (a team in `portal.teams`, membership as the portal
+computes it) or `group:<sso-group>` (portal runs with SSO sign-in only); see
+Principal. An expired secret, or one the run's user may not use, is refused at
+use time and audited as `secret_expired` / `secret_denied`.
 
 Use: a tool input may contain `{{secret:name}}`. Only the tools that type or
 fill (browser_fill, the pixel tier `type`, uia_set_text) resolve it, at the
@@ -39,6 +41,8 @@ import fnmatch
 import json
 import os
 import re
+import secrets as _secrets
+import string
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -134,16 +138,124 @@ def _user_match(user: str | None, patterns: list[str]) -> bool:
     return bool(user) and any(fnmatch.fnmatch(user.lower(), p.lower()) for p in patterns)
 
 
-def user_allowed(user: str | None, meta: SecretMeta) -> bool:
-    """Owners and users are fnmatch patterns (case-insensitive). Both empty = any user."""
+TEAM_PREFIX = "team:"
+GROUP_PREFIX = "group:"
+
+
+@dataclass(frozen=True)
+class Principal:
+    """A run user and the teams / SSO groups it belongs to, for `team:` and `group:` entries.
+
+    teams: lower-case names of the portal.teams teams the user is in. groups:
+    lower-case SSO groups as last seen by the portal, or None when the run has
+    no SSO identity (CLI and scheduled runs, or local portal sign-in): then
+    `group:` entries match nobody. known_teams: every team in portal.teams; a
+    `team:` entry naming any other team grants nothing (fail closed).
+    """
+
+    user: str
+    teams: frozenset[str] = frozenset()
+    groups: frozenset[str] | None = None
+    known_teams: frozenset[str] = frozenset()
+    source: str = ""
+
+
+def _has_group_entries(meta: SecretMeta) -> bool:
+    return any(e.lower().startswith((TEAM_PREFIX, GROUP_PREFIX)) for e in (*meta.owners, *meta.users))
+
+
+def principal_for(settings: Settings | None, user: str | None, source: str = "", groups=None) -> Principal:
+    """Resolve a run user to teams exactly as the portal does (portal/teams.py):
+    config members and reviewers, plus SSO-group members (last-seen groups in
+    workspace/portal_sso_groups.json) when `source` is "portal" and the portal
+    signs in with oidc / trusted_header. CLI and scheduled runs: config only.
+    `groups` (the run's own SSO groups) overrides the last-seen record."""
+    user = str(user or "")
+    if settings is None:
+        return Principal(user, source=source)
+    try:
+        from .portal.teams import SsoGroupDirectory, Teams
+
+        portal = settings.data.get("portal") or {}
+        mode = (portal.get("auth") or {}).get("mode", "local")
+        sso = source == "portal" and mode in ("oidc", "trusted_header")
+        if sso and groups is None:
+            groups = SsoGroupDirectory(settings.workspace_root / "portal_sso_groups.json").get(user) if user else []
+        teams = Teams(portal.get("teams"), groups_of=(lambda _u: groups or []) if sso else None)
+        mine = teams.teams_of(user, groups if sso else None) if user else []
+        return Principal(user, frozenset(t.lower() for t in mine), frozenset(str(g).lower() for g in groups or []) if sso else None,
+                         frozenset(t.lower() for t in teams.teams), source)
+    except Exception:  # noqa: BLE001 - a broken team config grants no team access (fail closed)
+        return Principal(user, source=source)
+
+
+def share_check(principal: Principal, entries: list[str]) -> tuple[bool, list[str]]:
+    """(matched, problems). problems explain entries that could not grant anything."""
+    problems: list[str] = []
+    for raw in entries:
+        e = raw.strip().lower()
+        if e.startswith(TEAM_PREFIX):
+            name = e[len(TEAM_PREFIX):]
+            if name not in principal.known_teams:
+                problems.append(f"team '{name}' is not in portal.teams")
+            elif name in principal.teams:
+                return True, problems
+        elif e.startswith(GROUP_PREFIX):
+            g = e[len(GROUP_PREFIX):]
+            if principal.groups is None:
+                problems.append(f"group '{g}' needs SSO groups, which only portal runs with SSO sign-in have")
+            elif g and g in principal.groups:
+                return True, problems
+        elif _user_match(principal.user, [e]):
+            return True, problems
+    return False, problems
+
+
+def _principal(user, principal: Principal | None) -> Principal:
+    return principal if principal is not None else Principal(str(user or ""))
+
+
+def user_allowed(user: str | None, meta: SecretMeta, principal: Principal | None = None) -> bool:
+    """Owners and users are fnmatch patterns (case-insensitive), `team:` or `group:` entries. Both empty = any user."""
     if not meta.owners and not meta.users:
         return True
-    return _user_match(user, [*meta.owners, *meta.users])
+    return share_check(_principal(user, principal), [*meta.owners, *meta.users])[0]
 
 
-def is_owner(user: str | None, meta: SecretMeta) -> bool:
+def is_owner(user: str | None, meta: SecretMeta, principal: Principal | None = None) -> bool:
     """No owners = anyone who can reach the store may manage it."""
-    return not meta.owners or _user_match(user, meta.owners)
+    return not meta.owners or share_check(_principal(user, principal), meta.owners)[0]
+
+
+def check_share_entries(settings: Settings | None, entries: list[str]) -> list[str]:
+    """Warnings for `team:` / `group:` entries that cannot grant anything with this config."""
+    portal = (settings.data.get("portal") or {}) if settings is not None else {}
+    teams_cfg = portal.get("teams") if isinstance(portal.get("teams"), dict) else {}
+    teams = {str(t).lower() for t in teams_cfg}
+    sso_groups = {str(g).lower() for t in teams_cfg.values() if isinstance(t, dict) for k in ("sso_groups", "sso_reviewer_groups") for g in (t.get(k) or [])}
+    mode = (portal.get("auth") or {}).get("mode", "local")
+    out = []
+    for raw in entries:
+        e = raw.strip().lower()
+        if e.startswith(TEAM_PREFIX) and e[len(TEAM_PREFIX):] not in teams:
+            out.append(f"team '{e[len(TEAM_PREFIX):]}' is not in portal.teams; this entry grants nothing until it is")
+        elif e.startswith(GROUP_PREFIX):
+            g = e[len(GROUP_PREFIX):]
+            if mode not in ("oidc", "trusted_header"):
+                out.append(f"group '{g}': portal.auth.mode is {mode!r}, so no run has SSO groups; this entry grants nothing")
+            elif g not in sso_groups:
+                out.append(f"group '{g}' is not in any portal.teams sso_groups / sso_reviewer_groups; the portal does not record it, so this entry grants nothing")
+    return out
+
+
+def _check_entry_syntax(entries: list[str]) -> None:
+    for raw in entries:
+        e = raw.strip().lower()
+        for pre in (TEAM_PREFIX, GROUP_PREFIX):
+            if e.startswith(pre) and not e[len(pre):].strip():
+                raise VaultError(f"sharing entry {raw!r} names no {pre[:-1]}")
+        if "," in e:
+            raise VaultError(f"sharing entry {raw!r} may not contain a comma")
 
 
 def parse_when(value: str) -> float:
@@ -313,6 +425,10 @@ class Vault:
     def rollback(self, name: str) -> SecretMeta:
         raise VaultError(f"the {self.backend} backend keeps no previous versions; set the old value again with `vault rotate`")
 
+    def update_sharing(self, name: str, owners: list[str], users: list[str]) -> SecretMeta:
+        """Change owners/users only: the value, its age (rotation clock) and versions stay."""
+        raise VaultError(f"the {self.backend} backend is read-only")
+
 
 def _validate_value(value: str) -> None:
     if not isinstance(value, str) or len(value) < MIN_SECRET_LEN:
@@ -394,6 +510,20 @@ class DpapiVault(Vault):
         if data["secrets"].pop(name, None) is None:
             raise VaultError(f"no secret named {name!r}")
         self.store.save(data)
+
+    def update_sharing(self, name, owners, users):
+        data = self.store.load()
+        rec = data["secrets"].get(name)
+        if rec is None:
+            raise VaultError(f"no secret named {name!r}")
+        value = dpapi_unprotect(base64.b64decode(rec["blob"]), self._entropy(name, rec))  # the old binding must still verify
+        pol = {**_FileMeta.meta(name, rec, self.backend).policy(), "owners": owners, "users": users}
+        new = _FileMeta.policy_fields(**pol)
+        blob = dpapi_protect(value, self._entropy(name, new), f"analyst_agent:{name}")
+        keep = {k: rec[k] for k in ("created", "updated", "version", "previous") if k in rec}
+        data["secrets"][name] = {"blob": base64.b64encode(blob).decode(), **new, **keep}
+        self.store.save(data)
+        return _FileMeta.meta(name, data["secrets"][name], self.backend)
 
 
 class EnvVault(Vault):
@@ -483,6 +613,16 @@ class KeyringVault(Vault):
             pass
         self.store.save(data)
 
+    def update_sharing(self, name, owners, users):
+        data = self.store.load()
+        rec = data["secrets"].get(name)
+        if rec is None:
+            raise VaultError(f"no secret named {name!r}")
+        pol = {**_FileMeta.meta(name, rec, self.backend).policy(), "owners": owners, "users": users}
+        data["secrets"][name] = {**_FileMeta.policy_fields(**pol), **{k: rec[k] for k in ("created", "updated") if k in rec}}
+        self.store.save(data)
+        return _FileMeta.meta(name, data["secrets"][name], self.backend)
+
 
 def open_vault(settings: Settings) -> Vault:
     cfg = settings.data.get("vault", {})
@@ -509,6 +649,20 @@ def run_user(ctx) -> str:
     """The user a run acts for: ToolContext.user if a caller set one, else the audit log's user
     (the orchestrator's `user`: the portal login, `schedule:<owner>`, or "analyst" on the CLI)."""
     return str(getattr(ctx, "user", None) or getattr(getattr(ctx, "audit", None), "user", "") or "")
+
+
+def run_principal(ctx, user: str) -> Principal:
+    """Teams of the run's user. ToolContext.user_source says where the run came from
+    ("portal", "schedule", "cli"); only portal runs use SSO groups. Cached on the context."""
+    cached = getattr(ctx, "_vault_principal", None)
+    if isinstance(cached, Principal) and cached.user == user:
+        return cached
+    p = principal_for(getattr(ctx, "settings", None), user, str(getattr(ctx, "user_source", "") or ""), getattr(ctx, "user_groups", None))
+    try:
+        ctx._vault_principal = p
+    except Exception:
+        pass
+    return p
 
 
 # --------------------------------------------------------------------------- resolution
@@ -551,8 +705,13 @@ def resolve_secrets(text: str, ctx: "ToolContext", *, tool: str, url: str | None
     for name in names:
         try:
             meta = vault.meta(name)
-            if not user_allowed(user, meta):
-                raise SecretDenied(f"secret '{name}' is not shared with user '{user or '?'}' (owners: {meta.owners or 'none'}, users: {meta.users or 'none'})")
+            if meta.owners or meta.users:
+                principal = run_principal(ctx, user) if _has_group_entries(meta) else Principal(user)
+                ok, problems = share_check(principal, [*meta.owners, *meta.users])
+                if not ok:
+                    why = f"; {'; '.join(problems)}" if problems else ""
+                    teams = f", teams: {', '.join(sorted(principal.teams))}" if principal.teams else ""
+                    raise SecretDenied(f"secret '{name}' is not shared with user '{user or '?'}'{teams} (owners: {meta.owners or 'none'}, users: {meta.users or 'none'}){why}")
             status, detail = secret_status(meta)
             if status == "expired":
                 raise SecretExpired(f"secret '{name}' has expired ({detail}); rotate it with `vault rotate {name}`")
@@ -602,20 +761,52 @@ def add_cli(sub) -> None:
     s.add_argument("name")
     s.add_argument("--allow-host", action="append", default=[], metavar="HOST", help="host pattern the secret may be typed into (repeatable)")
     s.add_argument("--allow-app", action="append", default=[], metavar="APP", help="exe or window-title pattern for desktop tiers (repeatable)")
-    s.add_argument("--owner", action="append", default=[], metavar="USER", help="run user who may use and manage it (repeatable, fnmatch)")
-    s.add_argument("--user", action="append", default=[], metavar="USER", help="run user who may use it (repeatable, fnmatch); no --owner/--user = any user")
+    s.add_argument("--owner", action="append", default=[], metavar="USER", help="run user who may use and manage it (repeatable, fnmatch, team:<name> or group:<sso-group>)")
+    s.add_argument("--user", action="append", default=[], metavar="USER", help="run user who may use it (repeatable, fnmatch, team:<name> or group:<sso-group>); no --owner/--user = any user")
     s.add_argument("--rotate-after-days", type=float, metavar="N", help="flag the secret for rotation N days after its value was set")
     _add_expiry_args(s)
     vs.add_parser("list", help="list secret names, allowlists, sharing, age and status (never values)")
     c = vs.add_parser("check", help="exit 1 if any secret is expired or due for rotation (for a scheduled task)")
     c.add_argument("--warn-days", type=float, default=7.0, help="report rotate-soon this many days ahead (default 7)")
-    r = vs.add_parser("rotate", help="prompt for a new value; keeps allowlists and sharing (and the previous value where the backend has versions)")
+    sh = vs.add_parser("share", help="change who may use or manage a secret (value, age and versions unchanged); no options = show it")
+    sh.add_argument("name")
+    for flag, what in (("add-owner", "add an owner"), ("remove-owner", "remove an owner"), ("add-user", "add a user"), ("remove-user", "remove a user")):
+        sh.add_argument(f"--{flag}", action="append", default=[], metavar="ENTRY", help=f"{what}: user pattern, team:<name> or group:<sso-group> (repeatable)")
+    r = vs.add_parser("rotate", help="prompt for a new value (or --generate one); keeps allowlists and sharing (and the previous value where the backend has versions)")
     r.add_argument("name")
+    r.add_argument("--generate", action="store_true", help="store a new random value from `secrets` instead of prompting; changes the STORED value only, not the target system")
+    r.add_argument("--length", type=int, metavar="N", help=f"length of the generated value ({GEN_MIN_LEN}-{GEN_MAX_LEN}, default {GEN_DEFAULT_LEN})")
+    r.add_argument("--show", action="store_true", help="print the generated value once (it then sits in your terminal scrollback)")
     _add_expiry_args(r)
     rb = vs.add_parser("rollback", help="restore the previous value (versioned backends only)")
     rb.add_argument("name")
     rm = vs.add_parser("remove", help="delete a secret")
     rm.add_argument("name")
+
+
+GEN_MIN_LEN, GEN_DEFAULT_LEN, GEN_MAX_LEN = 12, 24, 256
+GEN_SYMBOLS = "!#%+-=?@^_~"  # no quotes, backslash, spaces or shell/fnmatch specials
+
+
+def generate_value(length: int = GEN_DEFAULT_LEN) -> str:
+    """A random value from `secrets`: letters, digits and symbols, at least one of each."""
+    if not GEN_MIN_LEN <= int(length) <= GEN_MAX_LEN:
+        raise VaultError(f"--length must be between {GEN_MIN_LEN} and {GEN_MAX_LEN}")
+    classes = (string.ascii_lowercase, string.ascii_uppercase, string.digits, GEN_SYMBOLS)
+    alphabet = "".join(classes)
+    while True:
+        v = "".join(_secrets.choice(alphabet) for _ in range(int(length)))
+        if all(any(c in cls for c in v) for cls in classes):
+            return v
+
+
+def check_secrets(vault: Vault, now: float | None = None, warn_days: float = 7.0) -> list[tuple[SecretMeta, str, str]]:
+    """(meta, status, detail) for every secret; never reads a value. Raises VaultError if the store fails."""
+    now = time.time() if now is None else now
+    return [(m, *secret_status(m, now, warn_days)) for m in vault.list()]
+
+
+FAILING_STATUSES = ("expired", "rotate-due")
 
 
 def _expiry_from(args, keep):
@@ -677,9 +868,15 @@ def run_cli(args, settings: Settings, getpass_fn=None, out=print, vault: Vault |
 
         def owned(name: str) -> SecretMeta:
             m = vault.meta(name)
-            if not is_owner(actor, m):
+            principal = principal_for(settings, actor, "cli") if _has_group_entries(m) else Principal(actor or "")
+            if not is_owner(actor, m, principal):
                 raise VaultError(f"'{actor or '?'}' is not an owner of {name!r} (owners: {', '.join(m.owners)}); set AGENT_USER if you are")
             return m
+
+        def warn_entries(entries: list[str]) -> None:
+            _check_entry_syntax(entries)
+            for w in check_share_entries(settings, entries):
+                out(f"warning: {w}")
 
         if args.vault_cmd == "list":
             items = vault.list()
@@ -689,14 +886,13 @@ def run_cli(args, settings: Settings, getpass_fn=None, out=print, vault: Vault |
                 out(_line(m, now))
             return 0
         if args.vault_cmd == "check":
-            items = vault.list()
+            rows = check_secrets(vault, now, args.warn_days)
             bad = 0
-            for m in items:
-                status, _ = secret_status(m, now, args.warn_days)
+            for m, status, _ in rows:
                 if status != "ok":
                     out(_line(m, now, args.warn_days))
-                bad += status in ("expired", "rotate-due")
-            out(f"{len(items)} secrets, {bad} expired or due for rotation ({vault.backend} backend)")
+                bad += status in FAILING_STATUSES
+            out(f"{len(rows)} secrets, {bad} expired or due for rotation ({vault.backend} backend)")
             return 1 if bad else 0
         if args.vault_cmd == "set":
             check_name(args.name)
@@ -708,6 +904,7 @@ def run_cli(args, settings: Settings, getpass_fn=None, out=print, vault: Vault |
                 existing = None
             if existing is not None and not is_owner(actor, existing):  # overwriting needs ownership
                 owned(args.name)
+            warn_entries([*args.owner, *args.user])
             if not args.allow_host and not args.allow_app:
                 out("warning: no --allow-host or --allow-app given; the secret cannot be used until you set it again with one")
             value = _ask_twice(ask, args.name)
@@ -719,7 +916,9 @@ def run_cli(args, settings: Settings, getpass_fn=None, out=print, vault: Vault |
             if vault.read_only:
                 raise VaultError(f"the {vault.backend} backend is read-only; change the environment variable and its __UPDATED date instead")
             m = owned(args.name)
-            value = _ask_twice(ask, args.name)
+            if not args.generate and (args.length is not None or args.show):
+                raise VaultError("--length and --show need --generate")
+            value = generate_value(args.length or GEN_DEFAULT_LEN) if args.generate else _ask_twice(ask, args.name)
             if value == vault.get(args.name):
                 raise VaultError("the new value is the same as the current one; nothing changed")
             expires = _expiry_from(args, _KEEP)
@@ -728,6 +927,37 @@ def run_cli(args, settings: Settings, getpass_fn=None, out=print, vault: Vault |
                 out("note: the old expiry has passed and was cleared; give --expires-at or --expires-in-days to set a new one")
             m = vault.rotate(args.name, value, expires)
             out(f"rotated {m.name} ({m.backend})" + (f" now v{m.version}" if m.version else "") + ("; previous value kept for `vault rollback`" if vault.supports_versions else "; this backend keeps no previous value"))
+            if args.generate:
+                out(f"generated a {len(value)}-character value. Only the STORED value changed: set the same value on the target system "
+                    f"(or `vault rollback {m.name}`), or runs that type {{{{secret:{m.name}}}}} will fail to sign in.")
+                if args.show:
+                    out("warning: printing the generated value; it stays in your terminal scrollback and any captured output")
+                    out(value)
+                else:
+                    out("the value is not shown (use --show to print it once)")
+            return 0
+        if args.vault_cmd == "share":
+            m = owned(args.name)
+            if not (args.add_owner or args.remove_owner or args.add_user or args.remove_user):
+                out(f"{m.name}: owners={','.join(m.owners) or '-'} users={','.join(m.users) or '-'}" + ("" if m.owners or m.users else " (any run user may use it)"))
+                return 0
+            if vault.read_only:
+                raise VaultError(f"the {vault.backend} backend is read-only; change {m.name}'s __OWNERS / __USERS variables instead")
+            warn_entries([*args.add_owner, *args.add_user])
+
+            def edit(cur: list[str], add: list[str], remove: list[str]) -> list[str]:
+                drop = {x.strip().lower() for x in remove}
+                missing = sorted(drop - set(cur))
+                if missing:
+                    raise VaultError(f"not in the list: {', '.join(missing)}")
+                return [x for x in dict.fromkeys([*cur, *(a.strip().lower() for a in add if a.strip())]) if x not in drop]
+
+            owners = edit(m.owners, args.add_owner, args.remove_owner)
+            users = edit(m.users, args.add_user, args.remove_user)
+            if m.owners and not owners:
+                out("note: the secret has no owners now, so anyone who can reach the store may manage it")
+            m = vault.update_sharing(args.name, owners, users)
+            out(f"shared {m.name}: owners={','.join(m.owners) or '-'} users={','.join(m.users) or '-'}" + ("" if m.owners or m.users else " (any run user may use it)"))
             return 0
         if args.vault_cmd == "rollback":
             owned(args.name)

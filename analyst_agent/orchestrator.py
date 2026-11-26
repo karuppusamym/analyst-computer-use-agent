@@ -78,12 +78,15 @@ class Orchestrator:
         ask: Callable[[list[str]], dict[str, str] | None] | None = None,
         knowledge_dir: str | Path | None = None,
         require_plan_approval: bool = True,
+        user_source: str = "",
     ):
         self.settings = settings
         self.client = client or ModelClient(settings)
         self.approver = approver or ConsoleApprover(user)
         self.router = router or Router(settings)
         self.user = user
+        # Where the run came from, for vault team:/group: sharing: only "portal" runs use SSO groups.
+        self.user_source = user_source or getattr(approver, "user_source", "") or ("schedule" if str(user).startswith("schedule:") else "cli")
         self.ask = ask
         self.knowledge_dir = Path(knowledge_dir) if knowledge_dir else None
         self.require_plan_approval = require_plan_approval
@@ -184,7 +187,7 @@ class Orchestrator:
 
         policy = PolicyEngine(s, playbook.permissions if playbook else None)
         amounts = {st.id: st.approval_amount for st in plan.steps if st.approval_amount}
-        ctx = ToolContext(s, policy, audit, _StepAmountApprover(self.approver, amounts) if amounts else self.approver, workdir=audit.dir / "scratch", params=params)
+        ctx = ToolContext(s, policy, audit, _StepAmountApprover(self.approver, amounts) if amounts else self.approver, workdir=audit.dir / "scratch", params=params, user_source=self.user_source)
 
         if self.require_plan_approval:
             preview = "\n".join(f"{i + 1}. [{st.tier}] {st.intent}" + (("  (needs approval" + (f", amount {st.approval_amount}" if st.approval_amount else "") + ")") if st.approval == "required" or policy.needs_approval(st.action_class) else "") for i, st in enumerate(plan.steps))

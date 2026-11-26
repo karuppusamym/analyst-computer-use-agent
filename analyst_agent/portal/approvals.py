@@ -153,6 +153,8 @@ class ApprovalInbox:
 class WebApprover:
     """Approver for one portal run: queues each request in the shared inbox and waits."""
 
+    user_source = "portal"  # the run's user signed in to the portal (vault team:/group: sharing uses SSO groups)
+
     def __init__(self, inbox: ApprovalInbox, session_id: str, requested_by: str, timeout_s: float):
         self.inbox = inbox
         self.session_id = session_id

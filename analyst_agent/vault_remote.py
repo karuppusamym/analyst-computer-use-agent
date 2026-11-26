@@ -385,6 +385,14 @@ class HashiCorpVault(_RemoteVault):
         self.cache.drop(name)
         self._req("DELETE", self._p("metadata", name))  # all versions and metadata
 
+    def update_sharing(self, name, owners, users):
+        pol = {**self._fetch_meta(name).policy(), "owners": owners, "users": users}
+        encode_meta(pol, limit=512)
+        self.cache.drop(name)
+        self._write_meta(name, pol)  # metadata only: no new version, the value's age is unchanged
+        self.cache.drop(name)
+        return self.meta(name)
+
 
 # --------------------------------------------------------------------------- Azure Key Vault
 
@@ -572,6 +580,18 @@ class AzureKeyVault(_RemoteVault):
             self._req("DELETE", f"secrets/{azure_name(name)}")  # soft delete if the vault has it enabled
         except RemoteError as e:
             self._missing(name, e)
+
+    def update_sharing(self, name, owners, users):
+        b = self._bundle(name)
+        ver = (b.get("id") or "").rstrip("/").split("/")[-1]
+        m = self._meta_from(name, b)
+        pol = {**m.policy(), "owners": owners, "users": users}
+        tags = self._tags(name, pol, m.created)
+        self.cache.drop(name)
+        # Update Secret (PATCH on the current version): tags only, no new version, the value's age is unchanged
+        self._req("PATCH", f"secrets/{azure_name(name)}/{quote(ver, safe='')}", {"tags": tags})
+        self.cache.drop(name)
+        return self.meta(name)
 
 
 def open_remote(backend: str, cfg: dict) -> Vault:
