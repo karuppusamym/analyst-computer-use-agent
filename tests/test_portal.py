@@ -11,6 +11,8 @@ import http.client
 import json
 import re
 import secrets
+import shutil
+import tempfile
 import threading
 import time
 import unittest
@@ -30,8 +32,11 @@ from analyst_agent.portal.auth import (
     verify_id_token,
     verify_password,
 )
+from analyst_agent.policy import ApprovalRequest
+from analyst_agent.portal.approvals import ApprovalInbox
 from analyst_agent.portal.runs import safe_child
 from analyst_agent.portal.server import PortalApp, make_server
+from analyst_agent.portal.state import PendingStore
 
 from .helpers import TempWorkspace
 from .test_core import plan_json
@@ -109,15 +114,19 @@ class PortalCase(unittest.TestCase):
         store = UserStore(self.s.workspace_root / "portal_users.json")
         for name, role in (users or {}).items():
             store.add(name, role, f"pw-{name}-secret", iterations=FAST)
+        self._dev = dev
+        self.addCleanup(self._cleanup)
+        self._boot(script)
+
+    def _boot(self, script=None):
         self.backend = MockBackend(script)
-        self.app = PortalApp(self.s, self.ws.root / "playbooks", host="127.0.0.1", dev_no_auth=dev, client_factory=lambda s: ModelClient(s, backend=self.backend), quiet=True)
+        self.app = PortalApp(self.s, self.ws.root / "playbooks", host="127.0.0.1", dev_no_auth=self._dev, client_factory=lambda s: ModelClient(s, backend=self.backend), quiet=True)
         self.srv = make_server(self.app, "127.0.0.1", 0)
         self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
         self.thread.start()
         self.base = f"http://127.0.0.1:{self.srv.server_address[1]}"
-        self.addCleanup(self._stop)
 
-    def _stop(self):
+    def _stop_app(self):
         for p in self.app.inbox.pending():
             self.app.inbox.decide(p.id, False, "test-teardown")
         for q in self.app.questions.all():
@@ -127,7 +136,26 @@ class PortalCase(unittest.TestCase):
                 r.thread.join(10)
         self.srv.shutdown()
         self.srv.server_close()
+
+    def _cleanup(self):
+        self._stop_app()
         self.ws.cleanup()
+
+    def restart(self, script=None):
+        """Simulate a portal crash: keep the portal state and audit folders exactly as they are now,
+        stop this portal (its run threads must end so the temp folder can be removed), put the
+        snapshot back, then start a new PortalApp on the same workspace."""
+        snap = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, snap, True)
+        dirs = {"state": self.s.workspace_root / "portal_state", "audit": self.s.audit_dir}
+        for key, d in dirs.items():
+            d.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(d, snap / key)
+        self._stop_app()  # declines in the old instance; the snapshot below undoes them on disk
+        for key, d in dirs.items():
+            shutil.rmtree(d)
+            shutil.copytree(snap / key, d)
+        self._boot(script)
 
     def client(self, name: str | None = None) -> Client:
         c = Client(self.base)
@@ -299,6 +327,7 @@ class PortalRunTests(PortalCase):
         d = self.s.audit_dir / sid
         (d / "screenshots").mkdir(parents=True)
         (d / "events.jsonl").write_text(json.dumps({"seq": 1, "ts": time.time(), "kind": "task_started", "request": "x", "user": "alice"}) + "\n")
+        (d / "portal_meta.json").write_text(json.dumps({"owner": "alice"}))
         (d / "screenshots" / "00001-screen.png").write_bytes(b"\x89PNG\r\n\x1a\nfake")
         bad = [
             f"/sessions/{sid}/file/../../portal_users.json",
@@ -352,7 +381,8 @@ class PortalQuestionTests(PortalCase):
         self.assertIn(f'action="/sessions/{sid}/answer"', chat)
         bob = self.client("bob")
         s, _, _ = bob.post(f"/sessions/{sid}/answer", {"csrf": bob.csrf("/"), "a0": "2026-10"})
-        self.assertEqual(s, 403)  # only the requester (or an admin) answers
+        self.assertEqual(s, 404)  # only the requester (or an admin) answers; another analyst cannot even see it
+        self.assertNotIn("Which period?", bob.get("/")[2])
         s, h, _ = alice.post(f"/sessions/{sid}/answer", {"csrf": alice.csrf("/"), "a0": "2026-10"})
         self.assertEqual((s, h["Location"]), (303, "/?m=answered"))
         run = self.finished(sid)
@@ -369,6 +399,291 @@ class PortalTimeoutTests(PortalCase):
         self.assertEqual(run.status, "rejected")
         self.assertEqual(run.result.approvals[0]["by"], "timeout")
         self.assertEqual(self.app.inbox.history()[0].decision.by, "timeout")
+
+
+# --------------------------------------------------------------------------- persistence, orphans, resume
+
+
+def state_records(app, kind=None):
+    return {r["id"]: r for r in app.state.records(kind)}
+
+
+class PortalRestartTests(PortalCase):
+    def setUp(self):
+        self.start(users={"alice": "analyst", "rita": "reviewer"})
+
+    def test_restart_orphans_pending_approval_then_resume(self):
+        alice, rita = self.client("alice"), self.client("rita")
+        sid = self.start_task(alice)
+        self.assertEqual(json.loads((self.s.audit_dir / sid / "portal_meta.json").read_text(encoding="utf-8"))["owner"], "alice")
+        plan = self.pending(sid, "plan")
+        rec = state_records(self.app)[plan.id]
+        self.assertEqual((rec["kind"], rec["status"], rec["session_id"], rec["step_id"], rec["requested_by"]), ("approval", "pending", sid, "plan", "alice"))
+        self.assertEqual(rec["instance"], self.app.state.instance)
+        rita.post(f"/approvals/{plan.id}", {"csrf": rita.csrf("/approvals"), "decision": "approve"})
+        # The decision is on disk by the time the decide request has returned.
+        rec = state_records(self.app)[plan.id]
+        self.assertEqual((rec["status"], rec["outcome"], rec["by"], rec["approved"]), ("closed", "approved", "rita", True))
+        send = self.pending(sid, "draft-email")
+        self.assertTrue((self.s.audit_dir / sid / "checkpoint.json").exists())
+        old_instance = self.app.state.instance
+
+        self.restart()
+        self.assertNotEqual(self.app.state.instance, old_instance)
+        self.assertEqual(self.app.inbox.pending(), [])
+        rec = state_records(self.app)[send.id]
+        self.assertEqual((rec["status"], rec["outcome"], rec["by"], rec["approved"]), ("closed", "orphaned", "portal-restart", False))
+        events = [json.loads(x) for x in (self.s.audit_dir / sid / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+        orphaned = [e for e in events if e["kind"] == "approval_orphaned"]
+        self.assertEqual([(e["step"], e["approved"], e["by"]) for e in orphaned], [("draft-email", False, "portal-restart")])
+        self.assertEqual(orphaned[0]["seq"], max(e["seq"] for e in events))
+        self.assertNotIn("task_finished", [e["kind"] for e in events])
+        portal_log = (self.s.workspace_root / "portal_audit" / "portal" / "events.jsonl").read_text(encoding="utf-8")
+        self.assertIn('"approval_orphaned"', portal_log)
+        self.assertIn(send.id, portal_log)
+        rita = self.client("rita")  # the new server listens on a new port
+        # Decisions from before the restart are still listed, with the orphan marked as such.
+        s, _, inbox = rita.get("/approvals")
+        self.assertIn("Nothing is waiting for approval", inbox)
+        self.assertIn(">orphaned<", inbox)
+        self.assertIn(">rita<", inbox)
+        # A second restart does not touch already-closed records.
+        before = (self.s.audit_dir / sid / "events.jsonl").read_text(encoding="utf-8")
+        self.restart()
+        self.assertEqual((self.s.audit_dir / sid / "events.jsonl").read_text(encoding="utf-8"), before)
+
+        alice = self.client("alice")  # new server, new port
+        s, _, page = alice.get(f"/sessions/{sid}")
+        self.assertEqual(s, 200)
+        self.assertIn("Orphaned — run was interrupted", page)
+        self.assertIn(">interrupted<", page)
+        self.assertIn(f'action="/sessions/{sid}/resume"', page)
+        self.assertIn("Resume from checkpoint", page)
+        s, h, _ = alice.post(f"/sessions/{sid}/resume", {"csrf": alice.csrf(f"/sessions/{sid}")})
+        self.assertEqual((s, h["Location"]), (303, f"/sessions/{sid}?m=resumed"))
+        # Resuming twice while it runs is refused.
+        s, _, body = alice.post(f"/sessions/{sid}/resume", {"csrf": alice.csrf(f"/sessions/{sid}")})
+        self.assertEqual(s, 409)
+        rita = self.client("rita")
+        plan2 = self.pending(sid, "plan")  # the plan is approved again on resume
+        self.assertEqual(plan2.requested_by, "alice")  # the owner stays the owner
+        rita.post(f"/approvals/{plan2.id}", {"csrf": rita.csrf("/approvals"), "decision": "approve"})
+        send2 = self.pending(sid, "draft-email")
+        rita.post(f"/approvals/{send2.id}", {"csrf": rita.csrf("/approvals"), "decision": "approve"})
+        run = self.finished(sid)
+        self.assertEqual(run.status, "success", run.message)
+        events = [json.loads(x) for x in (self.s.audit_dir / sid / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+        resumed = [e for e in events if e["kind"] == "resumed"]
+        self.assertEqual(len(resumed), 1)
+        self.assertIn("reconcile", resumed[0]["verified_steps"])
+        self.assertEqual([r.status for r in run.result.records if r.step.id == "reconcile"], ["verified"])
+        self.assertEqual([r.summary for r in run.result.records if r.step.id == "reconcile"], ["restored from checkpoint"])
+        meta = json.loads((self.s.audit_dir / sid / "portal_meta.json").read_text(encoding="utf-8"))
+        self.assertEqual((meta["owner"], [x["by"] for x in meta["resumes"]]), ("alice", ["alice"]))
+        self.assertIn('"run_resumed"', (self.s.workspace_root / "portal_audit" / "portal" / "events.jsonl").read_text(encoding="utf-8"))
+        s, _, page = alice.get(f"/sessions/{sid}")
+        self.assertNotIn("Resume from checkpoint", page)  # finished successfully
+        s, _, _ = alice.post(f"/sessions/{sid}/resume", {"csrf": alice.csrf(f"/sessions/{sid}")})
+        self.assertEqual(s, 409)
+
+    def test_resume_button_only_with_checkpoint_and_not_after_kill_switch(self):
+        alice = self.client("alice")
+        sid = "20990101-000000-cafe01"
+        d = self.s.audit_dir / sid
+        d.mkdir(parents=True)
+        (d / "portal_meta.json").write_text(json.dumps({"owner": "alice"}))
+        (d / "events.jsonl").write_text(json.dumps({"seq": 1, "ts": time.time(), "kind": "task_started", "request": "reconcile october", "user": "alice", "playbook": "erp-crm-reconciliation", "params": {"period": "2026-10"}}) + "\n")
+        s, _, page = alice.get(f"/sessions/{sid}")
+        self.assertIn(">interrupted<", page)
+        self.assertNotIn("Resume from checkpoint", page)  # no checkpoint yet
+        s, _, body = alice.post(f"/sessions/{sid}/resume", {"csrf": alice.csrf(f"/sessions/{sid}")})
+        self.assertEqual(s, 409)
+        self.assertIn("no checkpoint", body)
+        (d / "checkpoint.json").write_text(json.dumps({"request": "reconcile october", "verified_steps": ["profile-inputs"], "params": {"period": "2026-10"}, "files": []}))
+        s, _, page = alice.get(f"/sessions/{sid}")
+        self.assertIn("Resume from checkpoint", page)
+        (d / "STOP").write_text("stop requested\n")
+        s, _, page = alice.get(f"/sessions/{sid}")
+        self.assertNotIn("Resume from checkpoint", page)
+        s, _, body = alice.post(f"/sessions/{sid}/resume", {"csrf": alice.csrf(f"/sessions/{sid}")})
+        self.assertEqual(s, 409)
+        self.assertIn("kill switch", body)
+        self.assertNotIn(sid, self.app.runs.runs)
+
+    def test_questions_persisted_and_orphaned(self):
+        self.restart(script=[plan_json([], questions=["Which period?"])])
+        alice = self.client("alice")
+        sid = self.start_task(alice, request="something vague", playbook="none", params="")
+        pq = wait_for(lambda: self.app.questions.get(sid), what="question")
+        rec = state_records(self.app, "question")[pq.id]
+        self.assertEqual((rec["status"], rec["session_id"], rec["asked_by"], rec["questions"]), ("pending", sid, "alice", ["Which period?"]))
+        self.restart()
+        self.assertEqual(self.app.questions.all(), [])
+        rec = state_records(self.app, "question")[pq.id]
+        self.assertEqual((rec["status"], rec["outcome"], rec["by"]), ("closed", "orphaned", "portal-restart"))
+        self.assertIn('"question_orphaned"', (self.s.audit_dir / sid / "events.jsonl").read_text(encoding="utf-8"))
+        alice = self.client("alice")
+        s, _, chat = alice.get("/")
+        self.assertNotIn(f'action="/sessions/{sid}/answer"', chat)
+        s, h, _ = alice.post(f"/sessions/{sid}/answer", {"csrf": alice.csrf("/"), "a0": "2026-10"})
+        self.assertEqual(h["Location"], "/?m=gone")
+        s, _, page = alice.get(f"/sessions/{sid}")
+        self.assertIn("Orphaned — run was interrupted", page)
+        self.assertIn("Which period?", page)
+        self.assertNotIn("Resume from checkpoint", page)  # nothing was verified, so there is no checkpoint
+
+    def test_answered_question_is_durable(self):
+        self.restart(script=[plan_json([], questions=["Which period?"]), plan_json([], questions=["Which region?"])])
+        alice = self.client("alice")
+        sid = self.start_task(alice, request="something vague", playbook="none", params="")
+        pq = wait_for(lambda: self.app.questions.get(sid), what="question")
+        alice.post(f"/sessions/{sid}/answer", {"csrf": alice.csrf("/"), "a0": "2026-10"})
+        rec = state_records(self.app, "question")[pq.id]
+        self.assertEqual((rec["status"], rec["outcome"], rec["by"]), ("closed", "answered", "alice"))
+        self.assertNotIn("2026-10", json.dumps(rec))  # answers go to the run, not to portal_state
+        self.finished(sid)
+
+
+class DurableDecisionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _submit(self, inbox):
+        out = {}
+        t = threading.Thread(target=lambda: out.setdefault("d", inbox.submit("s1", "alice", ApprovalRequest("plan", "plan", "Plan"), 30)), daemon=True)
+        t.start()
+        item = wait_for(lambda: (inbox.pending() or [None])[0], what="pending item")
+        return t, item, out
+
+    def test_thread_not_released_until_decision_is_on_disk(self):
+        store = PendingStore(self.tmp / "state")
+        inbox = ApprovalInbox(store=store)
+        t, item, out = self._submit(inbox)
+        real_close = store.close
+
+        def failing_close(*a, **k):
+            raise OSError("disk full")
+
+        store.close = failing_close
+        with self.assertRaises(OSError):
+            inbox.decide(item.id, True, "rita")
+        time.sleep(0.2)
+        self.assertTrue(t.is_alive())  # still waiting: an approval that was not recorded does not count
+        self.assertEqual([p.id for p in inbox.pending()], [item.id])
+        self.assertIsNone(item.decision)
+        self.assertEqual(store.records()[0]["status"], "pending")
+        store.close = real_close
+        self.assertIsNotNone(inbox.decide(item.id, True, "rita"))
+        t.join(5)
+        self.assertTrue(out["d"].approved)
+        self.assertEqual(store.records()[0]["outcome"], "approved")
+
+    def test_closed_on_disk_by_another_instance_is_gone(self):
+        store = PendingStore(self.tmp / "state")
+        inbox = ApprovalInbox(store=store)
+        t, item, out = self._submit(inbox)
+        other = PendingStore(self.tmp / "state")
+        self.assertEqual([r["id"] for r in other.orphans()], [item.id])
+        self.assertEqual(store.orphans(), [])  # its own pending records are not orphans
+        self.assertTrue(other.close("approval", item.id, "orphaned", "portal-restart"))
+        self.assertIsNone(inbox.decide(item.id, True, "rita"))  # cannot approve what was closed as declined
+        self.assertFalse(other.close("approval", item.id, "approved", "x"))
+        inbox._items[item.id]._event.set()  # let the waiting thread time out into a decline
+        t.join(5)
+        self.assertFalse(out["d"].approved)
+        self.assertEqual(store.records()[0]["outcome"], "orphaned")
+
+
+# --------------------------------------------------------------------------- visibility per role
+
+
+class PortalVisibilityTests(PortalCase):
+    def setUp(self):
+        self.start(users={"alice": "analyst", "bob": "analyst", "rita": "reviewer", "ada": "admin"})
+        self.cli = "20990101-000000-c11c11"
+        d = self.s.audit_dir / self.cli
+        d.mkdir(parents=True)
+        (d / "events.jsonl").write_text(json.dumps({"seq": 1, "ts": time.time(), "kind": "task_started", "request": "cli job", "user": "console-user"}) + "\n")
+        (d / "checkpoint.json").write_text(json.dumps({"request": "cli job", "verified_steps": [], "files": ["cli_only.csv"]}))
+        self.s.output_dir.mkdir(parents=True, exist_ok=True)
+        (self.s.output_dir / "cli_only.csv").write_bytes(b"a,b\n1,2\n")
+
+    def paths(self, sid):
+        return [f"/sessions/{sid}", f"/sessions/{sid}/live", f"/sessions/{sid}/report", f"/sessions/{sid}/file/events.jsonl", f"/api/sessions/{sid}/state", f"/api/sessions/{sid}/live"]
+
+    def assert_hidden(self, c, sid):
+        _, _, missing = c.get("/sessions/20990101-000000-000000")
+        for path in self.paths(sid):
+            s, _, body = c.get(path)
+            self.assertEqual(s, 404, path)
+            if not path.startswith("/api/") and "/file/" not in path:
+                self.assertEqual(re.sub(r'content="[^"]*"|nonce="[^"]*"', "", body), re.sub(r'content="[^"]*"|nonce="[^"]*"', "", missing))  # same page as a session that does not exist
+        for action in ("stop", "resume", "answer"):
+            s, _, _ = c.post(f"/sessions/{sid}/{action}", {"csrf": c.csrf("/"), "a0": "x"})
+            self.assertEqual(s, 404, action)
+        self.assertFalse((self.s.audit_dir / sid / "STOP").exists())
+        self.assertNotIn(sid, c.get("/sessions")[2])
+        self.assertNotIn(sid, c.get("/")[2])
+
+    def assert_visible(self, c, sid):
+        for path in (f"/sessions/{sid}", f"/sessions/{sid}/live", f"/api/sessions/{sid}/state", f"/api/sessions/{sid}/live"):
+            s, _, _ = c.get(path)
+            self.assertEqual(s, 200, path)
+        self.assertIn(sid, c.get("/sessions")[2])
+
+    def test_visibility_per_role(self):
+        alice, bob, rita, ada = (self.client(n) for n in ("alice", "bob", "rita", "ada"))
+        sid = self.start_task(alice, request="alice private reconcile")
+        plan = self.pending(sid, "plan")
+
+        self.assert_visible(alice, sid)
+        self.assert_hidden(alice, self.cli)  # CLI sessions have no owner: reviewers and admins only
+        s, _, _ = alice.get("/out/cli_only.csv")
+        self.assertEqual(s, 404)
+
+        self.assert_hidden(bob, sid)
+        self.assert_hidden(bob, self.cli)
+        s, _, inbox = bob.get("/approvals")
+        self.assertNotIn("alice private reconcile", inbox)
+        self.assertNotIn('Approvals<span class="count">', bob.get("/")[2])
+        self.assertIn('Approvals<span class="count">1</span>', rita.get("/")[2])
+        s, _, _ = bob.get("/out/cli_only.csv")
+        self.assertEqual(s, 404)
+
+        # The reviewer sees alice's session while it has an approval they can decide, and CLI sessions.
+        self.assert_visible(rita, sid)
+        self.assert_visible(rita, self.cli)
+        self.assertIn("alice private reconcile", rita.get("/approvals")[2])
+        s, _, data = rita.get("/out/cli_only.csv")
+        self.assertEqual((s, data), (200, "a,b\n1,2\n"))
+
+        self.assert_visible(ada, sid)
+        self.assert_visible(ada, self.cli)
+
+        s, h, _ = rita.post(f"/approvals/{plan.id}", {"csrf": rita.csrf("/approvals"), "decision": "reject", "back": "session"})
+        self.assertEqual(h["Location"], "/approvals?m=rejected")  # the session is no longer theirs to see
+        self.finished(sid)
+        self.assert_hidden(rita, sid)
+        self.assert_visible(rita, self.cli)
+        self.assert_visible(alice, sid)
+        self.assert_hidden(bob, sid)
+        self.assert_visible(ada, sid)
+        # The decision history stays readable by the owner, not by other analysts.
+        self.assertIn(sid, alice.get("/approvals")[2])
+        self.assertNotIn(sid, bob.get("/approvals")[2])
+        log = (self.s.workspace_root / "portal_audit" / "portal" / "events.jsonl").read_text(encoding="utf-8")
+        self.assertIn('"session_hidden"', log)
+
+    def test_reviewer_and_admin_see_own_runs(self):
+        rita, ada = self.client("rita"), self.client("ada")
+        sid = self.start_task(rita)
+        plan = self.pending(sid, "plan")
+        rita.post(f"/approvals/{plan.id}", {"csrf": rita.csrf("/approvals"), "decision": "reject"})
+        self.finished(sid)
+        self.assert_visible(rita, sid)  # own session, nothing pending
+        self.assert_visible(ada, sid)
+        self.assert_hidden(self.client("alice"), sid)
 
 
 # --------------------------------------------------------------------------- playbook review
@@ -464,7 +779,9 @@ class AuthModeTests(unittest.TestCase):
         s = Signer(secrets.token_bytes(32))
         tok = s.sign({"u": "a", "exp": time.time() + 60})
         self.assertEqual(s.unsign(tok)["u"], "a")
-        self.assertIsNone(s.unsign(tok[:-1] + ("A" if tok[-1] != "A" else "B")))
+        for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_":
+            if c != tok[-1]:
+                self.assertIsNone(s.unsign(tok[:-1] + c), c)  # every other last character is rejected
         self.assertIsNone(Signer(secrets.token_bytes(32)).unsign(tok))
         self.assertIsNone(s.unsign(s.sign({"u": "a", "exp": time.time() - 1})))
 

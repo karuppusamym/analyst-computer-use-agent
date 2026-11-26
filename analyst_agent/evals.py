@@ -171,8 +171,21 @@ def _g_audit_event_count(c: dict, base: Path, run: RunView) -> CheckOutcome:
 def _g_questions_mention(c: dict, base: Path, run: RunView) -> CheckOutcome:
     questions = run.result.questions if run.result else []
     needles = c["text"] if isinstance(c["text"], list) else [c["text"]]
-    missing = [t for t in needles if not any(t in q for q in questions)]
-    return CheckOutcome(f"questions mention {needles}", not missing, f"questions={questions}")
+    # A real model words its questions naturally ("which date range?"), so a parameter also counts
+    # as asked for when the orchestrator recorded it as missing or invalid before asking.
+    asked: set[str] = set()
+    events = run.session_dir / "events.jsonl"
+    if events.exists():
+        for line in events.read_text(encoding="utf-8").splitlines():
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if e.get("kind") in ("params_missing", "params_invalid"):
+                p = e.get("params") or []
+                asked.update(p if isinstance(p, list) else list(p))
+    missing = [t for t in needles if t not in asked and not any(t in q for q in questions)]
+    return CheckOutcome(f"questions mention {needles}", not missing, f"questions={questions} recorded={sorted(asked)}")
 
 
 EVAL_GRADERS: dict[str, Callable[[dict, Path, RunView], CheckOutcome]] = {

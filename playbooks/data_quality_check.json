@@ -21,7 +21,8 @@
     "as_of": {
       "type": "string",
       "default": "2026-11-30",
-      "description": "signup dates after this are invalid"
+      "description": "signup dates after this are invalid",
+      "format": "date"
     }
   },
   "steps": [

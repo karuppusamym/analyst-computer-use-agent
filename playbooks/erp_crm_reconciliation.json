@@ -6,10 +6,23 @@
   "approver": "finance-team-lead",
   "workflow": "reconcile ERP CRM exports mismatches",
   "description": "Reconcile the ERP invoice export against the CRM export for a period, list every mismatch, write a short summary and draft an email to the team lead.",
-  "permissions": {"data_class": "internal", "apps": [], "hosts": []},
+  "permissions": {
+    "data_class": "internal",
+    "apps": [],
+    "hosts": []
+  },
   "parameters": {
-    "period": {"type": "string", "required": true, "description": "YYYY-MM, e.g. 2026-10"},
-    "recipient": {"type": "string", "default": "finance-lead@example.com"}
+    "period": {
+      "type": "string",
+      "required": true,
+      "description": "YYYY-MM, e.g. 2026-10",
+      "format": "month"
+    },
+    "recipient": {
+      "type": "string",
+      "default": "finance-lead@example.com",
+      "format": "email"
+    }
   },
   "steps": [
     {
@@ -21,8 +34,16 @@
         "code": "import csv, json, os\nperiod = PARAMS['period']\nsrc = INPUT_DIRS[0]\nfiles = {'erp': os.path.join(src, f'erp_export_{period}.csv'), 'crm': os.path.join(src, f'crm_export_{period}.csv')}\nneed = {'erp': {'invoice_id', 'customer', 'amount'}, 'crm': {'invoice_id', 'account_name', 'amount'}}\nprofile = {'ok': True, 'period': period}\nfor k, p in files.items():\n    if not os.path.exists(p):\n        profile['ok'] = False; profile[k] = 'missing'; continue\n    with open(p, newline='', encoding='utf-8-sig') as f:\n        r = csv.DictReader(f); rows = list(r)\n    missing = sorted(need[k] - set(r.fieldnames or []))\n    profile[k] = {'rows': len(rows), 'missing_columns': missing, 'total': round(sum(float(x['amount']) for x in rows), 2) if not missing else None}\n    if missing: profile['ok'] = False\nopen(os.path.join(OUTPUT_DIR, f'input_profile_{period}.json'), 'w').write(json.dumps(profile, indent=1))\nprint(json.dumps(profile))\n"
       },
       "checks": [
-        {"type": "file_exists", "path": "output/input_profile_{period}.json"},
-        {"type": "json_field_equals", "path": "output/input_profile_{period}.json", "field": "ok", "value": true}
+        {
+          "type": "file_exists",
+          "path": "output/input_profile_{period}.json"
+        },
+        {
+          "type": "json_field_equals",
+          "path": "output/input_profile_{period}.json",
+          "field": "ok",
+          "value": true
+        }
       ]
     },
     {
@@ -34,9 +55,24 @@
         "code": "import csv, json, os\nperiod = PARAMS['period']\nsrc = INPUT_DIRS[0]\ndef load(name):\n    with open(os.path.join(src, f'{name}_export_{period}.csv'), newline='', encoding='utf-8-sig') as f:\n        return {r['invoice_id']: r for r in csv.DictReader(f)}\nerp, crm = load('erp'), load('crm')\nnorm = lambda s: ' '.join(s.upper().replace(' INC', '').split())\nout = []\nfor inv in sorted(set(erp) | set(crm)):\n    e, c = erp.get(inv), crm.get(inv)\n    if e is None: out.append([inv, 'missing_in_erp', '', c['amount'], '', c['account_name']]); continue\n    if c is None: out.append([inv, 'missing_in_crm', e['amount'], '', e['customer'], '']); continue\n    if abs(float(e['amount']) - float(c['amount'])) > 0.005: out.append([inv, 'amount_differs', e['amount'], c['amount'], e['customer'], c['account_name']])\n    elif e['customer'] != c['account_name']: out.append([inv, 'customer_differs', e['amount'], c['amount'], e['customer'], c['account_name']])\npath = os.path.join(OUTPUT_DIR, f'mismatches_{period}.csv')\nwith open(path, 'w', newline='', encoding='utf-8') as f:\n    w = csv.writer(f); w.writerow(['invoice_id', 'issue', 'erp_amount', 'crm_amount', 'erp_customer', 'crm_customer']); w.writerows(out)\nsummary = {'period': period, 'mismatches': len(out), 'erp_rows': len(erp), 'crm_rows': len(crm), 'by_issue': {}}\nfor row in out: summary['by_issue'][row[1]] = summary['by_issue'].get(row[1], 0) + 1\nsummary['erp_total'] = round(sum(float(r['amount']) for r in erp.values()), 2)\nsummary['crm_total'] = round(sum(float(r['amount']) for r in crm.values()), 2)\nopen(os.path.join(OUTPUT_DIR, f'recon_summary_{period}.json'), 'w').write(json.dumps(summary, indent=1))\nprint(json.dumps(summary))\n"
       },
       "checks": [
-        {"type": "file_exists", "path": "output/mismatches_{period}.csv"},
-        {"type": "csv_has_columns", "path": "output/mismatches_{period}.csv", "columns": ["invoice_id", "issue", "erp_amount", "crm_amount"]},
-        {"type": "file_exists", "path": "output/recon_summary_{period}.json"}
+        {
+          "type": "file_exists",
+          "path": "output/mismatches_{period}.csv"
+        },
+        {
+          "type": "csv_has_columns",
+          "path": "output/mismatches_{period}.csv",
+          "columns": [
+            "invoice_id",
+            "issue",
+            "erp_amount",
+            "crm_amount"
+          ]
+        },
+        {
+          "type": "file_exists",
+          "path": "output/recon_summary_{period}.json"
+        }
       ]
     },
     {
@@ -49,8 +85,19 @@
         "code": "import json, os\nperiod = PARAMS['period']\ns = json.load(open(os.path.join(OUTPUT_DIR, f'recon_summary_{period}.json')))\nlabels = {'amount_differs': 'amount differs', 'customer_differs': 'customer name differs', 'missing_in_crm': 'missing in CRM', 'missing_in_erp': 'missing in ERP'}\nlines = [f'# ERP vs CRM reconciliation, {period}', '', f\"{s['mismatches']} mismatches between {s['erp_rows']} ERP and {s['crm_rows']} CRM invoices.\", '']\nlines += [f'- {labels.get(k, k)}: {v}' for k, v in sorted(s['by_issue'].items())]\nlines += ['', f\"ERP total {s['erp_total']:,.2f}; CRM total {s['crm_total']:,.2f}; difference {s['erp_total'] - s['crm_total']:,.2f}.\", '', f'Details: mismatches_{period}.csv']\nopen(os.path.join(OUTPUT_DIR, f'recon_note_{period}.md'), 'w', encoding='utf-8').write('\\n'.join(lines))\nprint('\\n'.join(lines))\n"
       },
       "checks": [
-        {"type": "file_exists", "path": "output/recon_note_{period}.md"},
-        {"type": "text_contains", "path": "output/recon_note_{period}.md", "text": ["mismatches", "ERP total", "CRM total"]}
+        {
+          "type": "file_exists",
+          "path": "output/recon_note_{period}.md"
+        },
+        {
+          "type": "text_contains",
+          "path": "output/recon_note_{period}.md",
+          "text": [
+            "mismatches",
+            "ERP total",
+            "CRM total"
+          ]
+        }
       ]
     },
     {
@@ -63,20 +110,34 @@
         "kind": "tool",
         "tool": "draft_email",
         "input": {
-          "to": ["{recipient}"],
+          "to": [
+            "{recipient}"
+          ],
           "subject": "ERP vs CRM reconciliation {period}",
           "body": "Hi,\n\nThe reconciliation for {period} is ready. The summary is in recon_note_{period}.md and every mismatch is listed in the attached CSV.\n\nThis draft was prepared by the analyst agent and checked before sending.",
-          "attachments": ["workspace/output/mismatches_{period}.csv", "workspace/output/recon_note_{period}.md"],
+          "attachments": [
+            "workspace/output/mismatches_{period}.csv",
+            "workspace/output/recon_note_{period}.md"
+          ],
           "name": "draft-email-{period}"
         }
       },
       "checks": [
-        {"type": "file_exists", "path": "output/outbox/draft-email-{period}.eml"}
+        {
+          "type": "file_exists",
+          "path": "output/outbox/draft-email-{period}.eml"
+        }
       ]
     }
   ],
   "final_checks": [
-    {"type": "file_exists", "path": "output/mismatches_{period}.csv"},
-    {"type": "file_exists", "path": "output/recon_note_{period}.md"}
+    {
+      "type": "file_exists",
+      "path": "output/mismatches_{period}.csv"
+    },
+    {
+      "type": "file_exists",
+      "path": "output/recon_note_{period}.md"
+    }
   ]
 }

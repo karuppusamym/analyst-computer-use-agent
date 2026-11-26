@@ -17,6 +17,20 @@ from types import SimpleNamespace
 from unittest import mock
 
 from analyst_agent import scheduler
+
+
+def _have_tzdata() -> bool:
+    try:
+        from zoneinfo import ZoneInfo
+
+        ZoneInfo("America/New_York")
+        return True
+    except Exception:  # Windows without the tzdata package has no IANA zones
+        return False
+
+
+HAVE_TZDATA = _have_tzdata()
+needs_tzdata = unittest.skipUnless(HAVE_TZDATA, "no IANA time zones (pip install tzdata)")
 from analyst_agent.__main__ import main
 from analyst_agent.scheduler import (
     CronError,
@@ -146,6 +160,7 @@ class NextFireTests(unittest.TestCase):
                 continue
             self.assertEqual(c.next_after(start, UTC), expected, expr)
 
+    @needs_tzdata
     def test_timezone_wall_clock(self):
         from zoneinfo import ZoneInfo
 
@@ -155,6 +170,7 @@ class NextFireTests(unittest.TestCase):
         self.assertEqual((got.hour, got.day, got.month), (7, 2, 12))
         self.assertEqual(got.astimezone(UTC), utc(2026, 12, 2, 12))
 
+    @needs_tzdata
     def test_dst_gap_and_repeat(self):
         from zoneinfo import ZoneInfo
 
@@ -201,6 +217,7 @@ class MacroAndZoneTests(unittest.TestCase):
         with self.assertRaisesRegex(ScheduleError, "unknown date macro"):
             resolve_params({"p": "{{next_year}}"}, date(2026, 1, 1))
 
+    @needs_tzdata
     def test_resolve_tz(self):
         self.assertEqual(resolve_tz("UTC")[0], UTC)
         self.assertEqual(resolve_tz("local")[1], "")
@@ -322,6 +339,7 @@ class RunDueTests(unittest.TestCase):
         self.assertEqual(len(self.due(utc(2027, 3, 2, 7))), 1)
         self.assertEqual(self.fired[-1], ("recon", {"period": "2027-02"}))
 
+    @needs_tzdata
     def test_timezone_of_schedule_is_used(self):
         self.write(self.entry(timezone="America/New_York"))
         self.assertEqual(self.due(utc(2026, 11, 2, 7, 30)), [])  # 07:00 New York is 12:00 UTC
@@ -400,7 +418,10 @@ class CliTests(unittest.TestCase):
         code, out = self.run_cli("schedule", "add", "monthly", "--playbook", "erp-crm-reconciliation", "--cron", "0 7 2 * *")
         self.assertEqual(code, 1)
         self.assertIn("exists", out)
-        for bad in (["--cron", "0 7 31 2 *"], ["--cron", "@daily", "--param", "p={{nope}}"], ["--cron", "@daily", "--tz", "Mars/Base"]):
+        bads = [["--cron", "0 7 31 2 *"], ["--cron", "@daily", "--param", "p={{nope}}"]]
+        if HAVE_TZDATA:  # without zone data an unknown zone can't be told apart; it warns and uses local time
+            bads.append(["--cron", "@daily", "--tz", "Mars/Base"])
+        for bad in bads:
             code, out = self.run_cli("schedule", "add", "x", "--playbook", "erp-crm-reconciliation", *bad)
             self.assertEqual(code, 1, out)
         code, out = self.run_cli("schedule", "add", "x", "--playbook", "no-such-playbook", "--cron", "@daily")
@@ -409,7 +430,12 @@ class CliTests(unittest.TestCase):
         self.assertIn("monthly", out)
         self.assertIn("next=", out)
         code, out = self.run_cli("schedule", "run-due", "--now", "2026-11-24T10:00:00Z")
-        self.assertEqual((code, out.strip()), (0, "nothing due"))
+        lines = out.strip().splitlines()
+        self.assertEqual((code, lines[-1]), (0, "nothing due"))
+        if not HAVE_TZDATA:  # the only other output is the missing-zone warning
+            self.assertTrue(all("install tzdata" in x for x in lines[:-1]), out)
+        else:
+            self.assertEqual(len(lines), 1, out)
         code, out = self.run_cli("schedule", "remove", "monthly")
         self.assertEqual(code, 0)
         self.assertEqual(json.loads((self.ws.root / "config" / "schedules.json").read_text())["schedules"], [])

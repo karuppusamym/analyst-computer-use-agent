@@ -15,11 +15,13 @@
     "period": {
       "type": "string",
       "required": true,
-      "description": "YYYY-MM"
+      "description": "YYYY-MM",
+      "format": "month"
     },
     "recipient": {
       "type": "string",
-      "default": "ap-manager@example.com"
+      "default": "ap-manager@example.com",
+      "format": "email"
     }
   },
   "steps": [

@@ -15,21 +15,25 @@
     "period": {
       "type": "string",
       "required": true,
-      "description": "YYYY-MM, e.g. 2026-10"
+      "description": "YYYY-MM, e.g. 2026-10",
+      "format": "month"
     },
     "threshold_pct": {
       "type": "number",
       "default": 10,
-      "description": "flag when |variance| >= this percent of budget"
+      "description": "flag when |variance| >= this percent of budget",
+      "format": "number"
     },
     "threshold_abs": {
       "type": "number",
       "default": 1000,
-      "description": "and |variance| >= this amount"
+      "description": "and |variance| >= this amount",
+      "format": "number"
     },
     "recipient": {
       "type": "string",
-      "default": "fpa-lead@example.com"
+      "default": "fpa-lead@example.com",
+      "format": "email"
     }
   },
   "steps": [

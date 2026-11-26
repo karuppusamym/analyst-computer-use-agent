@@ -5,11 +5,26 @@
   "backup_owner": "sales-team-lead",
   "workflow": "warehouse question revenue churn by region quarter",
   "description": "Answer an ad-hoc warehouse question: revenue, orders and churn by region for a date range, saved as a CSV.",
-  "permissions": {"data_class": "internal"},
+  "permissions": {
+    "data_class": "internal"
+  },
   "parameters": {
-    "start_date": {"type": "string", "required": true, "description": "YYYY-MM-DD"},
-    "end_date": {"type": "string", "required": true, "description": "YYYY-MM-DD, inclusive"},
-    "label": {"type": "string", "default": "range"}
+    "start_date": {
+      "type": "string",
+      "required": true,
+      "description": "YYYY-MM-DD",
+      "format": "date"
+    },
+    "end_date": {
+      "type": "string",
+      "required": true,
+      "description": "YYYY-MM-DD, inclusive",
+      "format": "date"
+    },
+    "label": {
+      "type": "string",
+      "default": "range"
+    }
   },
   "steps": [
     {
@@ -26,13 +41,33 @@
         }
       },
       "checks": [
-        {"type": "file_exists", "path": "output/region_{label}.csv"},
-        {"type": "csv_has_columns", "path": "output/region_{label}.csv", "columns": ["region", "orders", "revenue", "churn_pct"]},
-        {"type": "csv_rows", "path": "output/region_{label}.csv", "min": 1, "max": 4}
+        {
+          "type": "file_exists",
+          "path": "output/region_{label}.csv"
+        },
+        {
+          "type": "csv_has_columns",
+          "path": "output/region_{label}.csv",
+          "columns": [
+            "region",
+            "orders",
+            "revenue",
+            "churn_pct"
+          ]
+        },
+        {
+          "type": "csv_rows",
+          "path": "output/region_{label}.csv",
+          "min": 1,
+          "max": 4
+        }
       ]
     }
   ],
   "final_checks": [
-    {"type": "file_exists", "path": "output/region_{label}.csv"}
+    {
+      "type": "file_exists",
+      "path": "output/region_{label}.csv"
+    }
   ]
 }

@@ -83,6 +83,30 @@ class PolicyAndChecksTests(Base):
         self.assertTrue(p.needs_approval("send"))
         self.assertFalse(p.needs_approval(None))
 
+    def test_short_8dot3_roots_match_long_paths(self):
+        """CI runners hand out TEMP as C:\\Users\\RUNNER~1\\...; roots given that way must still
+        contain the long-name path a tool resolves to (and the vault stays denied)."""
+        import ctypes
+        import os
+
+        if os.name != "nt":
+            self.skipTest("8.3 short names are Windows only")
+        long_dir = self.ws.root / "a_long_folder_name_for_short_names"
+        (long_dir / "workspace" / "output").mkdir(parents=True)
+        buf = ctypes.create_unicode_buffer(1024)
+        ctypes.windll.kernel32.GetShortPathNameW(str(long_dir), buf, 1024)
+        short = buf.value
+        if not short or Path(short).name.lower() == long_dir.name.lower():
+            self.skipTest("8.3 short names are disabled on this volume")
+        from analyst_agent.config import load_settings
+
+        s = load_settings(overrides={"workspace": {"root": short + "\\workspace", "input_dirs": [short + "\\workspace"], "output_dir": short + "\\workspace\\output"}, "vault": {"path": short + "\\workspace\\vault"}})
+        p = PolicyEngine(s)
+        p.check_path(long_dir / "workspace" / "output" / "x.csv", write=True)
+        p.check_path(Path(short) / "workspace" / "output" / "x.csv", write=True)
+        with self.assertRaises(PolicyViolation):
+            p.check_path(long_dir / "workspace" / "vault" / "vault.json")
+
     def test_read_file_wraps_untrusted(self):
         ctx = ToolContext(self.s, PolicyEngine(self.s), AuditLog(self.s.audit_dir), UnattendedApprover())
         out = ConnectorTier(self.s).execute({"name": "read_file", "input": {"path": str(self.ws.root / "samples" / "crm_export_2026-10.csv")}}, ctx)

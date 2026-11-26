@@ -9,6 +9,11 @@ Definitions live in config/schedules.json (settings `schedules.path`):
                   "timezone": "Europe/London", "enabled": true, "owner": "finance-analytics",
                   "notify": "workspace/output/schedule-notes/monthly-recon.md"}]}
 
+A built-in job instead of a playbook: {"id": "vault-daily", "kind": "vault_check",
+"cron": "0 6 * * *", "params": {"warn_days": 7}} runs the `vault check` logic (metadata
+only, never values). Expired or overdue secrets make a "failed" history entry and
+audit events; nothing is rotated, here or on any target system.
+
 run-due fires every schedule whose next time has passed, UNATTENDED: approvals are
 declined and reported (UnattendedApprover; nothing is auto-approved). A lock file
 stops overlapping runs. A missed slot runs once, never a catch-up series.
@@ -278,6 +283,9 @@ class ScheduleError(ValueError):
     pass
 
 
+KINDS = ("playbook", "vault_check")
+
+
 @dataclass
 class Schedule:
     id: str
@@ -290,6 +298,11 @@ class Schedule:
     notify: str = ""
     request: str = ""
     created_at: str = ""
+    kind: str = "playbook"  # or "vault_check" (built-in job, no playbook)
+
+    @property
+    def label(self) -> str:
+        return self.playbook if self.kind == "playbook" else f"[{self.kind}]"
 
     @property
     def expr(self) -> CronExpr:
@@ -300,6 +313,10 @@ class Schedule:
         for k in ("notify", "request", "created_at"):
             if getattr(self, k):
                 d[k] = getattr(self, k)
+        if self.kind != "playbook":  # playbook entries keep their exact old shape
+            d["kind"] = self.kind
+            if not self.playbook:
+                d.pop("playbook")
         return d
 
 
@@ -309,7 +326,10 @@ _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,80}")
 def schedule_from_dict(d: dict) -> Schedule:
     if not isinstance(d, dict):
         raise ScheduleError("schedule entry must be an object")
-    for key in ("id", "playbook", "cron"):
+    kind = str(d.get("kind") or "playbook")
+    if kind not in KINDS:
+        raise ScheduleError(f"{d.get('id')}: unknown kind {kind!r} (use {', '.join(KINDS)})")
+    for key in ("id", "cron") + (("playbook",) if kind == "playbook" else ()):
         if not d.get(key):
             raise ScheduleError(f"schedule entry is missing '{key}': {d}")
     if not _ID_RE.fullmatch(str(d["id"])):
@@ -317,15 +337,33 @@ def schedule_from_dict(d: dict) -> Schedule:
     if not isinstance(d.get("params", {}), dict):
         raise ScheduleError(f"{d['id']}: params must be an object")
     s = Schedule(
-        id=str(d["id"]), playbook=str(d["playbook"]), cron=str(d["cron"]), params=dict(d.get("params") or {}),
+        id=str(d["id"]), playbook=str(d.get("playbook") or ""), cron=str(d["cron"]), params=dict(d.get("params") or {}),
         timezone=str(d.get("timezone") or "local"), enabled=bool(d.get("enabled", True)), owner=str(d.get("owner", "")),
-        notify=str(d.get("notify") or ""), request=str(d.get("request") or ""), created_at=str(d.get("created_at") or ""),
+        notify=str(d.get("notify") or ""), request=str(d.get("request") or ""), created_at=str(d.get("created_at") or ""), kind=kind,
     )
+    if kind == "vault_check":
+        if s.playbook:
+            raise ScheduleError(f"{s.id}: a vault_check schedule runs no playbook; remove 'playbook'")
+        try:
+            warn_days(s)
+        except ValueError as e:
+            raise ScheduleError(f"{s.id}: {e}") from e
     try:
         s.expr
     except CronError as e:
         raise ScheduleError(f"{s.id}: {e}") from e
     return s
+
+
+def warn_days(s: Schedule) -> float:
+    v = s.params.get("warn_days", 7)
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"params.warn_days {v!r} is not a number") from None
+    if not 0 <= f <= 3650:
+        raise ValueError(f"params.warn_days {v!r} must be between 0 and 3650")
+    return f
 
 
 def load_schedules(path: Path) -> list[Schedule]:
@@ -468,13 +506,49 @@ def default_runner(settings: Settings, playbooks_dir: Path, knowledge_dir: Path 
         from .orchestrator import Orchestrator
         from .policy import UnattendedApprover
 
-        orch = Orchestrator(settings, approver=UnattendedApprover(), user=f"schedule:{schedule.owner or schedule.id}", ask=None, knowledge_dir=knowledge_dir, require_plan_approval=False)
+        orch = Orchestrator(settings, approver=UnattendedApprover(), user=f"schedule:{schedule.owner or schedule.id}", ask=None, knowledge_dir=knowledge_dir, require_plan_approval=False, user_source="schedule")
         try:
             return orch.run(schedule.request or f"Scheduled run '{schedule.id}' of {playbook.name}", playbook=playbook, params=params)
         finally:
             orch.router.close()
 
     return run
+
+
+def run_vault_check(settings: Settings, schedule: Schedule, vault_factory: Callable | None = None) -> dict:
+    """The built-in vault_check job: `vault check` on the configured store, metadata only.
+
+    Returns the history fields: status "success" (nothing expired or overdue), "failed"
+    (some are: a failing entry) or "error" (the store could not be read), the audit
+    session, and per-secret status for every secret that is not ok. Never reads a value
+    and never rotates anything."""
+    from .audit import AuditLog
+    from .vault import FAILING_STATUSES, VaultError, check_secrets, open_vault
+
+    days = warn_days(schedule)
+    audit = AuditLog(settings.audit_dir, user=f"schedule:{schedule.owner or schedule.id}")
+    out: dict[str, Any] = {"session_id": audit.session_id, "params": {"warn_days": days}}
+    try:
+        vault = (vault_factory or open_vault)(settings)
+        rows = check_secrets(vault, time.time(), days)
+    except (VaultError, OSError, ValueError) as e:
+        audit.event("vault_check", schedule=schedule.id, status="error", error=str(e)[:300])
+        return {**out, "status": "error", "error": f"vault check failed: {e}"}
+    flagged = [{"name": m.name, "status": st, "detail": detail} for m, st, detail in rows if st != "ok"]
+    for f in flagged:
+        if f["status"] == "expired":
+            audit.event("secret_expired", name=f["name"], detail=f["detail"], schedule=schedule.id, source="vault_check")
+        elif f["status"] == "rotate-due":
+            audit.event("secret_rotation_due", name=f["name"], detail=f["detail"], schedule=schedule.id, source="vault_check")
+    bad = [f for f in flagged if f["status"] in FAILING_STATUSES]
+    status = "failed" if bad else "success"
+    audit.event("vault_check", schedule=schedule.id, status=status, backend=vault.backend, checked=len(rows),
+                expired=sum(f["status"] == "expired" for f in flagged), rotate_due=sum(f["status"] == "rotate-due" for f in flagged),
+                rotate_soon=sum(f["status"] == "rotate-soon" for f in flagged))
+    out.update(status=status, backend=vault.backend, checked=len(rows), secrets=flagged)
+    if bad:
+        out["error"] = f"{len(bad)} secret(s) expired or due for rotation: " + ", ".join(f"{f['name']} ({f['status']})" for f in bad)
+    return out
 
 
 def _notify(settings: Settings, schedule: Schedule, record: dict, result) -> str:
@@ -487,7 +561,7 @@ def _notify(settings: Settings, schedule: Schedule, record: dict, result) -> str
     lines = [
         f"# Scheduled run: {schedule.id}",
         "",
-        f"- playbook: {schedule.playbook}",
+        f"- playbook: {schedule.label}",
         f"- scheduled for: {record['scheduled_for']}",
         f"- fired at: {record['fired_at']}",
         f"- status: {record['status']}",
@@ -498,6 +572,9 @@ def _notify(settings: Settings, schedule: Schedule, record: dict, result) -> str
         lines.append(f"- missed slots: ran once for the latest slot (first missed {record['first_missed']})")
     if record.get("error"):
         lines.append(f"- error: {record['error']}")
+    if record.get("kind") == "vault_check":
+        lines += ["", f"Secrets checked: {record.get('checked', '?')} ({record.get('backend', '?')} backend)"]
+        lines += [f"- {x['name']}: {x['status']}" + (f" ({x['detail']})" if x.get("detail") else "") for x in record.get("secrets") or []]
     if result is not None:
         if getattr(result, "report_path", ""):
             lines.append(f"- report: {result.report_path}")
@@ -509,8 +586,10 @@ def _notify(settings: Settings, schedule: Schedule, record: dict, result) -> str
     return str(path)
 
 
-def run_due(settings: Settings, playbooks_dir: Path, now: datetime | None = None, runner: Callable | None = None, knowledge_dir: Path | None = None, log: Callable[[str], None] = print) -> list[dict]:
-    """Fire every enabled schedule that is due at `now`. Returns the history records written."""
+def run_due(settings: Settings, playbooks_dir: Path, now: datetime | None = None, runner: Callable | None = None, knowledge_dir: Path | None = None, log: Callable[[str], None] = print,
+            vault_factory: Callable | None = None) -> list[dict]:
+    """Fire every enabled schedule that is due at `now`. Returns the history records written.
+    vault_factory(settings) opens the store for vault_check jobs (default: vault.open_vault)."""
     from .playbook import PlaybookError, PlaybookRegistry
 
     store = ScheduleStore(settings)
@@ -567,23 +646,31 @@ def run_due(settings: Settings, playbooks_dir: Path, now: datetime | None = None
             if missed:
                 record["first_missed"] = _iso(first.astimezone(tz))
             result = None
-            try:
-                params = resolve_params(sch.params, local_slot.date())
-                record["params"] = params
-                pb = registry.get(sch.playbook)
-                pb.bind(params)  # missing parameters fail here; nobody is present to answer questions
-                log(f"{sch.id}: firing {pb.name} for {record['scheduled_for']}" + (" (missed slots: running once)" if missed else ""))
-                result = runner(sch, pb, params)
-                record["session_id"] = result.session_id
-                record["status"] = result.status
-                record["steps"] = {r.step.id: r.status for r in result.records}
-                if result.report_path:
-                    record["report"] = result.report_path
-            except (PlaybookError, ScheduleError) as e:
-                record["status"] = "invalid"
-                record["error"] = str(e)
-            except Exception as e:  # a broken run is recorded, never retried in a loop
-                record["error"] = f"{type(e).__name__}: {e}"
+            if sch.kind == "vault_check":
+                record["kind"] = sch.kind
+                log(f"{sch.id}: checking the vault for {record['scheduled_for']}" + (" (missed slots: running once)" if missed else ""))
+                try:
+                    record.update(run_vault_check(settings, sch, vault_factory))
+                except Exception as e:  # a broken check is recorded, never retried in a loop
+                    record["error"] = f"{type(e).__name__}: {e}"
+            else:
+                try:
+                    params = resolve_params(sch.params, local_slot.date())
+                    record["params"] = params
+                    pb = registry.get(sch.playbook)
+                    pb.bind(params)  # missing parameters fail here; nobody is present to answer questions
+                    log(f"{sch.id}: firing {pb.name} for {record['scheduled_for']}" + (" (missed slots: running once)" if missed else ""))
+                    result = runner(sch, pb, params)
+                    record["session_id"] = result.session_id
+                    record["status"] = result.status
+                    record["steps"] = {r.step.id: r.status for r in result.records}
+                    if result.report_path:
+                        record["report"] = result.report_path
+                except (PlaybookError, ScheduleError) as e:
+                    record["status"] = "invalid"
+                    record["error"] = str(e)
+                except Exception as e:  # a broken run is recorded, never retried in a loop
+                    record["error"] = f"{type(e).__name__}: {e}"
             if sch.notify:
                 record["notify"] = _notify(settings, sch, record, result)
             store.append_history(record)
@@ -618,7 +705,10 @@ def add_cli(sub) -> None:
     ss.add_parser("list", help="list schedules with their next fire time")
     a = ss.add_parser("add", help="add a schedule")
     a.add_argument("id")
-    a.add_argument("--playbook", required=True)
+    what = a.add_mutually_exclusive_group(required=True)
+    what.add_argument("--playbook")
+    what.add_argument("--vault-check", action="store_true", help="built-in job: run `vault check` (metadata only); expired or overdue secrets fail the entry")
+    a.add_argument("--warn-days", type=float, help="with --vault-check: report rotate-soon this many days ahead (default 7)")
     a.add_argument("--cron", required=True, help='5 fields, e.g. "0 7 2 * *" (07:00 on the 2nd)')
     a.add_argument("--tz", default="local", help="IANA time zone, e.g. Europe/London (default: local)")
     a.add_argument("--param", action="append", default=[], help="name=value; date macros like {{prev_month}} resolve at fire time")
@@ -671,7 +761,7 @@ def cli(args, settings: Settings, root: Path) -> int:
                 print(f"no schedules in {store.path}")
             for sch, nxt, note in rows:
                 st = state.get(sch.id, {})
-                print(f"{sch.id:<24} {'on ' if sch.enabled else 'off'} {sch.cron!r:<18} {sch.timezone:<16} {sch.playbook:<26} next={_iso(nxt) if nxt and sch.enabled else '-':<26} last={st.get('last_status', '-')} {st.get('last_fired_at', '')}")
+                print(f"{sch.id:<24} {'on ' if sch.enabled else 'off'} {sch.cron!r:<18} {sch.timezone:<16} {sch.label:<26} next={_iso(nxt) if nxt and sch.enabled else '-':<26} last={st.get('last_status', '-')} {st.get('last_fired_at', '')}")
                 if note:
                     print(f"    note: {note}")
             return 0
@@ -680,15 +770,27 @@ def cli(args, settings: Settings, root: Path) -> int:
             if any(s.id == args.id for s in schedules) and not args.force:
                 print(f"error: schedule {args.id} exists (use --force to replace)")
                 return 1
-            try:
-                PlaybookRegistry(playbooks).get(args.playbook)
-            except PlaybookError as e:
-                print(f"error: {e}")
-                return 1
+            if args.vault_check:
+                if args.param:
+                    print("error: --param is for playbooks; use --warn-days with --vault-check")
+                    return 1
+                kind, params = "vault_check", ({"warn_days": args.warn_days} if args.warn_days is not None else {})
+            else:
+                if args.warn_days is not None:
+                    print("error: --warn-days needs --vault-check")
+                    return 1
+                try:
+                    PlaybookRegistry(playbooks).get(args.playbook)
+                except PlaybookError as e:
+                    print(f"error: {e}")
+                    return 1
+                kind, params = "playbook", dict(p.split("=", 1) for p in args.param)
+                resolve_params(params, date.today())  # rejects unknown macros now, not at 7am
             tz, warn = resolve_tz(args.tz)
-            params = dict(p.split("=", 1) for p in args.param)
-            resolve_params(params, date.today())  # rejects unknown macros now, not at 7am
-            sch = schedule_from_dict({"id": args.id, "playbook": args.playbook, "cron": args.cron, "timezone": args.tz, "params": params, "owner": args.owner, "notify": args.notify, "request": args.request, "enabled": not args.disabled, "created_at": _iso(datetime.now(timezone.utc))})
+            entry = {"id": args.id, "kind": kind, "cron": args.cron, "timezone": args.tz, "params": params, "owner": args.owner, "notify": args.notify, "request": args.request, "enabled": not args.disabled, "created_at": _iso(datetime.now(timezone.utc))}
+            if not args.vault_check:
+                entry["playbook"] = args.playbook
+            sch = schedule_from_dict(entry)
             store.save([s for s in schedules if s.id != args.id] + [sch])
             print(f"added {sch.id}: next fire {_iso(sch.expr.next_after(datetime.now(timezone.utc), tz))}" + (f"  ({warn})" if warn else ""))
             return 0

@@ -53,7 +53,12 @@ DEFAULTS: dict[str, Any] = {
         "connector": {"enabled": True},
         # Code tier containment (see tools/code.py, tools/sandbox.py). cpu_s null = timeout_s.
         "code": {"enabled": True, "timeout_s": 300, "memory_mb": 1024, "max_processes": 1, "cpu_s": None,
-                 "allow_network": False, "python_guard": True, "ui_restrictions": True, "require_job": True},
+                 "allow_network": False, "python_guard": True, "ui_restrictions": True, "require_job": True,
+                 # backend "local" (Job Object + guard) or "docker" (disposable container per step, tools/docker_backend.py).
+                 # docker fails closed when unavailable unless fallback_to_local. docker_cli: path or argv prefix.
+                 "backend": "local", "fallback_to_local": False, "docker_cli": "docker",
+                 "docker": {"image": "python:3.13-slim", "pull": "if-missing", "cpus": 1.0, "pids_limit": 64, "tmpfs_mb": 64,
+                            "max_output_file_mb": 100, "max_output_total_mb": 500, "max_output_files": 2000}},
         "browser": {"enabled": True, "headless": True},
         "desktop_uia": {"enabled": False},
         # Pixel control drives a real mouse and keyboard. Only enable it inside
@@ -76,6 +81,7 @@ DEFAULTS: dict[str, Any] = {
         "max_step_retries": 1,
         "max_replans": 1,
         "task_timeout_s": 3600,
+        "takeover_timeout_s": 1800,  # a human takeover (PAUSE) not handed back by then stops the run
     },
     "connectors": {"databases": {}},
     "audit": {"dir": "./workspace/audit"},
@@ -88,6 +94,11 @@ DEFAULTS: dict[str, Any] = {
         "allowed_hosts": [],  # Host header names; empty = loopback names when bound to loopback
         "question_timeout_s": 900,
         "live_screenshots": 4,
+        "state_dir": "portal_state",  # under workspace/: pending approvals and questions, one JSON file each
+        # Human takeover from the live view (README "Portal"). Input needs tiers.desktop_pixels.enabled.
+        "takeover": {"enabled": True, "owner_analysts": True, "frame_max_width": 1280, "frame_interval_ms": 1000, "max_text": 2000},
+        # Teams: {"finance": {"members": ["alice"], "reviewers": ["rita"], "playbooks": ["erp-crm-reconciliation"]}}
+        "teams": {},
         "auth": {
             # "local" (users file), "trusted_header" (SSO reverse proxy) or "oidc".
             "mode": "local",
@@ -98,8 +109,16 @@ DEFAULTS: dict[str, Any] = {
                      "username_claim": "preferred_username", "groups_claim": "groups", "user_roles": {}, "group_roles": {}, "default_role": "analyst"},
         },
     },
-    # Credential vault (vault.py). backend: "dpapi" (Windows, current user), "env" (read-only), "keyring" (if installed).
-    "vault": {"backend": "dpapi", "path": "./workspace/vault", "env_prefix": "AGENT_SECRET_", "entropy_env": ""},
+    # Credential vault (vault.py). backend: "dpapi" (Windows, current user), "env" (read-only), "keyring" (if installed),
+    # "hashicorp" (KV v2) or "azure_keyvault" (central stores, see vault_remote.py).
+    "vault": {"backend": "dpapi", "path": "./workspace/vault", "env_prefix": "AGENT_SECRET_", "entropy_env": "",
+              # Central stores (vault_remote.py). Credentials come from the named env vars, never from this file.
+              "hashicorp": {"url": "", "mount": "secret", "path_prefix": "analyst_agent/", "namespace": "", "token_env": "VAULT_TOKEN",
+                            "role_id_env": "VAULT_ROLE_ID", "secret_id_env": "VAULT_SECRET_ID", "approle_mount": "approle",
+                            "ca_bundle": "", "verify_tls": True, "timeout_s": 10, "cache_ttl_s": 60},
+              "azure_keyvault": {"vault_url": "", "auth": "auto", "tenant_id": "", "client_id": "", "client_secret_env": "AZURE_CLIENT_SECRET",
+                                 "authority_host": "https://login.microsoftonline.com", "imds_endpoint": "http://169.254.169.254/metadata/identity/oauth2/token",
+                                 "managed_identity_client_id": "", "api_version": "7.4", "ca_bundle": "", "verify_tls": True, "timeout_s": 10, "cache_ttl_s": 60}},
     # Scheduled unattended runs (scheduler.py): definitions file and run state/history folder.
     "schedules": {"path": "./config/schedules.json", "state_dir": "./workspace/schedules", "lock_stale_s": 7200},
 }
@@ -124,8 +143,10 @@ class Settings:
         return self.data[key]
 
     def path(self, value: str) -> Path:
+        # Always resolve: on Windows a temp or profile path can arrive as an 8.3 short name
+        # (C:\Users\RUNNER~1\...), and containment checks compare resolved long names.
         p = Path(value)
-        return p if p.is_absolute() else (self.base_dir / p).resolve()
+        return (p if p.is_absolute() else self.base_dir / p).resolve()
 
     @property
     def workspace_root(self) -> Path:

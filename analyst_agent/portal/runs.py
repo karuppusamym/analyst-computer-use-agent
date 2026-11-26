@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -12,10 +13,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from ..audit import append_event
 from ..config import Settings
+from ..takeover import PAUSE_FILE, pause_info
 from ..playbook import Playbook, PlaybookError, PlaybookRegistry
 from .approvals import ApprovalInbox, QuestionBox, WebApprover
+from .state import atomic_write_json, read_json
 
+META_FILE = "portal_meta.json"
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$")
 
 
@@ -54,6 +59,21 @@ def request_stop(audit_dir: Path, session_id: str) -> bool:
     return True
 
 
+def read_meta(session_dir: Path) -> dict:
+    """portal_meta.json: who started the run in the portal (absent for CLI and scheduled runs)."""
+    m = read_json(session_dir / META_FILE)
+    return m if isinstance(m, dict) else {}
+
+
+def write_meta(session_dir: Path, meta: dict) -> None:
+    atomic_write_json(session_dir / META_FILE, meta)
+
+
+def append_session_event(session_dir: Path, kind: str, user: str = "portal", **data: Any) -> None:
+    """Append one event to a session's audit log from outside its run (e.g. an orphaned request)."""
+    append_event(session_dir, kind, user, **data)
+
+
 def read_events(session_dir: Path, limit: int | None = None) -> list[dict]:
     p = session_dir / "events.jsonl"
     if not p.exists():
@@ -70,7 +90,7 @@ def read_events(session_dir: Path, limit: int | None = None) -> list[dict]:
 
 def summarize_events(events: list[dict]) -> dict[str, Any]:
     """Rebuild request, step statuses and final status from an audit log."""
-    info: dict[str, Any] = {"request": "", "user": "", "playbook": None, "params": {}, "started": None, "status": "", "report": "", "steps": [], "approvals": []}
+    info: dict[str, Any] = {"request": "", "user": "", "playbook": None, "params": {}, "started": None, "status": "", "report": "", "steps": [], "approvals": [], "orphaned": []}
     steps: dict[str, dict] = {}
 
     def add_steps(lst):
@@ -103,6 +123,13 @@ def summarize_events(events: list[dict]) -> dict[str, Any]:
                     steps[sid]["status"] = "verified"
         elif k == "approval_decided":
             info["approvals"].append({"step": e.get("step"), "approved": e.get("approved"), "by": e.get("by"), "note": e.get("note", ""), "ts": e.get("ts")})
+        elif k in ("approval_orphaned", "question_orphaned"):
+            if k == "approval_orphaned":
+                what = f"approval for step {e.get('step')}: {e.get('summary', '')}"
+                info["approvals"].append({"step": e.get("step"), "approved": False, "by": e.get("by"), "note": e.get("note", ""), "ts": e.get("ts")})
+            else:
+                what = "clarifying questions: " + "; ".join(map(str, e.get("questions") or []))
+            info["orphaned"].append({"kind": k, "what": what, "note": e.get("note", ""), "ts": e.get("ts")})
         elif k == "needs_input":
             info["status"] = "needs_input"
         elif k == "task_failed":
@@ -137,6 +164,7 @@ class Run:
     result: Any = None
     thread: threading.Thread | None = None
     finished_at: float | None = None
+    resume: bool = False
 
     @property
     def alive(self) -> bool:
@@ -197,12 +225,112 @@ class RunManager:
         pb = self.resolve_playbook(playbook_choice, request)
         sid = new_session_id()
         run = Run(sid, request, user, pb.name if pb else None, dict(params))
+        # Owner first, so the session is never shown to the wrong people, even before its first event.
+        write_meta(self.settings.audit_dir / sid, {"owner": user, "started_by": user, "created_at": run.started_at, "source": "portal", "resumes": []})
         with self._lock:
             self.runs[sid] = run
-        t = threading.Thread(target=self._run, args=(run, pb), name=f"portal-run-{sid}", daemon=True)
+        self._launch(run, pb)
+        self.on_event("run_started", session=sid, request=request, playbook=run.playbook, by=user)
+        return run
+
+    def _launch(self, run: Run, pb: Playbook | None) -> None:
+        t = threading.Thread(target=self._run, args=(run, pb), name=f"portal-run-{run.session_id}", daemon=True)
         run.thread = t
         t.start()
-        self.on_event("run_started", session=sid, request=request, playbook=run.playbook, by=user)
+
+    def owner(self, sid: str) -> str | None:
+        """The portal user who started the session; None for CLI / scheduled sessions."""
+        if not valid_session_id(sid):
+            return None
+        owner = read_meta(self.settings.audit_dir / sid).get("owner")
+        run = self.runs.get(sid)
+        return str(owner) if owner else (run.user if run else None)
+
+    def playbook_of(self, sid: str) -> str | None:
+        """The session's playbook name (None for planner-built or unknown sessions)."""
+        run = self.runs.get(sid)
+        if run and run.playbook:
+            return run.playbook
+        if not valid_session_id(sid):
+            return None
+        for e in read_events(self.settings.audit_dir / sid):
+            if e.get("kind") == "task_started":
+                return e.get("playbook") or None
+        return None
+
+    def viewers(self, sid: str) -> list[str]:
+        """Users the owner or an admin shared this session with (portal_meta.json "viewers")."""
+        if not valid_session_id(sid):
+            return []
+        v = read_meta(self.settings.audit_dir / sid).get("viewers")
+        return [str(x) for x in v] if isinstance(v, list) else []
+
+    def set_viewers(self, sid: str, viewers: list[str]) -> None:
+        with self._lock:
+            d = self.settings.audit_dir / sid
+            meta = read_meta(d)
+            if not meta.get("owner"):
+                run = self.runs.get(sid)
+                if run:
+                    meta["owner"] = run.user
+            meta["viewers"] = sorted(dict.fromkeys(viewers))
+            d.mkdir(parents=True, exist_ok=True)
+            write_meta(d, meta)
+
+    # ---- resume (the portal's `run --resume <session>`)
+    def resume_problem(self, sid: str, info: dict | None = None) -> str:
+        """Why this session cannot be resumed, or "" if it can."""
+        d = self.settings.audit_dir / sid
+        if not valid_session_id(sid) or not (d / "checkpoint.json").is_file():
+            return "this session has no checkpoint (no step was verified yet)"
+        run = self.runs.get(sid)
+        if run and (run.alive or run.status == "starting"):
+            return "this session is still running"
+        info = info if info is not None else self.session_info(sid, _resume_check=False)
+        status = str(info.get("status") or "")
+        if status == "success":
+            return "this session already finished successfully"
+        if status.startswith("waiting"):
+            return "this session is waiting for a decision"
+        if (d / "STOP").exists():
+            return "the kill switch was pressed for this session, so it is not resumed from the portal"
+        if (d / PAUSE_FILE).exists():
+            return "a person has taken over this session; hand it back first"
+        if not info.get("request"):
+            return "the original request is not in the audit log"
+        return ""
+
+    def resume(self, sid: str, by: str) -> Run:
+        """Continue a session from its last checkpoint in a background thread.
+
+        Calls Orchestrator.run(..., session_id=sid, resume=True), as `run --resume` does:
+        verified steps are skipped and the plan goes to the approval inbox again.
+        """
+        with self._lock:
+            info = self.session_info(sid, _resume_check=False)
+            problem = self.resume_problem(sid, info)
+            if problem:
+                raise PlaybookError(problem)
+            d = self.settings.audit_dir / sid
+            cp = read_json(d / "checkpoint.json") or {}
+            params = dict(info.get("params") or {})
+            for k, v in (cp.get("params") or {}).items():
+                if "[REDACTED:" not in str(v):  # never feed a redaction marker back in as a value
+                    params.setdefault(k, v)
+            pb = None
+            if info.get("playbook"):
+                pb = next((p for p in self.runnable_playbooks() if p.name == info["playbook"]), None)
+                if pb is None:
+                    raise PlaybookError(f"the session's playbook {info['playbook']} is no longer an approved playbook")
+            meta = read_meta(d)
+            owner = meta.get("owner") or info.get("user") or by
+            run = Run(sid, info.get("request") or str(cp.get("request", "")), str(owner), pb.name if pb else None, params, resume=True)
+            if meta:
+                meta.setdefault("resumes", []).append({"by": by, "at": run.started_at})
+                write_meta(d, meta)
+            self.runs[sid] = run
+            self._launch(run, pb)
+        self.on_event("run_resumed", session=sid, by=by, owner=owner, playbook=run.playbook)
         return run
 
     def _run(self, run: Run, pb: Playbook | None) -> None:
@@ -225,7 +353,7 @@ class RunManager:
                 require_plan_approval=True,
                 **kwargs,
             )
-            result = orch.run(run.request, playbook=pb, params=run.params, session_id=run.session_id)
+            result = orch.run(run.request, playbook=pb, params=run.params, session_id=run.session_id, resume=run.resume)
             run.result = result
             run.status = result.status
             run.message = result.message
@@ -269,11 +397,13 @@ class RunManager:
                 out[sid] = self.session_info(sid)
         return sorted(out.values(), key=lambda x: x.get("started") or 0, reverse=True)
 
-    def session_info(self, sid: str) -> dict:
+    def session_info(self, sid: str, _resume_check: bool = True) -> dict:
         d = self.settings.audit_dir / sid
         info = summarize_events(read_events(d))
         info["id"] = sid
         info["stopped"] = (d / "STOP").exists()
+        info["takeover"] = pause_info(d)
+        info["owner"] = self.owner(sid)
         run = self.runs.get(sid)
         if run:
             info["request"] = info["request"] or run.request
@@ -291,11 +421,15 @@ class RunManager:
                 info["report"] = run.result.report_path or info["report"]
         elif info["status"] == "running":
             info["status"] = "interrupted"  # no live thread in this portal and no task_finished event
+        if info["takeover"] is not None and info["status"] == "running":
+            info["status"] = "paused (human takeover)"
         if self.inbox.pending(sid):
             info["status"] = "waiting for approval"
         if self.questions.get(sid):
             info["status"] = "waiting for answers"
         info["outputs"] = self.outputs(sid)
+        if _resume_check:
+            info["resumable"] = not self.resume_problem(sid, info)
         return info
 
     def outputs(self, sid: str) -> list[dict]:

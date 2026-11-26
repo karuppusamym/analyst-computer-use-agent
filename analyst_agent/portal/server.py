@@ -30,9 +30,14 @@ from . import views as V
 from .approvals import ApprovalInbox, QuestionBox
 from .auth import OIDC_COOKIE, SESSION_COOKIE, AuthError, Authenticator, Identity, peer_is_trusted
 from .playbooks import ReviewError, approve_draft, find_entry, list_playbooks, reject_draft
-from .runs import RunManager, read_events, safe_child, valid_session_id
+from .runs import RunManager, append_session_event, read_events, safe_child, valid_session_id
+from .state import ORPHAN_BY, ORPHAN_NOTE, PendingStore
+from .takeover import TakeoverError, TakeoverManager
+from .teams import ReviewRights, SsoGroupDirectory, Teams
 
 MAX_BODY = 1_000_000
+USER_NAME_RE = re.compile(r"^[A-Za-z0-9_.@+-]{1,100}$")
+MAX_VIEWERS = 50
 LOOPBACK_NAMES = {"127.0.0.1", "localhost", "::1"}
 IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif"}
 TEXT_TYPES = {".md", ".txt", ".csv", ".json", ".jsonl", ".log", ".sql", ".py", ".eml"}
@@ -46,6 +51,10 @@ FLASH = {
     "started": ("Task started. The plan will appear in the approval inbox.", True),
     "pb_approved": ("Draft approved and published.", True),
     "pb_rejected": ("Draft rejected.", True),
+    "resumed": ("Resuming from the last checkpoint. Verified steps are skipped; the plan goes to the approval inbox again.", True),
+    "takeover": ("You have taken over. The agent pauses before its next action and waits until you hand back.", True),
+    "handback": ("Handed back. The agent continues and is told what you did.", True),
+    "shared": ("Sharing updated.", True),
 }
 
 
@@ -93,6 +102,8 @@ class PortalApp:
         client_factory: Callable[[Settings], Any] | None = None,
         router_factory: Callable[[Settings], Any] | None = None,
         quiet: bool = False,
+        desktop_factory: Callable[[Settings], Any] | None = None,
+        capture: Callable[[tuple[int, int]], bytes] | None = None,
     ):
         if dev_no_auth and not is_loopback(host):
             raise AuthError("--dev-no-auth only binds to 127.0.0.1 (loopback); use real auth for any other address")
@@ -104,11 +115,107 @@ class PortalApp:
         settings.workspace_root.mkdir(parents=True, exist_ok=True)
         self.auth = Authenticator(self.cfg, settings.workspace_root, dev_no_auth=dev_no_auth)
         self.audit = AuditLog(settings.workspace_root / "portal_audit", session_id="portal", user="portal")
-        self.inbox = ApprovalInbox(on_decided=self._approval_logged)
-        self.questions = QuestionBox()
+        self.state = PendingStore(settings.workspace_root / str(self.cfg.get("state_dir") or "portal_state"))
+        self.inbox = ApprovalInbox(on_decided=self._approval_logged, store=self.state)
+        self.questions = QuestionBox(store=self.state)
         self.runs = RunManager(settings, self.playbooks_dir, Path(knowledge_dir) if knowledge_dir else None, self.inbox, self.questions, client_factory, router_factory, on_event=self._event)
+        # Team membership from SSO groups only when the groups come from the IdP or the trusted proxy.
+        self.sso_groups = SsoGroupDirectory(settings.workspace_root / "portal_sso_groups.json") if self.auth.mode in ("oidc", "trusted_header") else None
+        self.teams = Teams(self.cfg.get("teams"), groups_of=self.sso_groups.get if self.sso_groups else None)
+        self.auth.session_groups = self.teams.known_groups()
+        self.team_warnings = self._check_teams()
+        self.takeover = TakeoverManager(settings, self.runs, self.audit, tier_factory=desktop_factory, capture=capture)
         allowed = self.cfg.get("allowed_hosts") or []
         self.allowed_hosts = {h.lower() for h in allowed} or (LOOPBACK_NAMES | {host.lower()} if is_loopback(host) else set())
+        self._close_orphans()
+        self.state.prune()
+        self.inbox.load_history(self.state.records("approval"))
+
+    def _check_teams(self) -> list[str]:
+        """Config problems and (local sign-in) team names missing from the user store. Warnings only."""
+        warnings = list(self.teams.warnings)
+        if self.auth.mode == "local":
+            warnings += self.teams.unknown_users(self.auth.users.users().keys())
+            if self.teams.known_groups():
+                warnings.append("sso_groups / sso_reviewer_groups are ignored with portal.auth.mode local")
+        for w in warnings:
+            self.audit.event("teams_config_warning", warning=w)
+            if not self.quiet:
+                print(f"warning: portal.teams: {w}", file=sys.stderr)
+        return warnings
+
+    def _record_groups(self, ident: Identity | None) -> None:
+        if self.sso_groups is not None and ident is not None and ident.source in ("oidc", "trusted_header"):
+            known = self.teams.known_groups()
+            if self.sso_groups.record(ident.name, [g for g in ident.groups if g in known], ident.source):
+                self.audit.event("sso_groups_seen", by=ident.name, source=ident.source, groups=sorted(g for g in ident.groups if g in known), teams=self.teams.teams_of(ident.name, ident.groups))
+
+    def _close_orphans(self) -> None:
+        """Requests left pending by a previous portal: their run thread is gone, so decline them."""
+        for rec in self.state.orphans():
+            kind, sid = rec.get("kind"), str(rec.get("session_id", ""))
+            if not self.state.close(str(kind), rec["id"], "orphaned", ORPHAN_BY, ORPHAN_NOTE, approved=False):
+                continue
+            d = self.settings.audit_dir / sid if valid_session_id(sid) else None
+            if kind == "approval":
+                self.audit.event("approval_orphaned", session=sid, request_id=rec["id"], step=rec.get("step_id"), action_class=rec.get("action_class"), summary=rec.get("summary"), approved=False, by=ORPHAN_BY, note=ORPHAN_NOTE, requested_by=rec.get("requested_by"))
+                if d:
+                    append_session_event(d, "approval_orphaned", step=rec.get("step_id"), action_class=rec.get("action_class"), summary=rec.get("summary"), approved=False, by=ORPHAN_BY, note=ORPHAN_NOTE)
+            else:
+                self.audit.event("question_orphaned", session=sid, request_id=rec["id"], questions=rec.get("questions"), by=ORPHAN_BY, note=ORPHAN_NOTE, asked_by=rec.get("asked_by"))
+                if d:
+                    append_session_event(d, "question_orphaned", questions=rec.get("questions"), by=ORPHAN_BY, note=ORPHAN_NOTE)
+
+    # ------------------------------------------------------------------ visibility
+    def can_see(self, ident: Identity | None, sid: str) -> bool:
+        """Admins: every session. Everyone: their own, sessions shared with them, and sessions of
+        people in one of their teams. Reviewers also: CLI sessions (no owner) and any with an approval
+        they may decide. Anything else is answered with 404."""
+        if ident is None or not valid_session_id(sid):
+            return False
+        if ident.can("admin"):
+            return True
+        owner = self.runs.owner(sid)
+        if owner is not None and owner == ident.name:
+            return True
+        if ident.name in self.runs.viewers(sid):
+            return True
+        if (self.takeover.active(sid) or {}).get("by") == ident.name:
+            return True  # the person holding a takeover keeps the session until they hand back
+        if owner is not None and self.teams.share_team(ident.name, owner, ident.groups):
+            return True
+        if ident.can("reviewer"):
+            return owner is None or (bool(self.inbox.pending(sid)) and self.may_decide(ident, sid))
+        return False
+
+    def may_decide(self, ident: Identity | None, sid: str) -> bool:
+        """Reviewers decide approvals only for playbooks their team lists (portal.teams); admins always."""
+        if ident is None or not ident.can("reviewer"):
+            return False
+        if ident.can("admin"):
+            return True
+        return self.teams.may_review(ident.name, self.runs.playbook_of(sid), ident.groups)
+
+    def rights(self, ident: Identity | None, item) -> ReviewRights:
+        """What this person may do with one pending approval: the role, the team's playbooks,
+        then the reviewer's limits by action class and amount. Checked again on every POST."""
+        if ident is None or not ident.can("reviewer"):
+            return ReviewRights(False, False, "only reviewers and admins can decide")
+        if ident.can("admin"):
+            return ReviewRights(True, True)
+        return self.teams.rights(ident.name, self.runs.playbook_of(item.session_id), item.req.action_class, item.req.amount, ident.groups)
+
+    def may_share(self, ident: Identity, sid: str) -> bool:
+        return ident.can("admin") or self.runs.owner(sid) == ident.name
+
+    def _visible_sessions(self, ident: Identity) -> list[dict]:
+        return [s for s in self.runs.sessions() if self.can_see(ident, s["id"])]
+
+    def _visible_pending(self, ident: Identity) -> list:
+        return [p for p in self.inbox.pending() if self.can_see(ident, p.session_id)]
+
+    def _visible_questions(self, ident: Identity) -> list:
+        return [q for q in self.questions.all() if self.can_see(ident, q.session_id)]
 
     # ------------------------------------------------------------------ audit
     def _event(self, kind: str, **data: Any) -> None:
@@ -116,7 +223,8 @@ class PortalApp:
 
     def _approval_logged(self, item) -> None:
         d = item.decision
-        self.audit.event("approval_decided", session=item.session_id, step=item.req.step_id, action_class=item.req.action_class, summary=item.req.summary, approved=d.approved, by=d.by, note=d.note)
+        extra = {"amount": item.req.amount} if item.req.amount is not None else {}
+        self.audit.event("approval_decided", session=item.session_id, step=item.req.step_id, action_class=item.req.action_class, summary=item.req.summary, approved=d.approved, by=d.by, note=d.note, **extra)
 
     # ------------------------------------------------------------------ plumbing
     def _host_ok(self, host_header: str | None) -> bool:
@@ -156,6 +264,8 @@ class PortalApp:
             cookies: list[str] = []
             peer = hd.client_address[0]
             ident = self.auth.resolve(sent, hd.headers, peer)
+            if ident is not None and ident.source == "trusted_header":
+                self._record_groups(ident)
             if ident and self.auth.mode in ("trusted_header", "dev") and (not sent or sent.get("u") != ident.name):
                 tok = self.auth.new_session(ident)
                 session = self.auth.signer.unsign(tok)
@@ -214,13 +324,13 @@ class PortalApp:
             hd.wfile.write(body)
 
     # ------------------------------------------------------------------ helpers
-    def _counts(self) -> dict:
+    def _counts(self, ident: Identity) -> dict:
         drafts = sum(1 for e in list_playbooks(self.playbooks_dir) if e.is_draft and e.reviewable)
-        return {"approvals": len(self.inbox.pending()), "playbooks": drafts, "chat": len(self.questions.all())}
+        return {"approvals": len(self._visible_pending(ident)), "playbooks": drafts, "chat": len(self._visible_questions(ident))}
 
     def _page(self, ctx: Ctx, status: int, title: str, body: str, active: str = "", poll: str = "") -> Response:
         flash, ok = FLASH.get(ctx.query.get("m", ""), ("", False))
-        return Response(status, V.layout(title, body, ctx.ident, ctx.csrf, ctx.nonce, active, self._counts() if ctx.ident else {}, poll, flash, ok))
+        return Response(status, V.layout(title, body, ctx.ident, ctx.csrf, ctx.nonce, active, self._counts(ctx.ident) if ctx.ident else {}, poll, flash, ok))
 
     @staticmethod
     def _redirect(location: str, status: int = 303) -> Response:
@@ -237,6 +347,16 @@ class PortalApp:
 
     def _session_exists(self, sid: str) -> bool:
         return valid_session_id(sid) and ((self.settings.audit_dir / sid).is_dir() or sid in self.runs.runs)
+
+    def _visible(self, ctx: Ctx, sid: str) -> bool:
+        """The session exists and this user may see it. Callers answer 404 otherwise, never 403,
+        so a session id does not reveal whether someone else's session exists."""
+        if not self._session_exists(sid):
+            return False
+        if self.can_see(ctx.ident, sid):
+            return True
+        self.audit.event("session_hidden", session=sid, path=ctx.path, by=ctx.ident.name if ctx.ident else None, role=ctx.ident.role if ctx.ident else None)
+        return False
 
     def _file(self, path: Path | None) -> Response:
         if path is None or not path.is_file():
@@ -264,13 +384,19 @@ class PortalApp:
         ("GET", r"/sessions/(?P<sid>[^/]+)", "session", "analyst"),
         ("POST", r"/sessions/(?P<sid>[^/]+)/stop", "stop", "analyst"),
         ("POST", r"/sessions/(?P<sid>[^/]+)/answer", "answer", "analyst"),
+        ("POST", r"/sessions/(?P<sid>[^/]+)/resume", "resume", "analyst"),
         ("GET", r"/sessions/(?P<sid>[^/]+)/live", "live", "analyst"),
+        ("POST", r"/sessions/(?P<sid>[^/]+)/takeover", "takeover", "analyst"),
+        ("POST", r"/sessions/(?P<sid>[^/]+)/handback", "handback", "analyst"),
+        ("POST", r"/sessions/(?P<sid>[^/]+)/share", "share", "analyst"),
         ("GET", r"/sessions/(?P<sid>[^/]+)/report", "report", "analyst"),
         ("GET", r"/sessions/(?P<sid>[^/]+)/file/(?P<rel>.+)", "session_file", "analyst"),
         ("GET", r"/out/(?P<rel>.+)", "output_file", "analyst"),
         ("GET", r"/api/state", "api_state", "analyst"),
         ("GET", r"/api/sessions/(?P<sid>[^/]+)/state", "api_session_state", "analyst"),
         ("GET", r"/api/sessions/(?P<sid>[^/]+)/live", "api_live", "analyst"),
+        ("POST", r"/api/sessions/(?P<sid>[^/]+)/takeover/input", "api_takeover_input", "analyst"),
+        ("GET", r"/api/sessions/(?P<sid>[^/]+)/takeover/frame", "api_takeover_frame", "analyst"),
         ("GET", r"/approvals", "approvals", "analyst"),
         ("POST", r"/approvals/(?P<aid>[A-Za-z0-9]+)", "decide", "reviewer"),
         ("GET", r"/playbooks", "playbooks", "analyst"),
@@ -358,7 +484,8 @@ class PortalApp:
         except AuthError as e:
             self.audit.event("login_failed", source="oidc", reason=str(e), peer=ctx.peer)
             return self._error(ctx, 401, f"sign-in failed: {e}")
-        self.audit.event("login", by=ident.name, role=ident.role, source="oidc", peer=ctx.peer)
+        self.audit.event("login", by=ident.name, role=ident.role, source="oidc", peer=ctx.peer, teams=self.teams.teams_of(ident.name, ident.groups))
+        self._record_groups(ident)
         ctx.cookies[:] = [self.auth.cookie_header(SESSION_COOKIE, self.auth.new_session(ident)), self.auth.cookie_header(OIDC_COOKIE, "", max_age=0, samesite="Lax")]
         # A same-site navigation from this page, so the SameSite=Strict cookie is sent on the next request.
         body = '<!doctype html><meta charset=utf-8><meta http-equiv="refresh" content="0;url=/"><title>Signed in</title><p>Signed in. <a href="/">Continue</a></p>'
@@ -366,11 +493,11 @@ class PortalApp:
 
     # ------------------------------------------------------------------ chat
     def _chat_body(self, ctx: Ctx) -> str:
-        sessions = self.runs.sessions()
+        sessions = self._visible_sessions(ctx.ident)
         pending: dict[str, list] = {}
-        for p in self.inbox.pending():
+        for p in self._visible_pending(ctx.ident):
             pending.setdefault(p.session_id, []).append(p)
-        questions = {q.session_id: q for q in self.questions.all()}
+        questions = {q.session_id: q for q in self._visible_questions(ctx.ident)}
         return V.chat_page(ctx.ident, ctx.csrf, self.runs.runnable_playbooks(), sessions, questions, pending)
 
     def r_chat(self, ctx: Ctx) -> Response:
@@ -400,9 +527,11 @@ class PortalApp:
                 error = str(e)
             else:
                 return self._redirect(f"/?m=started&session={quote(run.session_id)}")
-        return Response(400, V.layout("Task chat", f'<div class="msg err">{V.h(error)}</div>' + self._chat_body(ctx), ctx.ident, ctx.csrf, ctx.nonce, "chat", self._counts()))
+        return Response(400, V.layout("Task chat", f'<div class="msg err">{V.h(error)}</div>' + self._chat_body(ctx), ctx.ident, ctx.csrf, ctx.nonce, "chat", self._counts(ctx.ident)))
 
     def r_answer(self, ctx: Ctx, sid: str) -> Response:
+        if not self._visible(ctx, sid):
+            return self._error(ctx, 404, "no such session")
         pq = self.questions.get(sid)
         if pq is None:
             return self._redirect("/?m=gone")
@@ -417,30 +546,122 @@ class PortalApp:
 
     # ------------------------------------------------------------------ sessions
     def r_sessions(self, ctx: Ctx) -> Response:
-        return self._page(ctx, 200, "Sessions", V.sessions_page(self.runs.sessions()), "sessions", poll="/api/state")
+        return self._page(ctx, 200, "Sessions", V.sessions_page(self._visible_sessions(ctx.ident)), "sessions", poll="/api/state")
 
     def r_session(self, ctx: Ctx, sid: str) -> Response:
-        if not self._session_exists(sid):
+        if not self._visible(ctx, sid):
             return self._error(ctx, 404, "no such session")
         info = self.runs.session_info(sid)
         events = read_events(self.settings.audit_dir / sid)
-        body = V.session_page(info, events, ctx.ident, ctx.csrf, self.inbox.pending(sid), self.questions.get(sid))
+        body = V.session_page(info, events, ctx.ident, ctx.csrf, self.inbox.pending(sid), self.questions.get(sid), may_decide=lambda item: self.rights(ctx.ident, item),
+                              viewers=self.runs.viewers(sid), may_share=self.may_share(ctx.ident, sid))
         return self._page(ctx, 200, f"Session {sid}", body, "sessions", poll=f"/api/sessions/{quote(sid)}/state")
 
     def r_stop(self, ctx: Ctx, sid: str) -> Response:
-        if not self._session_exists(sid):
+        if not self._visible(ctx, sid):
             return self._error(ctx, 404, "no such session")
         ok = self.runs.stop(sid, ctx.ident.name)
         return self._redirect(f"/sessions/{quote(sid)}?m={'stopped' if ok else 'nostop'}")
 
+    def r_resume(self, ctx: Ctx, sid: str) -> Response:
+        if not self._visible(ctx, sid):
+            return self._error(ctx, 404, "no such session")
+        try:
+            self.runs.resume(sid, ctx.ident.name)
+        except PlaybookError as e:
+            return self._error(ctx, 409, f"cannot resume: {e}")
+        return self._redirect(f"/sessions/{quote(sid)}?m=resumed")
+
     def r_live(self, ctx: Ctx, sid: str) -> Response:
-        if not self._session_exists(sid):
+        if not self._visible(ctx, sid):
             return self._error(ctx, 404, "no such session")
         info = self.runs.session_info(sid)
-        return self._page(ctx, 200, f"Live {sid}", V.live_page(sid, ctx.csrf, info.get("stopped", False), info.get("status") in V.FINAL), "sessions")
+        run = self.runs.runs.get(sid)
+        active = info.get("takeover") is not None
+        may, why = self.takeover.may_take_over(ctx.ident, sid)
+        if may and not (run and run.alive):
+            may, why = False, "only a session that is running in this portal can be taken over"
+        controls = self.takeover.controls(ctx.ident, sid)
+        tk = {
+            "active": active,
+            "holder": (info.get("takeover") or {}).get("by") if active else None,
+            "may": may and not active and not info.get("stopped"),
+            "why": why,
+            "controls": controls,
+            "may_end": active and (controls or ctx.ident.can("admin")),
+            "watch": active and (controls or ctx.ident.can("admin")),
+            "desktop": self.takeover.desktop() if active else (True, ""),
+            "interval": int(self.takeover.cfg.get("frame_interval_ms", 1000)),
+            "dry_run": bool(self.settings["tiers"]["desktop_pixels"].get("dry_run")),
+        }
+        return self._page(ctx, 200, f"Live {sid}", V.live_page(sid, ctx.csrf, info.get("stopped", False), info.get("status") in V.FINAL, tk), "sessions")
+
+    # ------------------------------------------------------------------ human takeover
+    def r_takeover(self, ctx: Ctx, sid: str) -> Response:
+        if not self._visible(ctx, sid):
+            return self._error(ctx, 404, "no such session")
+        try:
+            self.takeover.start(ctx.ident, sid)
+        except TakeoverError as e:
+            self.audit.event("takeover_refused", session=sid, by=ctx.ident.name, role=ctx.ident.role, reason=str(e))
+            return self._error(ctx, e.status, f"cannot take over: {e}")
+        return self._redirect(f"/sessions/{quote(sid)}/live?m=takeover")
+
+    def r_handback(self, ctx: Ctx, sid: str) -> Response:
+        if not self._visible(ctx, sid):
+            return self._error(ctx, 404, "no such session")
+        try:
+            self.takeover.end(ctx.ident, sid)
+        except TakeoverError as e:
+            return self._error(ctx, e.status, f"cannot hand back: {e}")
+        return self._redirect(f"/sessions/{quote(sid)}/live?m=handback")
+
+    def r_api_takeover_input(self, ctx: Ctx, sid: str) -> Response:
+        if not self._visible(ctx, sid):
+            return self._error(ctx, 404, "no such session")
+        try:
+            ok, message = self.takeover.human_input(ctx.ident, sid, ctx.form)
+        except TakeoverError as e:
+            return self._json({"ok": False, "error": str(e)}, e.status)
+        return self._json({"ok": ok, "message": message})
+
+    def r_api_takeover_frame(self, ctx: Ctx, sid: str) -> Response:
+        if not self._visible(ctx, sid):
+            return self._error(ctx, 404, "no such session")
+        try:
+            png = self.takeover.frame(ctx.ident, sid)
+        except TakeoverError as e:
+            return self._json({"error": str(e)}, e.status)
+        except OSError as e:
+            return self._json({"error": f"screen capture failed: {e}"}, 503)
+        return Response(200, png, "image/png")
+
+    # ------------------------------------------------------------------ sharing
+    def r_share(self, ctx: Ctx, sid: str) -> Response:
+        if not self._visible(ctx, sid):
+            return self._error(ctx, 404, "no such session")
+        if not self.may_share(ctx.ident, sid):
+            return self._error(ctx, 403, "only the session owner or an admin can share it")
+        name, op = ctx.form.get("user", "").strip(), ctx.form.get("op", "add")
+        if op not in ("add", "remove") or not USER_NAME_RE.match(name):
+            return self._error(ctx, 400, "give a user name (letters, digits, . _ @ + -)")
+        viewers = self.runs.viewers(sid)
+        if op == "add":
+            if name == self.runs.owner(sid):
+                return self._error(ctx, 400, "the owner already sees this session")
+            if name not in viewers and len(viewers) >= MAX_VIEWERS:
+                return self._error(ctx, 400, f"at most {MAX_VIEWERS} viewers")
+            viewers.append(name)
+        else:
+            viewers = [v for v in viewers if v != name]
+        self.runs.set_viewers(sid, viewers)
+        kind = "session_shared" if op == "add" else "session_unshared"
+        self.audit.event(kind, session=sid, by=ctx.ident.name, viewer=name)
+        append_session_event(self.settings.audit_dir / sid, kind, ctx.ident.name, by=ctx.ident.name, viewer=name)
+        return self._redirect(f"/sessions/{quote(sid)}?m=shared")
 
     def r_report(self, ctx: Ctx, sid: str) -> Response:
-        if not self._session_exists(sid):
+        if not self._visible(ctx, sid):
             return self._error(ctx, 404, "no such session")
         p = self.settings.audit_dir / sid / "report.md"
         if not p.is_file():
@@ -448,7 +669,7 @@ class PortalApp:
         return self._page(ctx, 200, f"Report {sid}", V.report_page(sid, p.read_text(encoding="utf-8", errors="replace")), "sessions")
 
     def r_session_file(self, ctx: Ctx, sid: str, rel: str) -> Response:
-        if not valid_session_id(sid):
+        if not valid_session_id(sid) or not self._visible(ctx, sid):
             return self._error(ctx, 404, "no such session")
         p = safe_child(self.settings.audit_dir / sid, rel)
         if p is None:
@@ -463,17 +684,23 @@ class PortalApp:
         if p is None:
             self.audit.event("path_refused", path=ctx.path, by=ctx.ident.name)
             return self._error(ctx, 404, "no such file")
+        if not ctx.ident.can("admin"):
+            # workspace/output/ is shared: serve a file only if a session this user can see produced it.
+            rel_posix = rel.replace("\\", "/").lstrip("/")
+            if not any(o["kind"] == "out" and o["rel"] == rel_posix for s in self._visible_sessions(ctx.ident) for o in s.get("outputs") or []):
+                return self._error(ctx, 404, "no such file")
         return self._file(p)
 
     # ------------------------------------------------------------------ JSON for polling
     def r_api_state(self, ctx: Ctx) -> Response:
         root = self.settings.audit_dir
         n_dirs = sum(1 for _ in root.iterdir()) if root.exists() else 0
-        state = [[(sid, r.status, r.alive) for sid, r in sorted(list(self.runs.runs.items()))], [p.id for p in self.inbox.pending()], sorted(q.session_id for q in self.questions.all()), n_dirs]
+        runs = [(sid, r.status, r.alive) for sid, r in sorted(list(self.runs.runs.items())) if self.can_see(ctx.ident, sid)]
+        state = [runs, [p.id for p in self._visible_pending(ctx.ident)], sorted(q.session_id for q in self._visible_questions(ctx.ident)), n_dirs]
         return self._json({"v": hashlib.sha256(json.dumps(state).encode()).hexdigest()[:16]})
 
     def r_api_session_state(self, ctx: Ctx, sid: str) -> Response:
-        if not self._session_exists(sid):
+        if not self._visible(ctx, sid):
             return self._error(ctx, 404, "no such session")
         info = self.runs.session_info(sid)
         ev = self.settings.audit_dir / sid / "events.jsonl"
@@ -481,7 +708,7 @@ class PortalApp:
         return self._json({"v": hashlib.sha256(json.dumps(state, default=str).encode()).hexdigest()[:16], "status": info.get("status")})
 
     def r_api_live(self, ctx: Ctx, sid: str) -> Response:
-        if not self._session_exists(sid):
+        if not self._visible(ctx, sid):
             return self._error(ctx, 404, "no such session")
         try:
             after = int(ctx.query.get("after", "0"))
@@ -493,13 +720,17 @@ class PortalApp:
         return self._json({
             "status": info.get("status"),
             "stopped": info.get("stopped"),
+            "takeover": (info.get("takeover") or {}).get("by", "") if info.get("takeover") is not None else None,
             "screenshots": shots,
             "events": [{"seq": e.get("seq"), "time": time.strftime("%H:%M:%S", time.localtime(e.get("ts", 0))), "kind": e.get("kind"), "detail": V.event_detail(e)} for e in events],
         })
 
     # ------------------------------------------------------------------ approvals
     def r_approvals(self, ctx: Ctx) -> Response:
-        return self._page(ctx, 200, "Approvals", V.approvals_page(self.inbox.pending(), self.inbox.history(), ctx.ident, ctx.csrf), "approvals", poll="/api/state")
+        history = self.inbox.history()
+        if not ctx.ident.can("reviewer"):
+            history = [x for x in history if self.can_see(ctx.ident, x.session_id)]
+        return self._page(ctx, 200, "Approvals", V.approvals_page(self._visible_pending(ctx.ident), history, ctx.ident, ctx.csrf, may_decide=lambda item: self.rights(ctx.ident, item)), "approvals", poll="/api/state")
 
     def r_decide(self, ctx: Ctx, aid: str) -> Response:
         decision = ctx.form.get("decision", "")
@@ -507,11 +738,25 @@ class PortalApp:
             return self._error(ctx, 400, "decision must be approve or reject")
         note = ctx.form.get("note", "").strip()[:1000]
         full_note = f"portal ({ctx.ident.role}, {ctx.ident.source})" + (f": {note}" if note else "")
+        pending = self.inbox.get(aid)
+        if pending is not None and pending.decision is None:
+            if not self._visible(ctx, pending.session_id):
+                return self._error(ctx, 404, "no such approval")
+            rights = self.rights(ctx.ident, pending)
+            if not (rights.approve if decision == "approve" else rights.decide):
+                reason = rights.reason or "not allowed"
+                info = dict(step=pending.req.step_id, action_class=pending.req.action_class, decision=decision, by=ctx.ident.name, role=ctx.ident.role,
+                            playbook=self.runs.playbook_of(pending.session_id), reason=reason, **({"amount": pending.req.amount} if pending.req.amount is not None else {}))
+                self.audit.event("approval_forbidden", session=pending.session_id, request_id=aid, **info)
+                if valid_session_id(pending.session_id):
+                    append_session_event(self.settings.audit_dir / pending.session_id, "approval_forbidden", ctx.ident.name, **info)
+                return self._error(ctx, 403, f"you may not {decision} this request: {reason}")
         item = self.inbox.decide(aid, decision == "approve", ctx.ident.name, full_note)
         if item is None:
             return self._redirect("/approvals?m=gone")
         m = "approved" if decision == "approve" else "rejected"
-        if ctx.form.get("back") == "session":
+        # Decided requests no longer make a session visible to a reviewer, so only go back to pages they keep.
+        if ctx.form.get("back") == "session" and self.can_see(ctx.ident, item.session_id):
             return self._redirect(f"/sessions/{quote(item.session_id)}?m={m}")
         return self._redirect("/approvals?m=" + m)
 

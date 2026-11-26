@@ -5,12 +5,13 @@
   python -m analyst_agent playbooks
   python -m analyst_agent run "Reconcile October" --playbook erp-crm-reconciliation --param period=2026-10
   python -m analyst_agent run "Q3 churn by region?"            (planner builds the steps; needs the model)
-  python -m analyst_agent eval [--split holdout]
+  python -m analyst_agent eval [--split holdout]             (appends to workspace/evals/history.jsonl, writes <run-id>.html)
+  python -m analyst_agent eval history [--last N] | eval compare <runA> <runB>
   python -m analyst_agent stop <session-id>                     (kill switch)
   python -m analyst_agent portal [--host 127.0.0.1] [--port 8765] (web portal)
   python -m analyst_agent portal-user add <name> --role analyst|reviewer|admin
   python -m analyst_agent vault set <name> --allow-host h       (value is prompted, never on argv)
-  python -m analyst_agent vault list | vault remove <name>
+  python -m analyst_agent vault list | check | share <name> | rotate <name> [--generate] | rollback <name> | remove <name>
   python -m analyst_agent teach from-session|record|promote|drafts   (draft playbooks; see teach.py)
   python -m analyst_agent schedule list|add|remove|run-due|daemon|install-hint   (see scheduler.py)
 """
@@ -71,7 +72,10 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--resume", metavar="SESSION", help="resume a session from its last checkpoint")
     run.add_argument("--enable-desktop", action="store_true", help="allow the pixel tier (only on an isolated machine or with the window allowlist)")
     run.add_argument("--dry-run-desktop", action="store_true", help="pixel tier logs actions without sending input")
-    ev = sub.add_parser("eval", help="run the evaluation set")
+    ev = sub.add_parser("eval", help="run the evaluation set; 'eval history' / 'eval compare A B' show past runs")
+    ev.add_argument("action", nargs="?", default="run", choices=["run", "history", "compare"])
+    ev.add_argument("runs", nargs="*", help="compare: two run ids (or unique prefixes, or -1 = latest, -2 = previous)")
+    ev.add_argument("--last", type=int, default=10, help="history: how many recent runs to show")
     ev.add_argument("--split", choices=["tune", "holdout"])
     ev.add_argument("--tasks", default=str(ROOT / "evals" / "tasks.json"))
     st = sub.add_parser("stop", help="kill switch for a running session")
@@ -94,6 +98,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "status":
         for name, (ok, why) in Router(s).status().items():
             print(f"{name:<15} {'available' if ok else 'unavailable'}  {'' if ok else why}")
+        from .tools.docker_backend import status_line
+
+        print(status_line(s["tiers"]["code"]))
         print(f"\nmodel backend: {s['gateway']['backend']}  gateway: {s['gateway']['base_url']}  token set: {bool(s.gateway_token())}")
         return 0
     if args.cmd == "gateway-check":
@@ -135,10 +142,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "schedule":
         return scheduler.cli(args, s, ROOT)
     if args.cmd == "eval":
+        from . import eval_history
         from .evals import format_eval, run_evals
 
+        if args.action != "run":
+            return eval_history.cli(args, s)
         outcomes, summary = run_evals(s, args.tasks, ROOT / "playbooks", split=args.split)
         print(format_eval(outcomes, summary))
+        config_name = Path(args.config).stem if args.config else "default"
+        row, hist, report = eval_history.record_run(s, outcomes, summary, config_name=config_name, root=ROOT, split=args.split)
+        print(f"\nrun {row['run_id']} appended to {hist}\nreport: {report}")
         return 0 if summary["pilot_gate_met"] else 1
     if args.cmd == "run":
         params = dict(p.split("=", 1) for p in args.param)

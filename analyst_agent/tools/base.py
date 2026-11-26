@@ -37,6 +37,7 @@ class ToolContext:
     step_id: str = ""
     workdir: Path = Path(".")
     params: dict = field(default_factory=dict)
+    user_source: str = ""  # where the run came from: "portal", "schedule" or "cli" (vault team:/group: sharing)
 
 
 @dataclass

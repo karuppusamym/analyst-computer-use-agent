@@ -34,6 +34,7 @@ class Step:
     action_class: str | None = None  # send / submit / delete / upload_external / ...
     mode: str = "guided"  # "scripted" when script is set and proven
     no_check_reason: str = ""  # reviewed exception to "no check, no step" (e.g. an intermediate UI action)
+    approval_amount: str | None = None  # e.g. "{amount}": carried on this step's approval requests for reviewer amount limits
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items() if v not in (None, [], {}, "")}
@@ -55,6 +56,22 @@ class Playbook:
     source_path: str = ""
     status: str = "active"  # "draft" playbooks (teach mode) are never matched or run until promoted
     provenance: dict = field(default_factory=dict)
+
+    def invalid_params(self, params: dict[str, Any]) -> dict[str, str]:
+        """Check given values against each parameter's declared `format` / `enum` / `pattern` / `type`.
+
+        Returns {name: reason} for every value that does not fit. Values are text
+        substituted into SQL, code, file names and UI fields, so a value that does
+        not match its declared shape must never reach a step.
+        """
+        bad: dict[str, str] = {}
+        for k, spec in self.parameters.items():
+            if k not in params:
+                continue
+            reason = param_problem(params[k], spec)
+            if reason:
+                bad[k] = reason
+        return bad
 
     def bind(self, params: dict[str, Any]) -> "Playbook":
         """Return a copy with {placeholders} filled in. Missing required params raise."""
@@ -84,6 +101,43 @@ class Playbook:
         }
 
 
+_FORMATS: dict[str, tuple[str, str]] = {
+    "date": (r"\d{4}-\d{2}-\d{2}", "a date as YYYY-MM-DD"),
+    "month": (r"\d{4}-(0[1-9]|1[0-2])", "a month as YYYY-MM"),
+    "week": (r"([1-9]|[1-4]\d|5[0-3])", "an ISO week number from 1 to 53"),
+    "number": (r"-?\d+(\.\d+)?", "a number"),
+    "email": (r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "an email address"),
+    "identifier": (r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}", "letters, digits, '_', '.' or '-' only"),
+    "url": (r"https?://[^\s'\"<>]+", "an http(s) URL"),
+}
+
+
+def param_problem(value: Any, spec: dict) -> str:
+    """Why `value` does not fit the parameter spec, or "" when it does."""
+    text = str(value).strip()
+    if "enum" in spec:
+        allowed = [str(x) for x in spec["enum"]]
+        if text not in allowed and text.lower() not in [a.lower() for a in allowed]:
+            return f"must be one of {', '.join(allowed)}"
+    fmt = spec.get("format") or ("number" if spec.get("type") == "number" else "")
+    if fmt:
+        if fmt not in _FORMATS:
+            return f"unknown format '{fmt}' in the playbook"
+        rx, what = _FORMATS[fmt]
+        if not re.fullmatch(rx, text):
+            return f"must be {what}"
+        if fmt == "date":
+            import datetime as _dt
+
+            try:
+                _dt.date.fromisoformat(text)
+            except ValueError:
+                return "is not a real calendar date"
+    if spec.get("pattern") and not re.fullmatch(spec["pattern"], text):
+        return f"does not match the required pattern {spec['pattern']}"
+    return ""
+
+
 class _Keep(dict):
     def __missing__(self, key: str) -> str:
         return "{" + key + "}"
@@ -91,6 +145,10 @@ class _Keep(dict):
 
 def _fill(obj: Any, values: dict) -> Any:
     if isinstance(obj, str):
+        whole = re.fullmatch(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", obj)
+        if whole and isinstance(values.get(whole.group(1)), (list, tuple)):
+            return [str(x) for x in values[whole.group(1)]]  # a list parameter fills a whole field as a list
+
         # Only replace {name} tokens that are known parameters; leave code braces alone.
         def sub(m: re.Match) -> str:
             key = m.group(1)
@@ -135,6 +193,7 @@ def playbook_from_dict(data: dict, source_path: str = "") -> Playbook:
                 action_class=raw.get("action_class"),
                 mode=raw.get("mode", "scripted" if raw.get("script") else "guided"),
                 no_check_reason=raw.get("no_check_reason", ""),
+                approval_amount=None if raw.get("approval_amount") in (None, "") else str(raw["approval_amount"]),
             )
         )
     return Playbook(

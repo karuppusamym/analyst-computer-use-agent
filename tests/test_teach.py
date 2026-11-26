@@ -314,6 +314,121 @@ class RecorderConversionTests(unittest.TestCase):
         self.assertEqual([s["script"]["tool"] for s in steps], ["browser_goto", "browser_fill", "browser_click"])
 
 
+class RecorderTabsConversionTests(unittest.TestCase):
+    START = "http://127.0.0.1:9/tabs"
+    B = "http://127.0.0.1:9/"
+
+    def ev(self, t, type, tab=0, **kw):
+        return {"t": t, "type": type, "tab": tab, **kw}
+
+    def test_popups_switches_downloads_and_uploads(self):
+        export = [{"role": "link", "name": "Open export window"}]
+        dl = [{"role": "link", "name": "Download summary"}]
+        helpb = [{"role": "button", "name": "Open help"}]
+        att = [{"label": "Attachment"}, {"css": "#attachment"}]
+        events = [
+            self.ev(1, "navigate", url=self.START),
+            self.ev(1000, "click", targets=export, role="link", name="Open export window", href=self.B + "export"),
+            self.ev(1100, "navigate", tab=1, url=self.B + "export"),  # reported before the popup itself
+            self.ev(1101, "popup", tab=1, opener=0, url=self.B + "export"),
+            self.ev(2000, "click", tab=1, targets=dl, role="link", name="Download summary", href=self.B + "download/summary.csv"),
+            self.ev(2100, "download", tab=1, filename="summary.csv"),
+            self.ev(3000, "click", targets=helpb, role="button", name="Open help"),
+            self.ev(3100, "popup", tab=2, opener=0, url="about:blank"),
+            self.ev(3200, "navigate", tab=2, url=self.B + "help"),  # the popup's own load
+            self.ev(4000, "popup", tab=3, opener=0, url=self.B + "help"),  # opened by a script, no click
+            self.ev(5000, "upload", tab=0, targets=att, label="Attachment", field="attachment", files=["C:\\Users\\me\\secret\\pack.csv", "b.csv"], value="C:\\fakepath\\pack.csv"),
+        ]
+        steps, params, warnings = events_to_steps(events, self.START)
+        got = [(s["script"]["tool"], s["script"]["input"]) for s in steps]
+        self.assertEqual([g[0] for g in got], ["browser_goto", "browser_click", "browser_download", "browser_switch_tab", "browser_click", "browser_switch_tab", "browser_switch_tab", "browser_upload"], json.dumps(got, indent=1))
+        self.assertTrue(got[1][1]["expect_popup"])
+        self.assertEqual(got[1][1]["popup_url_contains"], "127.0.0.1:9/export")
+        self.assertNotIn("expect_popup", got[2][1])
+        self.assertEqual(got[3][1], {"url_contains": "127.0.0.1:9/tabs", "tab": 0})  # URL first, index as fallback
+        self.assertTrue(got[4][1]["expect_popup"])
+        self.assertEqual(got[4][1]["popup_url_contains"], "127.0.0.1:9/help")  # learned from the popup's first load
+        self.assertEqual(got[5][1], {"url_contains": "127.0.0.1:9/help", "tab": 3, "new_tab": True, "wait_s": 10})  # script-opened tab: wait for it
+        self.assertEqual(got[6][1], {"url_contains": "127.0.0.1:9/tabs", "tab": 0})
+        self.assertEqual(got[7][1], {"targets": att, "paths": "{attachment_paths}"})  # two files: one list parameter
+        self.assertEqual(steps[2]["checks"], [{"type": "file_exists", "path": "output/downloads/summary.csv"}])
+        self.assertEqual(params["attachment_paths"]["type"], "list")
+        self.assertTrue(params["attachment_paths"]["required"])
+        self.assertNotIn("default", params["attachment_paths"])
+        self.assertIn("pack.csv, b.csv", params["attachment_paths"]["description"])
+        self.assertEqual(warnings, [])
+        data = recording_to_draft("tabs-flow", self.START, events, created_by="tester")
+        raw = json.dumps(data)
+        self.assertNotIn("secret\\\\pack", raw)  # only the base name survives
+        self.assertNotIn("fakepath", raw)
+        self.assertEqual(data["provenance"]["tabs"], 4)
+        self.assertEqual(validate_draft(data), [])
+
+    def test_closes_frames_and_uploads(self):
+        B = self.B
+        fr = [{"name": "entry", "css": 'iframe[name="entry"]', "url_contains": "127.0.0.1:9/frames/entry"}]
+        nested = fr + [{"name": "notes", "url_contains": "127.0.0.1:9/frames/notes"}]
+        amount = [{"label": "Amount"}, {"css": "#amount"}]
+        att = [{"label": "Attachments"}]
+        events = [
+            self.ev(1, "navigate", url=self.START),
+            self.ev(100, "click", targets=[{"role": "button", "name": "Open help"}], role="button", name="Open help"),
+            self.ev(200, "popup", tab=1, opener=0, url=B + "help?session=8f3a91&lang=en"),
+            self.ev(300, "close", tab=1),  # the person closes the popup
+            self.ev(400, "fill", targets=amount, field="amount", value="12", frame=fr),
+            self.ev(450, "fill", targets=amount, field="amount", value="125", frame=fr),  # merged (same frame)
+            self.ev(500, "fill", targets=amount, field="amount", value="7", frame=nested),  # another frame: its own step
+            self.ev(600, "upload", targets=att, field="attachments", files=["a.csv"]),
+            self.ev(700, "upload", targets=att, field="attachments", files=["a.csv", "b.csv"]),  # re-chosen: replaces
+            self.ev(800, "close", tab=0),  # closing the last tab ends the recording; not a step
+        ]
+        steps, params, _ = events_to_steps(events, self.START)
+        got = [(s["script"]["tool"], s["script"]["input"]) for s in steps]
+        self.assertEqual([g[0] for g in got], ["browser_goto", "browser_click", "browser_close_tab", "browser_switch_tab", "browser_fill", "browser_fill", "browser_upload"], json.dumps(got, indent=1))
+        self.assertEqual(got[1][1]["popup_url_contains"], "127.0.0.1:9/help")  # volatile query value dropped
+        self.assertEqual(got[2][1], {"url_contains": "127.0.0.1:9/help", "tab": 1})
+        self.assertEqual(got[3][1], {"url_contains": "127.0.0.1:9/tabs", "tab": 0})  # the current tab was closed
+        self.assertEqual(got[4][1], {"targets": amount, "frame": fr, "text": "{amount}"})
+        self.assertEqual(got[5][1]["frame"], nested)
+        self.assertEqual(got[6][1], {"targets": att, "paths": "{attachments_paths}"})
+        self.assertNotIn("attachments_path", params)  # the earlier single-file choice is gone
+        data = recording_to_draft("frames-flow", self.START, events, created_by="t")
+        self.assertEqual(validate_draft(data), [])
+        # The whole browser being closed at the end is not a list of close steps either.
+        tail = [self.ev(1, "navigate", url=self.START), self.ev(10, "popup", tab=1, opener=None, url=B + "help"), self.ev(20, "close", tab=1), self.ev(21, "close", tab=0)]
+        self.assertNotIn("browser_close_tab", [s["script"]["tool"] for s in events_to_steps(tail, self.START)[0]])
+
+    def test_stable_url_and_list_parameters(self):
+        from analyst_agent.playbook import _fill
+        from analyst_agent.tools.browser import parse_paths, stable_url
+
+        self.assertEqual(stable_url("http://127.0.0.1:9/export"), "127.0.0.1:9/export")
+        self.assertEqual(stable_url("https://Portal.example.com/a/b?view=summary&id=123&tab=x#top"), "portal.example.com/a/b?view=summary")
+        self.assertEqual(stable_url("https://h.example/r?token=abc123"), "h.example/r")
+        self.assertEqual(stable_url("http://h"), "h/")
+        self.assertEqual(stable_url("about:blank"), "")
+        self.assertEqual(parse_paths(["a", " ", "b"]), ["a", "b"])
+        self.assertEqual(parse_paths('["C:/x/a.csv", "C:/x/b.csv"]'), ["C:/x/a.csv", "C:/x/b.csv"])
+        import os
+
+        self.assertEqual(parse_paths(f"a.csv{os.pathsep}b.csv\nc.csv"), ["a.csv", "b.csv", "c.csv"])
+        self.assertEqual(_fill({"paths": "{f}", "label": "files {f}"}, {"f": ["a", "b"]}), {"paths": ["a", "b"], "label": "files ['a', 'b']"})
+
+    def test_clean_event_frames(self):
+        out = clean_event({"type": "click", "targets": [{"css": "#x"}], "frame": [{"name": "entry", "css": "#f", "url_contains": "h/x", "junk": "y"}, "bad"] + [{}] * 10})
+        self.assertEqual(out["frame"][0], {"name": "entry", "css": "#f", "url_contains": "h/x"})
+        self.assertEqual(out["frame"][1], {})
+        self.assertEqual(len(out["frame"]), 6)
+        self.assertNotIn("frame", clean_event({"type": "click", "targets": [], "frame": "nope"}))
+
+    def test_clean_event_tabs_and_files(self):
+        out = clean_event({"type": "upload", "tab": "2", "opener": "x", "files": ["/home/u/a.csv", "C:\\d\\b.csv"], "value": "C:\\fakepath\\a.csv", "targets": []})
+        self.assertEqual(out["tab"], 2)
+        self.assertNotIn("opener", out)
+        self.assertEqual(out["files"], ["a.csv", "b.csv"])
+        self.assertNotIn("value", out)
+
+
 class RecordUnavailableTest(Base):
     def test_record_reports_unavailable_cleanly(self):
         import contextlib
@@ -455,6 +570,297 @@ class LiveBrowserTeachTests(unittest.TestCase):
         self.assertEqual(r2.status, "success", [(x.step.id, x.status, x.summary) for x in r2.records])
         self.assertEqual(backend.requests, [])
         self.assertTrue((self.s.output_dir / "downloads" / "report_wk46.csv").exists())
+
+    def test_record_popups_download_upload_then_replay(self):
+        self.portal.UPLOADS.clear()
+        content = "region,amount\nNorth,PRIVATE-CONTENT-123\n"
+        upload = self.ws.root / "samples" / "pack.csv"
+        upload.write_bytes(content.encode())
+
+        def drive(page):
+            with page.expect_popup() as info:
+                page.get_by_role("link", name="Open export window").click()
+            export = info.value
+            export.wait_for_load_state()
+            with export.expect_download():
+                export.get_by_role("link", name="Download summary").click()
+            with page.expect_popup() as info:
+                page.get_by_role("button", name="Open help").click()
+            info.value.wait_for_load_state()
+            info.value.close()
+            page.bring_to_front()
+            page.get_by_role("link", name="Upload a file").click()
+            page.wait_for_url("**/upload")
+            page.get_by_label("Attachment").set_input_files(str(upload))
+            page.get_by_label("Comment").fill("monthly pack")
+            page.get_by_role("button", name="Upload").click()
+            page.wait_for_url("**/uploaded")
+            page.wait_for_timeout(300)
+
+        path, data = record_draft(self.s, "tabs-recorded", self.base + "/tabs", self.pbdir, headless=True, driver=drive, created_by="tester")
+        raw = path.read_text(encoding="utf-8")
+        self.assertNotIn("PRIVATE-CONTENT-123", raw)
+        self.assertNotIn(str(upload.parent), raw)  # no local path, only the file name
+        self.assertEqual(len(self.portal.UPLOADS), 1)
+        steps = data["steps"]
+        tools = [s["script"]["tool"] for s in steps]
+        self.assertEqual(tools, ["browser_goto", "browser_click", "browser_download", "browser_switch_tab", "browser_click", "browser_close_tab", "browser_switch_tab", "browser_click", "browser_upload", "browser_fill", "browser_click"], json.dumps(steps, indent=1))
+        host = self.base.split("//", 1)[1]
+        self.assertTrue(steps[1]["script"]["input"]["expect_popup"])
+        self.assertEqual(steps[1]["script"]["input"]["popup_url_contains"], host + "/export")
+        self.assertTrue(steps[4]["script"]["input"]["expect_popup"])
+        self.assertEqual(steps[3]["script"]["input"], {"url_contains": host + "/tabs", "tab": 0})
+        self.assertEqual(steps[5]["script"]["input"], {"url_contains": host + "/help", "tab": 2})
+        self.assertEqual(steps[6]["script"]["input"], {"url_contains": host + "/tabs", "tab": 0})
+        self.assertEqual(steps[8]["script"]["input"]["path"], "{attachment_path}")
+        self.assertEqual(steps[2]["checks"], [{"type": "file_exists", "path": "output/downloads/summary.csv"}])
+        self.assertEqual(data["provenance"]["tabs"], 3)
+        self.assertEqual(validate_draft(data), [])
+
+        # Replay every step with the browser tier and no model; the upload is approved once.
+        self.portal.UPLOADS.clear()
+        steps[-1].pop("checks")
+        steps[-1]["no_check_reason"] = "checked by the test against the portal's UPLOADS"
+        r, backend = self._replay(data, {"attachment_path": str(upload), "comment": "replayed"}, approvals=[True])
+        self.assertEqual(r.status, "success", [(x.step.id, x.status, x.summary) for x in r.records])
+        self.assertEqual(backend.requests, [])
+        self.assertEqual(self.portal.UPLOADS, [{"filename": "pack.csv", "size": len(content.encode()), "sha256": __import__("hashlib").sha256(content.encode()).hexdigest(), "comment": "replayed"}])
+        self.assertEqual((self.s.output_dir / "downloads" / "summary.csv").read_text(encoding="utf-8"), self.portal.SUMMARY_CSV)
+
+        # Without approval nothing is uploaded; a path outside the allowed folders is refused.
+        from analyst_agent.policy import PolicyEngine
+        from analyst_agent.tools.base import ToolContext
+        from analyst_agent.tools.browser import BrowserTier
+
+        tier = BrowserTier(self.s)
+        ctx = ToolContext(self.s, PolicyEngine(self.s), AuditLog(self.s.audit_dir), ScriptedApprover([False]), step_id="t")
+        try:
+            tier.execute({"name": "browser_goto", "input": {"url": self.base + "/upload"}}, ctx)
+            out = tier.execute({"name": "browser_upload", "input": {"targets": [{"label": "Attachment"}], "path": str(upload)}}, ctx)
+            self.assertTrue(out.is_error)
+            self.assertIn("needs human approval", out.text)
+            out = tier.execute({"name": "browser_upload", "input": {"targets": [{"label": "Attachment"}], "path": str(ROOT / "README.md")}}, ctx)
+            self.assertTrue(out.is_error)
+            self.assertIn("may not read", out.text)
+            out = tier.execute({"name": "browser_switch_tab", "input": {"tab": 5, "wait_s": 0.2}}, ctx)
+            self.assertTrue(out.is_error)
+            out = tier.execute({"name": "browser_close_tab", "input": {"tab": 0}}, ctx)
+            self.assertTrue(out.is_error)
+            self.assertIn("last open tab", out.text)  # replay never closes the last tab
+        finally:
+            tier.close()
+
+    def _tier_replay(self, data: dict, params: dict, approvals=None):
+        """Run every step's tool on one BrowserTier (no model), so the test can look at its tabs."""
+        from analyst_agent.policy import PolicyEngine
+        from analyst_agent.tools.base import ToolContext
+        from analyst_agent.tools.browser import BrowserTier
+
+        tier = BrowserTier(self.s)
+        audit = AuditLog(self.s.audit_dir)
+        ctx = ToolContext(self.s, PolicyEngine(self.s), audit, ScriptedApprover(approvals or []), step_id="replay")
+        outs = []
+        for st in playbook_from_dict(data).bind(params).steps:
+            outs.append((st.id, st.script["tool"], tier.execute({"name": st.script["tool"], "input": st.script["input"]}, ctx)))
+            if outs[-1][2].is_error:
+                break
+        return tier, outs, audit
+
+    def test_tabs_replay_by_url_when_the_site_opens_them_in_another_order(self):
+        self.portal.WINDOW_ORDER[:] = ["export", "help"]
+
+        def drive(page):
+            with page.expect_popup() as info:
+                page.get_by_role("button", name="Open both windows").click()
+            info.value.wait_for_load_state()
+            ctx = page.context
+            for _ in range(50):
+                if len(ctx.pages) >= 3:
+                    break
+                page.wait_for_timeout(100)
+            export = next(p for p in ctx.pages if p.url.endswith("/export"))
+            helpwin = next(p for p in ctx.pages if p.url.endswith("/help"))
+            helpwin.wait_for_load_state()
+            export.bring_to_front()
+            with export.expect_download():
+                export.get_by_role("link", name="Download summary").click()
+            helpwin.close()
+            page.bring_to_front()
+            page.get_by_role("link", name="Upload a file").click()
+            page.wait_for_url("**/upload")
+            page.wait_for_timeout(300)
+
+        try:
+            _, data = record_draft(self.s, "order-recorded", self.base + "/tabs", self.pbdir, headless=True, driver=drive, created_by="tester")
+            host = self.base.split("//", 1)[1]
+            got = [(s["script"]["tool"], s["script"]["input"]) for s in data["steps"]]
+            self.assertEqual([g[0] for g in got], ["browser_goto", "browser_click", "browser_switch_tab", "browser_switch_tab", "browser_download", "browser_close_tab", "browser_switch_tab", "browser_click"], json.dumps(got, indent=1))
+            self.assertEqual(got[1][1]["popup_url_contains"], host + "/export")
+            self.assertEqual(got[2][1], {"url_contains": host + "/help", "tab": 2, "new_tab": True, "wait_s": 10})
+            self.assertEqual(got[3][1], {"url_contains": host + "/export", "tab": 1})
+            self.assertEqual(got[5][1], {"url_contains": host + "/help", "tab": 2})
+            self.assertEqual(validate_draft(data), [])
+
+            # At replay the site opens the windows the other way round: /help is tab 1, /export tab 2.
+            self.portal.WINDOW_ORDER[:] = ["help", "export"]
+            tier, outs, audit = self._tier_replay(data, {})
+            try:
+                self.assertTrue(all(not o.is_error for _, _, o in outs), [(i, t, o.text) for i, t, o in outs])
+                self.assertEqual(len(outs), len(data["steps"]))
+                self.assertEqual((self.s.output_dir / "downloads" / "summary.csv").read_text(encoding="utf-8"), self.portal.SUMMARY_CSV)
+                open_urls = sorted(p.url.rsplit("/", 1)[1] for p in tier._pages if not p.is_closed())
+                self.assertEqual(open_urls, ["export", "upload"])  # the help window was closed, matched by URL
+                self.assertTrue(tier._pages[1].is_closed() and tier._pages[1].url.endswith("/help"))
+            finally:
+                tier.close()
+            events = [json.loads(x) for x in (audit.dir / "events.jsonl").read_text(encoding="utf-8").splitlines() if x.strip()]
+            closes = [e for e in events if e.get("action") == "close_tab"]
+            self.assertEqual([(e["tab"], e["matched"]) for e in closes], [(1, "url")])
+
+            # By index alone the same draft would download from the wrong window.
+            for st in data["steps"]:
+                for k in ("url_contains", "popup_url_contains"):
+                    st["script"]["input"].pop(k, None)
+            tier, outs, _ = self._tier_replay(data, {})
+            try:
+                self.assertTrue(outs[-1][2].is_error, [(i, t, o.text) for i, t, o in outs])
+                self.assertEqual(outs[-1][1], "browser_download")
+            finally:
+                tier.close()
+        finally:
+            self.portal.WINDOW_ORDER[:] = ["export", "help"]
+
+    def test_record_multi_file_upload_then_replay_all(self):
+        import hashlib
+
+        self.portal.UPLOADS.clear()
+        files = []
+        for n, body in (("a.csv", "x,1\nPRIVATE-A\n"), ("b.csv", "y,2\nPRIVATE-B\n")):
+            f = self.ws.root / "samples" / n
+            f.write_bytes(body.encode())
+            files.append(f)
+
+        def drive(page):
+            page.get_by_role("link", name="Upload several files").click()
+            page.wait_for_url("**/upload-many")
+            page.get_by_label("Attachments").set_input_files([str(f) for f in files])
+            page.get_by_label("Comment").fill("two packs")
+            page.get_by_role("button", name="Upload").click()
+            page.wait_for_url("**/uploaded")
+            page.wait_for_timeout(300)
+
+        path, data = record_draft(self.s, "multi-recorded", self.base + "/tabs", self.pbdir, headless=True, driver=drive, created_by="tester")
+        raw = path.read_text(encoding="utf-8")
+        self.assertNotIn("PRIVATE-A", raw)
+        self.assertNotIn(str(files[0].parent), raw)
+        up = next(s for s in data["steps"] if s["script"]["tool"] == "browser_upload")
+        self.assertEqual(up["script"]["input"]["paths"], "{attachments_paths}")
+        self.assertEqual(data["parameters"]["attachments_paths"]["type"], "list")
+        self.assertIn("a.csv, b.csv", data["parameters"]["attachments_paths"]["description"])
+        self.assertEqual(data["provenance"]["warnings"], [])
+        self.assertEqual(validate_draft(data), [])
+
+        self.portal.UPLOADS.clear()
+        data["steps"][-1].pop("checks")
+        data["steps"][-1]["no_check_reason"] = "checked by the test against the portal's UPLOADS"
+        approver_answers = [True]
+        r, backend = self._replay(data, {"attachments_paths": [str(f) for f in files], "comment": "replayed"}, approvals=approver_answers)
+        self.assertEqual(r.status, "success", [(x.step.id, x.status, x.summary) for x in r.records])
+        self.assertEqual(backend.requests, [])
+        want = [{"filename": f.name, "size": f.stat().st_size, "sha256": hashlib.sha256(f.read_bytes()).hexdigest()} for f in files]
+        self.assertEqual(self.portal.UPLOADS, [{"files": want, "comment": "replayed"}])
+
+        # One path outside the allowed folders refuses the whole upload (nothing is set).
+        from analyst_agent.policy import PolicyEngine
+        from analyst_agent.tools.base import ToolContext
+        from analyst_agent.tools.browser import BrowserTier
+
+        tier = BrowserTier(self.s)
+        approver = ScriptedApprover([True])
+        ctx = ToolContext(self.s, PolicyEngine(self.s), AuditLog(self.s.audit_dir), approver, step_id="t")
+        try:
+            tier.execute({"name": "browser_goto", "input": {"url": self.base + "/upload-many"}}, ctx)
+            import os
+
+            out = tier.execute({"name": "browser_upload", "input": {"targets": [{"label": "Attachments"}], "paths": f"{files[0]}{os.pathsep}{ROOT / 'README.md'}"}}, ctx)
+            self.assertTrue(out.is_error)
+            self.assertIn("may not read", out.text)
+            self.assertEqual(approver.seen, [])  # refused before anyone was asked
+        finally:
+            tier.close()
+
+    def test_record_iframe_actions_then_replay_in_the_frame(self):
+        self.portal.FRAME_SAVES.clear()
+        self.portal.FRAME_NOTES.clear()
+
+        def drive(page):
+            entry = page.frame_locator("iframe[name=entry]")
+            entry.get_by_label("Amount").fill("125")
+            entry.get_by_label("Region").select_option("S")
+            entry.get_by_role("button", name="Save").click()
+            for _ in range(50):
+                if self.portal.FRAME_SAVES:
+                    break
+                page.wait_for_timeout(100)
+            notes = page.frame_locator("iframe[name=entry]").frame_locator("iframe[name=notes]")
+            notes.get_by_label("Frame note").fill("checked")
+            notes.get_by_role("button", name="Add note").click()
+            for _ in range(50):
+                if self.portal.FRAME_NOTES:
+                    break
+                page.wait_for_timeout(100)
+            page.wait_for_timeout(300)
+
+        _, data = record_draft(self.s, "frames-recorded", self.base + "/frames", self.pbdir, headless=True, driver=drive, created_by="tester")
+        self.assertEqual(self.portal.FRAME_SAVES, [{"amount": "125", "region": "S"}])
+        host = self.base.split("//", 1)[1]
+        got = [(s["script"]["tool"], s["script"]["input"]) for s in data["steps"]]
+        self.assertEqual([g[0] for g in got], ["browser_goto", "browser_fill", "browser_select", "browser_click", "browser_fill", "browser_click"], json.dumps(got, indent=1))
+        entry_level = {"name": "entry", "url_contains": host + "/frames/entry", "css": 'iframe[name="entry"]'}
+        self.assertEqual(got[1][1]["frame"], [entry_level])
+        self.assertEqual(got[3][1]["frame"], [entry_level])
+        self.assertEqual(got[4][1]["frame"], [entry_level, {"name": "notes", "url_contains": host + "/frames/notes", "css": 'iframe[name="notes"]'}])
+        self.assertEqual(data["parameters"]["amount"]["default"], "125")
+        self.assertEqual(validate_draft(data), [])
+
+        self.portal.FRAME_SAVES.clear()
+        self.portal.FRAME_NOTES.clear()
+        data["steps"][-1].pop("checks")
+        data["steps"][-1]["no_check_reason"] = "checked by the test against the portal's FRAME_NOTES"
+        r, backend = self._replay(data, {"amount": "300", "note": "replayed note"})
+        self.assertEqual(r.status, "success", [(x.step.id, x.status, x.summary) for x in r.records])
+        self.assertEqual(backend.requests, [])
+        self.assertEqual(self.portal.FRAME_SAVES, [{"amount": "300", "region": "S"}])
+        self.assertEqual(self.portal.FRAME_NOTES, [{"note": "replayed note"}])
+
+    def test_frame_off_the_allowlist_is_not_recorded_or_replayed(self):
+        self.portal.FRAME_SAVES.clear()
+
+        def drive(page):
+            page.frame_locator("iframe[name=entry]").get_by_label("Amount").fill("9")
+            page.frame_locator("iframe[name=entry]").get_by_label("Region").select_option("S")
+            page.wait_for_timeout(300)
+
+        _, data = record_draft(self.s, "frames-blocked", self.base + "/frames?via=localhost", self.pbdir, headless=True, driver=drive, created_by="tester")
+        self.assertEqual([s["script"]["tool"] for s in data["steps"]], ["browser_goto"])
+        self.assertTrue(any("frame on http://localhost" in w for w in data["provenance"]["warnings"]), data["provenance"]["warnings"])
+        self.assertNotIn("localhost", data["permissions"]["hosts"])
+
+        from analyst_agent.policy import PolicyEngine
+        from analyst_agent.tools.base import ToolContext
+        from analyst_agent.tools.browser import BrowserTier
+
+        tier = BrowserTier(self.s)
+        ctx = ToolContext(self.s, PolicyEngine(self.s), AuditLog(self.s.audit_dir), ScriptedApprover([]), step_id="t")
+        try:
+            tier.execute({"name": "browser_goto", "input": {"url": self.base + "/frames?via=localhost"}}, ctx)
+            out = tier.execute({"name": "browser_fill", "input": {"targets": [{"label": "Amount"}], "frame": [{"name": "entry"}], "text": "9"}}, ctx)
+            self.assertTrue(out.is_error)
+            self.assertIn("not allowed", out.text)
+            out = tier.execute({"name": "browser_fill", "input": {"targets": [{"label": "Amount"}], "frame": [{"name": "nope"}], "text": "9"}}, ctx)
+            self.assertTrue(out.is_error)
+        finally:
+            tier.close()
 
     def test_record_refuses_host_off_allowlist(self):
         with self.assertRaisesRegex(TeachError, "allowlist"):

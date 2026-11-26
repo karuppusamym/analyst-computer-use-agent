@@ -149,6 +149,17 @@ Rules:
 - Finish with a final message whose last line is `RESULT: done` or `RESULT: blocked - <reason>`, preceded by a short summary of what you produced (file paths, counts, totals)."""
 
 _NOT_EXECUTED = "Not executed: an earlier computer action in this turn failed."
+_PAUSED = "Not executed: the session was paused for a human takeover before this action."
+_LOOK_FIRST = "Not executed: a human acted on the desktop while you were paused. Take a screenshot first, then decide what to do."
+
+
+def _add_note(messages: list[dict], note: str) -> None:
+    """Append a text note to the last (user) message without breaking tool_result ordering."""
+    last = messages[-1]
+    if isinstance(last.get("content"), str):
+        last["content"] += "\n\n" + note
+    else:
+        last["content"] = list(last["content"]) + [{"type": "text", "text": note}]
 
 
 @dataclass
@@ -179,6 +190,8 @@ class Executor:
     def __init__(self, client: ModelClient, role: str = "executor"):
         self.client = client
         self.role = role
+        self.paused = None  # callable: is a human takeover pending? (checked before every tool call)
+        self.must_look = False  # after a takeover: the next computer action must be a screenshot
 
     def _step_prompt(self, step: Step, ctx: ToolContext, prior: str, error: str, progress: str) -> str:
         s = ctx.settings
@@ -200,8 +213,11 @@ class Executor:
             parts.append(f"You already made progress on this step in an earlier context:\n{progress}\nContinue from there.")
         return "\n\n".join(parts)
 
-    def run(self, step: Step, tier: Tier, ctx: ToolContext, prior: str = "", error: str = "", deadline: float | None = None, stop_flag=None) -> StepRun:
+    def run(self, step: Step, tier: Tier, ctx: ToolContext, prior: str = "", error: str = "", deadline: float | None = None, stop_flag=None, pause_hook=None, paused=None) -> StepRun:
+        """pause_hook(): blocks while a human holds the session; returns (False, reason) to stop
+        or (True, note) where a non-empty note goes into the next model turn."""
         limits = ctx.settings["limits"]
+        self.paused = paused
         tools = tier.api_tools()
         progress = ""
         files: list[str] = []
@@ -212,6 +228,13 @@ class Executor:
             for _turn in range(limits["max_executor_turns"]):
                 if stop_flag and stop_flag():
                     return StepRun("blocked", "stopped by kill switch", files, last_png, turns_total)
+                if pause_hook:
+                    ok, note = pause_hook()
+                    if not ok:
+                        return StepRun("blocked", note or "stopped by kill switch", files, last_png, turns_total)
+                    if note:
+                        _add_note(messages, note)
+                        self.must_look = tier.name == "desktop_pixels"
                 if deadline and time.time() > deadline:
                     return StepRun("failed", "task time-out reached", files, last_png, turns_total)
                 reply = self.client.create(self.role, messages, system=EXECUTOR_SYSTEM, tools=tools)
@@ -248,6 +271,7 @@ class Executor:
         files: list[str] = []
         png: bytes | None = None
         computer_failed = False
+        held = False
         last_computer_idx = None
         for block in uses:
             in_toolset = block.get("toolset_name") == "computer"
@@ -255,10 +279,26 @@ class Executor:
             result: dict[str, Any] = {"type": "tool_result", "tool_use_id": block["id"]}
             if in_toolset:
                 result["toolset_name"] = "computer"
+            if held or (self.paused and self.paused()):
+                held = True  # a human takeover started: nothing more runs in this batch
+                result.update(is_error=True, content=_PAUSED)
+                results.append(result)
+                computer_failed = computer_failed or is_computer
+                continue
             if is_computer and computer_failed:
                 result.update(is_error=True, content=_NOT_EXECUTED)
                 results.append(result)
                 continue
+            if is_computer and self.must_look:
+                member = (block.get("input") or {}).get("action") if block.get("name") == "computer" and not in_toolset else block.get("name")
+                if member == "screenshot":
+                    self.must_look = False
+                else:
+                    ctx.audit.event("computer_action_refused", member=member, reason="fresh screenshot required after a human takeover", step=ctx.step_id)
+                    result.update(is_error=True, content=_LOOK_FIRST)
+                    results.append(result)
+                    computer_failed = True
+                    continue
             if not tier.handles(block):
                 out = ToolOutput(f"Error: tool {block.get('name')} is not available in this step", is_error=True)
             else:

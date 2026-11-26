@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
@@ -20,11 +20,26 @@ from .checkpoint import CheckpointStore
 from .config import Settings
 from .model import ModelClient, ModelError
 from .playbook import Playbook, Step
-from .policy import ApprovalRequest, Approver, ConsoleApprover, PolicyEngine
+from .policy import ApprovalDecision, ApprovalRequest, Approver, ConsoleApprover, PolicyEngine
 from .report import write_report
 from .router import RouteError, Router
+from .takeover import HUMAN_KINDS, PAUSE_FILE, human_note, pause_info
 from .tools.base import ToolContext, ToolOutput
 from .tools.code import run_python
+
+
+class _StepAmountApprover:
+    """Gives in-step tool approvals (browser submit, desktop press, upload) the amount the
+    playbook step declared, so a reviewer's amount limit also applies to them."""
+
+    def __init__(self, inner: Approver, amounts: dict[str, str]):
+        self.inner = inner
+        self.amounts = amounts
+
+    def request(self, req: ApprovalRequest) -> "ApprovalDecision":
+        if req.amount is None and self.amounts.get(req.step_id):
+            req = replace(req, amount=self.amounts[req.step_id])
+        return self.inner.request(req)
 
 
 @dataclass
@@ -63,17 +78,23 @@ class Orchestrator:
         ask: Callable[[list[str]], dict[str, str] | None] | None = None,
         knowledge_dir: str | Path | None = None,
         require_plan_approval: bool = True,
+        user_source: str = "",
     ):
         self.settings = settings
         self.client = client or ModelClient(settings)
         self.approver = approver or ConsoleApprover(user)
         self.router = router or Router(settings)
         self.user = user
+        # Where the run came from, for vault team:/group: sharing: only "portal" runs use SSO groups.
+        self.user_source = user_source or getattr(approver, "user_source", "") or ("schedule" if str(user).startswith("schedule:") else "cli")
         self.ask = ask
         self.knowledge_dir = Path(knowledge_dir) if knowledge_dir else None
         self.require_plan_approval = require_plan_approval
         self.planner = Planner(self.client)
         self.verifier = Verifier(self.client)
+        self.pause_poll_s = 0.25
+        self._human_note = ""
+        self._pause_end = ""
 
     # ------------------------------------------------------------------ helpers
     def _knowledge(self) -> str:
@@ -82,7 +103,7 @@ class Orchestrator:
         return "\n\n".join(p.read_text(encoding="utf-8")[:6000] for p in sorted(self.knowledge_dir.glob("*.md")))
 
     def _approve(self, audit: AuditLog, approvals: list, req: ApprovalRequest) -> bool:
-        audit.event("approval_requested", step=req.step_id, action_class=req.action_class, summary=req.summary)
+        audit.event("approval_requested", step=req.step_id, action_class=req.action_class, summary=req.summary, **({"amount": req.amount} if req.amount is not None else {}))
         decision = self.approver.request(req)
         audit.event("approval_decided", step=req.step_id, approved=decision.approved, by=decision.by, note=decision.note)
         approvals.append({"step": req.step_id, "action": req.action_class, "approved": decision.approved, "by": decision.by})
@@ -91,11 +112,53 @@ class Orchestrator:
     def _stop_requested(self, audit: AuditLog) -> bool:
         return (audit.dir / "STOP").exists() or (self.settings.workspace_root / "STOP").exists()
 
+    # ------------------------------------------------------------------ human takeover (PAUSE file)
+    def _wait_if_paused(self, audit: AuditLog, step_id: str = "") -> bool:
+        """Block while a human holds this session (PAUSE file). Like STOP, but resumable.
+
+        Returns False when the run must stop instead (kill switch, or no hand-back within
+        limits.takeover_timeout_s); self._pause_end says why. On hand-back the human's
+        audited actions become a note for the executor's next turn (self._human_note)."""
+        if not (audit.dir / PAUSE_FILE).exists():
+            return True
+        info = pause_info(audit.dir) or {}
+        start = audit.event("takeover_paused", step=step_id, by=info.get("by"))
+        limit = float(self.settings["limits"].get("takeover_timeout_s", 1800))
+        t0 = time.time()
+        while (audit.dir / PAUSE_FILE).exists():
+            if self._stop_requested(audit):
+                self._pause_end = "stopped by kill switch"
+                audit.event("takeover_wait_ended", step=step_id, reason="kill switch")
+                return False
+            if time.time() - t0 > limit:
+                self._pause_end = f"stopped: human takeover was not handed back within {int(limit)} s"
+                audit.event("takeover_timeout", step=step_id, by=info.get("by"), waited_s=round(time.time() - t0, 1))
+                return False
+            time.sleep(self.pause_poll_s)
+        after = [e for e in audit.events() if int(e.get("seq", 0) or 0) > int(start.get("seq", 0))]
+        actions = [e for e in after if e.get("kind") in HUMAN_KINDS]
+        ended_by = next((e.get("by") for e in reversed(after) if e.get("kind") == "takeover_ended"), None)
+        note = human_note(after, str(info.get("by") or ""))
+        self._human_note = note if not self._human_note else self._human_note + "\n\n" + note
+        audit.event("takeover_resumed", step=step_id, by=info.get("by"), handed_back_by=ended_by, human_actions=sum(1 for e in actions if e["kind"] == "human_action"),
+                    human_refused=sum(1 for e in actions if e["kind"] == "human_action_refused"), paused_s=round(time.time() - t0, 1))
+        return True
+
+    def _pause_hook(self, audit: AuditLog, step_id: str) -> tuple[bool, str]:
+        """For the executor: (False, reason) to stop, else (True, note-for-the-model or "")."""
+        if not self._wait_if_paused(audit, step_id):
+            return False, self._pause_end
+        note, self._human_note = self._human_note, ""
+        if note:
+            audit.event("takeover_note_sent", step=step_id, note=note)
+        return True, note
+
     # ------------------------------------------------------------------ main entry
     def run(self, request: str, playbook: Playbook | None = None, params: dict | None = None, session_id: str | None = None, resume: bool = False, guide: Playbook | None = None) -> TaskResult:
         """playbook: follow it exactly (scripted replay). guide: a playbook matched to the request,
         given to the planner as a reference so the plan covers everything the request asks."""
         self._guide = guide
+        self._human_note = ""
         s = self.settings
         s.output_dir.mkdir(parents=True, exist_ok=True)
         audit = AuditLog(s.audit_dir, session_id=session_id, user=self.user)
@@ -123,10 +186,11 @@ class Orchestrator:
         params.update(plan.params)
 
         policy = PolicyEngine(s, playbook.permissions if playbook else None)
-        ctx = ToolContext(s, policy, audit, self.approver, workdir=audit.dir / "scratch", params=params)
+        amounts = {st.id: st.approval_amount for st in plan.steps if st.approval_amount}
+        ctx = ToolContext(s, policy, audit, _StepAmountApprover(self.approver, amounts) if amounts else self.approver, workdir=audit.dir / "scratch", params=params, user_source=self.user_source)
 
         if self.require_plan_approval:
-            preview = "\n".join(f"{i + 1}. [{st.tier}] {st.intent}" + ("  (needs approval)" if st.approval == "required" or policy.needs_approval(st.action_class) else "") for i, st in enumerate(plan.steps))
+            preview = "\n".join(f"{i + 1}. [{st.tier}] {st.intent}" + (("  (needs approval" + (f", amount {st.approval_amount}" if st.approval_amount else "") + ")") if st.approval == "required" or policy.needs_approval(st.action_class) else "") for i, st in enumerate(plan.steps))
             if not self._approve(audit, approvals, ApprovalRequest("plan", "plan", f"Plan for: {request}", preview)):
                 return TaskResult("rejected", audit.session_id, [], message="plan was not approved", usage=self._usage(), approvals=approvals)
 
@@ -150,6 +214,10 @@ class Orchestrator:
             if self._stop_requested(audit):
                 rec.status = "blocked"
                 rec.summary = "stopped by kill switch"
+                break
+            if not self._wait_if_paused(audit, rec.step.id):
+                rec.status = "blocked"
+                rec.summary = self._pause_end
                 break
             if time.time() > deadline:
                 rec.status = "failed"
@@ -211,6 +279,14 @@ class Orchestrator:
 
     def _make_plan(self, request: str, playbook: Playbook | None, params: dict, audit: AuditLog) -> Plan:
         if playbook:
+            invalid = playbook.invalid_params(params)
+            if invalid:
+                # A value that does not fit its declared shape never reaches a step (SQL, code, file names, UI).
+                # Drop it and ask for a valid one; the model is not allowed to guess what was meant.
+                audit.event("params_invalid", params={k: {"value": str(params[k])[:200], "reason": r} for k, r in invalid.items()})
+                for k in invalid:
+                    params.pop(k, None)
+                return Plan([], [], [f"The value given for '{k}' {r}. Please give a valid value for '{k}'." for k, r in invalid.items()], {}, "playbook")
             missing = [k for k, spec in playbook.parameters.items() if spec.get("required", True) and k not in params and "default" not in spec]
             if missing:
                 # Let the planner read parameter values out of the request text.
@@ -219,10 +295,17 @@ class Orchestrator:
                 except ModelError as e:
                     # No model to read the request: ask for the values instead of failing.
                     audit.event("planner_unavailable", error=str(e)[:500])
+                    audit.event("params_missing", params=missing)
                     return Plan([], [], [f"Please give a value for '{k}'" for k in missing], {}, "playbook")
                 params.update({k: v for k, v in plan.params.items() if k in playbook.parameters})
+                invalid = playbook.invalid_params(params)
+                if invalid:
+                    audit.event("params_invalid", source="planner", params={k: {"value": str(params[k])[:200], "reason": r} for k, r in invalid.items()})
+                    for k in invalid:
+                        params.pop(k, None)
                 still = [k for k in missing if k not in params]
                 if still:
+                    audit.event("params_missing", params=still)
                     return Plan([], [], plan.questions or [f"Please give a value for '{k}'" for k in still], {}, "playbook")
             bound = playbook.bind(params)
             audit.event("plan", source="playbook", playbook=bound.name, version=bound.version, steps=[st.to_dict() for st in bound.steps], final_checks=bound.final_checks)
@@ -239,7 +322,7 @@ class Orchestrator:
         audit.event("step_started", step=step.id, intent=step.intent, tier=step.tier)
         if step.approval == "required" or policy.needs_approval(step.action_class):
             preview = json.dumps(step.script or {"instructions": step.instructions}, indent=1)[:3000]
-            if not self._approve(audit, approvals, ApprovalRequest(step.id, step.action_class or "approval", f"Step: {step.intent}", preview)):
+            if not self._approve(audit, approvals, ApprovalRequest(step.id, step.action_class or "approval", f"Step: {step.intent}", preview, amount=step.approval_amount)):
                 rec.status = "rejected"
                 last = approvals[-1]
                 rec.summary = f"not approved (decided by {last['by']}); nothing was done"
@@ -255,19 +338,29 @@ class Orchestrator:
         rec.tier_used, rec.route_note = route.tier.name, route.note
         prior = "\n".join(f"- {r.step.id}: {r.summary[:600]} files={r.files}" for r in records if r.status == "verified")
         error = ""
+        scripted_failure = ""
         max_attempts = 1 + self.settings["limits"]["max_step_retries"] + (1 if step.script else 0)
         while rec.attempts < max_attempts:
+            # A takeover may have started while this step waited for its approval.
+            if not self._wait_if_paused(audit, step.id):
+                rec.status, rec.summary = "blocked", self._pause_end
+                return
             rec.attempts += 1
             if step.script and rec.attempts == 1 and route.requested == route.tier.name:
                 run = self._run_script(step, route.tier, ctx)
             else:
                 try:
-                    run = Executor(self.client).run(step, route.tier, ctx, prior=prior, error=error, deadline=deadline, stop_flag=lambda: self._stop_requested(audit))
+                    run = Executor(self.client).run(step, route.tier, ctx, prior=prior, error=error, deadline=deadline, stop_flag=lambda: self._stop_requested(audit),
+                                                   pause_hook=lambda: self._pause_hook(audit, step.id), paused=lambda: (audit.dir / PAUSE_FILE).exists())
                 except ModelError as e:
-                    run = StepRun("failed", f"model call failed: {e}")
+                    # Keep the real cause from the scripted attempt; the model retry is only a fallback.
+                    first = f"{scripted_failure}; " if scripted_failure else ""
+                    run = StepRun("failed", f"{first}guided retry unavailable (model call failed: {e})")
+            if step.script and rec.attempts == 1 and run.status != "done":
+                scripted_failure = f"scripted run failed: {run.summary[:1500]}"
             rec.summary = run.summary
             rec.files = list(dict.fromkeys(rec.files + run.files))
-            if run.status == "blocked" and "kill switch" in run.summary:
+            if run.status == "blocked" and ("kill switch" in run.summary or run.summary.startswith("stopped: human takeover")):
                 rec.status = "blocked"
                 return
             try:
@@ -299,6 +392,12 @@ class Orchestrator:
             elif kind == "tools":  # a fixed sequence of tool calls on one tier; stops at the first error
                 texts, written, failed = [], [], False
                 for call in script.get("calls", []):
+                    if (ctx.audit.dir / PAUSE_FILE).exists():
+                        # A human took over mid-sequence: the screen no longer matches the script.
+                        # Fail this attempt; the guided retry waits for the hand-back and gets the note.
+                        texts.append("interrupted: a human took over this session during the scripted sequence")
+                        failed = True
+                        break
                     o = tier.execute({"name": call["tool"], "input": call.get("input", {})}, ctx)
                     texts.append(f"{call['tool']}: {o.text}")
                     written += o.files

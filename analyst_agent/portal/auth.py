@@ -50,6 +50,9 @@ class Identity:
     name: str
     role: str
     source: str = "local"
+    # SSO groups from the ID token (captured at sign-in, kept in the signed session) or from the
+    # trusted proxy's groups header. Never taken from a form or query. Empty for local users.
+    groups: tuple[str, ...] = ()
 
     def can(self, needed: str) -> bool:
         return role_at_least(self.role, needed)
@@ -187,7 +190,9 @@ class Signer:
         body, mac = token.split(".")
         want = hmac.new(self.key, body.encode("ascii"), hashlib.sha256).digest()
         try:
-            if not hmac.compare_digest(want, b64url_decode(mac)):
+            # Compare the canonical encoding, so a token has exactly one valid spelling
+            # (non-canonical base64 could otherwise decode to the same MAC).
+            if not hmac.compare_digest(b64url_encode(want), mac):
                 return None
             data = json.loads(b64url_decode(body))
         except (ValueError, TypeError):
@@ -380,10 +385,11 @@ class OidcClient:
                 break
         if not name:
             raise AuthError("ID token has no usable user name claim")
-        role = role_for(name, _as_list(claims.get(self.cfg.get("groups_claim", "groups"))), self.cfg)
+        groups = _as_list(claims.get(self.cfg.get("groups_claim", "groups")))
+        role = role_for(name, groups, self.cfg)
         if role is None:
             raise AuthError(f"user {name} has no portal role")
-        return Identity(name, role, "oidc")
+        return Identity(name, role, "oidc", tuple(groups))
 
 
 def _as_list(v: Any) -> list[str]:
@@ -452,6 +458,9 @@ class Authenticator:
         self.users = UserStore(self.workspace_root / acfg.get("users_file", "portal_users.json"))
         self.oidc: OidcClient | None = None
         self._failures: dict[str, list[float]] = {}
+        # SSO group names worth keeping in the session cookie (those the team config maps);
+        # set by the portal. None = keep none.
+        self.session_groups: set[str] | None = None
         self._fail_lock = threading.Lock()
         if self.mode == "oidc":
             o = acfg.get("oidc", {})
@@ -473,6 +482,8 @@ class Authenticator:
         payload = {"n": secrets.token_urlsafe(16), "exp": int(time.time() + self.ttl)}
         if ident:
             payload.update({"u": ident.name, "r": ident.role, "src": ident.source})
+            if ident.source == "oidc" and ident.groups and self.session_groups:
+                payload["g"] = sorted({g for g in ident.groups if g in self.session_groups})[:100]
         return self.signer.sign(payload)
 
     def cookie_header(self, name: str, value: str, max_age: int | None = None, samesite: str = "Strict") -> str:
@@ -502,15 +513,18 @@ class Authenticator:
                 return None
             groups = _as_list(headers.get(t["groups_header"])) if t.get("groups_header") else []
             role = role_for(name, groups, t)
-            return Identity(name, role, "trusted_header") if role else None
+            return Identity(name, role, "trusted_header", tuple(groups)) if role else None
         if session and session.get("u"):
             role = session.get("r", "analyst")
+            groups: tuple[str, ...] = ()
             if self.mode == "local":
                 rec = self.users.users().get(session["u"])
                 if rec is None:
                     return None  # user removed: session ends
                 role = rec.get("role", role)
-            return Identity(session["u"], role if role in ROLES else "analyst", session.get("src", self.mode))
+            elif self.mode == "oidc" and session.get("src") == "oidc" and isinstance(session.get("g"), list):
+                groups = tuple(str(g) for g in session["g"])  # signed at sign-in; see new_session
+            return Identity(session["u"], role if role in ROLES else "analyst", session.get("src", self.mode), groups)
         return None
 
     # ---- local login with a simple lockout
