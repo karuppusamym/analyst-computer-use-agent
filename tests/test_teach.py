@@ -621,7 +621,7 @@ class LiveBrowserTeachTests(unittest.TestCase):
         self.portal.UPLOADS.clear()
         steps[-1].pop("checks")
         steps[-1]["no_check_reason"] = "checked by the test against the portal's UPLOADS"
-        r, backend = self._replay(data, {"attachment_path": str(upload), "comment": "replayed"}, approvals=[True])
+        r, backend = self._replay(data, {"attachment_path": str(upload), "comment": "replayed"}, approvals=[True, True])  # the file, then the form post
         self.assertEqual(r.status, "success", [(x.step.id, x.status, x.summary) for x in r.records])
         self.assertEqual(backend.requests, [])
         self.assertEqual(self.portal.UPLOADS, [{"filename": "pack.csv", "size": len(content.encode()), "sha256": __import__("hashlib").sha256(content.encode()).hexdigest(), "comment": "replayed"}])
@@ -763,7 +763,7 @@ class LiveBrowserTeachTests(unittest.TestCase):
         self.portal.UPLOADS.clear()
         data["steps"][-1].pop("checks")
         data["steps"][-1]["no_check_reason"] = "checked by the test against the portal's UPLOADS"
-        approver_answers = [True]
+        approver_answers = [True, True]  # the file input, then the button that posts the form
         r, backend = self._replay(data, {"attachments_paths": [str(f) for f in files], "comment": "replayed"}, approvals=approver_answers)
         self.assertEqual(r.status, "success", [(x.step.id, x.status, x.summary) for x in r.records])
         self.assertEqual(backend.requests, [])
@@ -827,7 +827,7 @@ class LiveBrowserTeachTests(unittest.TestCase):
         self.portal.FRAME_NOTES.clear()
         data["steps"][-1].pop("checks")
         data["steps"][-1]["no_check_reason"] = "checked by the test against the portal's FRAME_NOTES"
-        r, backend = self._replay(data, {"amount": "300", "note": "replayed note"})
+        r, backend = self._replay(data, {"amount": "300", "note": "replayed note"}, approvals=[True, True])  # both frame forms post
         self.assertEqual(r.status, "success", [(x.step.id, x.status, x.summary) for x in r.records])
         self.assertEqual(backend.requests, [])
         self.assertEqual(self.portal.FRAME_SAVES, [{"amount": "300", "region": "S"}])

@@ -130,6 +130,25 @@ class Orchestrator:
         approvals.append({"step": req.step_id, "action": req.action_class, "approved": decision.approved, "by": decision.by})
         return decision.approved
 
+    @staticmethod
+    def _checkpoint_mismatch(cp: dict, request: str, params: dict, steps: list[Step], audit: AuditLog) -> str:
+        """Why a checkpoint may not be used for this run ('' when it may)."""
+        if cp.get("request") is not None and cp.get("request") != request:
+            return "the request differs from the checkpointed run"
+        saved = cp.get("params") or {}
+        now = redact(dict(params), audit)
+        changed = sorted(k for k in set(saved) | set(now) if str(saved.get(k)) != str(now.get(k)))
+        if changed:
+            return f"parameters changed since the checkpoint: {changed}"
+        digests = cp.get("step_digests")
+        by_id = {st.id: st for st in steps}
+        for sid in cp.get("verified_steps", []):
+            if sid not in by_id:
+                return f"verified step '{sid}' is not in the current plan"
+            if digests is not None and digests.get(sid) != _step_digest(by_id[sid]):
+                return f"step '{sid}' changed since the checkpoint"
+        return ""
+
     def _stop_requested(self, audit: AuditLog) -> bool:
         return (audit.dir / "STOP").exists() or (self.settings.workspace_root / "STOP").exists()
 
@@ -248,6 +267,11 @@ class Orchestrator:
         records = [StepRecord(st) for st in plan.steps]
         done_ids: set[str] = set()
         if resume and (cp := checkpoints.load()):
+            mismatch = self._checkpoint_mismatch(cp, request, params, plan.steps, audit)
+            if mismatch:
+                # Never mark a step done because its id matches a checkpoint taken for other inputs.
+                audit.event("resume_refused", reason=mismatch)
+                return TaskResult("failed", audit.session_id, [], message=f"cannot resume: {mismatch}. Start a new run instead.", usage=self._usage(), approvals=approvals)
             done_ids = set(cp.get("verified_steps", []))
             for r in records:
                 if r.step.id in done_ids:
@@ -277,7 +301,8 @@ class Orchestrator:
             self._run_step(rec, records, ctx, policy, audit, approvals, deadline)
             if rec.status == "verified":
                 done_ids.add(rec.step.id)
-                checkpoints.save(redact({"request": request, "verified_steps": sorted(done_ids), "params": params, "files": [f for r in records for f in r.files]}, audit))
+                checkpoints.save(redact({"request": request, "verified_steps": sorted(done_ids), "params": params, "files": [f for r in records for f in r.files],
+                                         "step_digests": {r.step.id: _step_digest(r.step) for r in records if r.step.id in done_ids}}, audit))
                 continue
             if rec.status in ("rejected", "skipped"):
                 continue  # a declined action is reported, never forced
@@ -290,6 +315,13 @@ class Orchestrator:
                     audit.event("replan_failed", error=str(e))
                     break
                 audit.event("replanned", steps=[st.to_dict() for st in new.steps])
+                if self.require_plan_approval:
+                    # The new steps were written after reading untrusted output: a person approves them like the first plan.
+                    preview = "\n".join(f"{n + 1}. [{st.tier}] {st.intent}" + ("  (needs approval)" if st.approval == "required" or policy.needs_approval(st.action_class) else "") for n, st in enumerate(new.steps))
+                    if not self._approve(audit, approvals, ApprovalRequest("replan", "plan", f"Revised plan for: {request} (after step '{rec.step.id}' failed)", preview)):
+                        rec.status = "blocked"
+                        rec.summary = (rec.summary + "\n" if rec.summary else "") + "the revised plan was not approved"
+                        break
                 records = [r for r in records if r.status == "verified"] + [StepRecord(st) for st in new.steps]
                 plan.final_checks = new.final_checks  # final checks must match the new steps
                 i = len([r for r in records if r.status == "verified"])
@@ -392,13 +424,17 @@ class Orchestrator:
         scripted_failure = ""
         max_attempts = 1 + self.settings["limits"]["max_step_retries"] + (1 if step.script else 0)
         while rec.attempts < max_attempts:
-            # A takeover may have started while this step waited for its approval.
+            # The kill switch or a takeover may have come while this step waited for its approval.
+            if self._stop_requested(audit):
+                rec.status, rec.summary = "blocked", "stopped by kill switch"
+                audit.event("step_stopped", step=step.id)
+                return
             if not self._wait_if_paused(audit, step.id):
                 rec.status, rec.summary = "blocked", self._pause_end
                 return
             rec.attempts += 1
             if step.script and rec.attempts == 1 and route.requested == route.tier.name:
-                run = self._run_script(step, route.tier, ctx)
+                run = self._run_script(step, route.tier, ctx, stop=lambda: self._stop_requested(audit))
             else:
                 try:
                     run = Executor(self.client).run(step, route.tier, ctx, prior=prior, error=error, deadline=lambda: deadline + self._held_s, stop_flag=lambda: self._stop_requested(audit),
@@ -430,7 +466,7 @@ class Orchestrator:
             error = f"Executor said: {run.summary[-1500:]}\nFailed checks:\n{verdict.failure_text()}"
         rec.status = "failed"
 
-    def _run_script(self, step: Step, tier, ctx: ToolContext) -> StepRun:
+    def _run_script(self, step: Step, tier, ctx: ToolContext, stop: Callable[[], bool] | None = None) -> StepRun:
         """Scripted replay of a proven step: no model call; the checks still decide."""
         script = step.script or {}
         kind = script.get("kind", "python")
@@ -443,6 +479,9 @@ class Orchestrator:
             elif kind == "tools":  # a fixed sequence of tool calls on one tier; stops at the first error
                 texts, written, failed = [], [], False
                 for call in script.get("calls", []):
+                    if stop and stop():
+                        ctx.audit.event("scripted_step_stopped", step=step.id, done=len(texts))
+                        return StepRun("blocked", "stopped by kill switch" + (f" after {len(texts)} call(s)" if texts else ""), list(written))
                     if (ctx.audit.dir / PAUSE_FILE).exists():
                         # A human took over mid-sequence: the screen no longer matches the script.
                         # Fail this attempt; the guided retry waits for the hand-back and gets the note.
@@ -463,3 +502,12 @@ class Orchestrator:
             out = ToolOutput(f"Error: {type(e).__name__}: {str(e)[:1000]}", is_error=True)
         files = list(out.files) + [c["path"] for c in step.checks if c.get("type") == "file_exists"]
         return StepRun("failed" if out.is_error else "done", redact(out.text, ctx.audit), files)
+
+
+def _step_digest(step: Step) -> str:
+    """Fingerprint of what a step does, so a resumed run only skips the same step."""
+    import hashlib
+
+    d = step.to_dict()
+    body = {k: d.get(k) for k in ("intent", "tier", "instructions", "script", "checks", "action_class", "approval")}
+    return hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()[:16]

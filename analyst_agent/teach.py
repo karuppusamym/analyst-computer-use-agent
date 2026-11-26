@@ -251,7 +251,7 @@ def _convert_action(call: dict, snapshot: dict[str, dict]) -> dict | None:
             return None
         new = {"targets": _targets_from_snapshot(el)}
         if name == "browser_fill":
-            new["text"] = "{{secret:" + _slug(el["name"]) + "}}" if el["type"] == "password" or "password" in el["name"].lower() else inp.get("text", "")
+            new["text"] = "{{secret:" + _slug(el["name"]) + "}}" if el["type"] == "password" or _SECRET_NAME.search(el["name"]) else inp.get("text", "")
         if name == "browser_select":
             new["value"] = inp.get("value", "")
         if name == "browser_upload":
@@ -485,7 +485,19 @@ RECORDER_JS = r"""
   const send = (ev) => { try { ev.t = Date.now(); if (window !== window.top) ev.frame_css = frameCss(); window.__agentTeachRecord(ev); } catch (e) {} };
   const txt = (s) => (s || '').replace(/\s+/g, ' ').trim().slice(0, 120);
   const typeOf = (el) => (el.getAttribute && (el.getAttribute('type') || '') || '').toLowerCase();
-  const isSecret = (el) => typeOf(el) === 'password' || /password|passcode|pin|secret/i.test(el.getAttribute('autocomplete') || '');
+  // A field stays secret once it was ever secret: a "show password" toggle turns type=password into
+  // type=text, and the value must still never be recorded. One-time codes count as secrets too.
+  const everSecret = new WeakSet();
+  const SECRET_RE = /password|passwd|passcode|\bpin\b|secret|one-time-code|\botp\b|totp|mfa|2fa/i;
+  const looksSecret = (el) => typeOf(el) === 'password' || SECRET_RE.test(el.getAttribute('autocomplete') || '') ||
+      SECRET_RE.test((el.getAttribute('name') || '') + ' ' + (el.id || '')) ||
+      (/^(numeric)$/i.test(el.getAttribute('inputmode') || '') && /code|otp|token|verif/i.test((el.getAttribute('name') || '') + ' ' + (el.id || '') + ' ' + (el.getAttribute('aria-label') || '')));
+  const isSecret = (el) => { if (everSecret.has(el)) return true; if (looksSecret(el)) { everSecret.add(el); return true; } return false; };
+  try {
+    new MutationObserver((ms) => { for (const m of ms) if (m.attributeName === 'type' && (m.oldValue || '').toLowerCase() === 'password') everSecret.add(m.target); })
+      .observe(document, {subtree: true, attributes: true, attributeFilter: ['type'], attributeOldValue: true});
+  } catch (e) {}
+  document.addEventListener('focusin', (e) => { if (e.target && e.target.getAttribute) isSecret(e.target); }, true);
   const implicitRole = (el) => {
     const tag = el.tagName.toLowerCase(), type = typeOf(el);
     if (el.getAttribute('role')) return el.getAttribute('role');
@@ -565,7 +577,7 @@ RECORDER_JS = r"""
   };
   const flushAll = () => Array.from(dirty).forEach(flush);
   window.__agentTeachFlush = flushAll;
-  document.addEventListener('input', (e) => { if (isText(e.target)) dirty.add(e.target); }, true);
+  document.addEventListener('input', (e) => { if (isText(e.target)) { isSecret(e.target); dirty.add(e.target); } }, true);
   document.addEventListener('change', (e) => {
     const el = e.target;
     if (!isText(el)) flushAll();  // a field typed into before this select/upload comes first
@@ -601,6 +613,7 @@ RECORDER_JS = r"""
 })();
 """
 
+_SECRET_NAME = re.compile(r"password|passwd|passcode|\bpin\b|secret|one-time|\botp\b|totp|mfa|2fa", re.I)
 _EVENT_KEYS = {"type", "t", "tag", "role", "name", "label", "input_type", "field", "secret", "masked", "targets", "value", "option", "href", "url", "filename", "title", "reason", "tab", "opener", "files", "frame"}
 PAGE_EVENT_TYPES = ("click", "fill", "select", "submit", "upload")  # what the page script may report
 

@@ -259,6 +259,8 @@ class FakeScreen:
         return [
             mock.patch.object(sw, "screen_size", lambda: (1920, 1080)),
             mock.patch.object(sw, "foreground_window", lambda: self.fg),
+            mock.patch.object(sw, "window_at", lambda x, y: self.fg),  # the foreground window fills the fake screen
+            mock.patch.object(sw, "cursor_pos", lambda: (0, 0)),
             mock.patch.object(sw, "click", lambda x, y, button="left", count=1, modifiers=None: self.sent.append(("click", x, y, button, count, tuple(modifiers or ())))),
             mock.patch.object(sw, "type_text", lambda text, delay=0.005: self.sent.append(("type", text))),
             mock.patch.object(sw, "key_combo", lambda combo, repeat=1: self.sent.append(("key", combo, repeat))),
@@ -389,6 +391,9 @@ class PortalTakeoverTests(TakeoverPortalCase):
         # Never from a person: vault placeholders, Windows-key combos, unknown actions or keys.
         self.assertFalse(self.send(rita, sid, action="type", text="{{secret:portal-pw}}")[1]["ok"])
         self.assertFalse(self.send(rita, sid, action="key", text="win+r")[1]["ok"])
+        self.assertFalse(self.send(rita, sid, action="key", text="super_l+r")[1]["ok"])  # alias of the Windows key
+        self.assertFalse(self.send(rita, sid, action="click", x="1", y="1", modifiers="win+r")[1]["ok"])  # held during a click
+        self.assertFalse(self.send(rita, sid, action="click", x="1", y="1", modifiers="ctrl+x")[1]["ok"])  # clicks hold modifiers only
         self.assertEqual(self.send(rita, sid, action="drag", x="1", y="1")[0], 400)  # a drag needs an end point
         self.assertEqual(self.send(rita, sid, action="paste", text="x")[0], 400)  # no clipboard action
         self.assertEqual(self.send(rita, sid, action="key", text="notakey")[0], 400)
@@ -412,7 +417,7 @@ class PortalTakeoverTests(TakeoverPortalCase):
         self.assertTrue(all(e["actor"] == "human:rita" and e["user"] == "rita" for e in human + refused))
         self.assertEqual(human[0]["input"]["coordinate"], [200, 100])
         self.assertEqual(human[0]["foreground"], ["Legacy Ledger - TEST", "python.exe"])
-        self.assertEqual(len(refused), 3)
+        self.assertEqual(len(refused), 6)  # window, placeholder, win+r, super_l+r, click with win, click with a letter
         self.assertEqual(refused[0]["foreground"], ["Untitled - Notepad", "notepad.exe"])
         ks = [e["kind"] for e in evs]
         for k in ("takeover_started", "takeover_paused", "takeover_ended", "takeover_resumed"):
@@ -420,7 +425,7 @@ class PortalTakeoverTests(TakeoverPortalCase):
         started = next(e for e in evs if e["kind"] == "takeover_started")
         self.assertEqual((started["by"], started["actor"]), ("rita", "human:rita"))
         resumed = next(e for e in evs if e["kind"] == "takeover_resumed")
-        self.assertEqual((resumed["human_actions"], resumed["human_refused"]), (4, 3))
+        self.assertEqual((resumed["human_actions"], resumed["human_refused"]), (4, 6))
         self.assertLess(ks.index("takeover_resumed"), ks.index("step_started"))
         self.assertEqual(len({e["seq"] for e in evs}), len(evs))
         portal_log = (self.s.workspace_root / "portal_audit" / "portal" / "events.jsonl").read_text(encoding="utf-8")

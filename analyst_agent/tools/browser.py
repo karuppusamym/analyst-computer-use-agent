@@ -27,12 +27,36 @@ import re
 from pathlib import Path
 from urllib.parse import urlparse
 
+from ..audit import redact
 from ..policy import ApprovalRequest, PolicyViolation, wrap_untrusted
 from ..vault import has_placeholder, resolve_secrets
 from .base import Tier, Tool, ToolContext, ToolOutput, schema
 
 SECRET_PLACEHOLDER = re.compile(r"\{\{secret:[^}]+\}\}")
 RISKY = re.compile(r"\b(submit|send|pay|delete|remove|confirm|place order|purchase|transfer|sign)\b", re.I)
+# Wording that is risky on a button but routine on a navigation link ("Upload a file", "Orders").
+RISKY_BUTTON = re.compile(r"\b(post|publish|approve|reply|buy|order|checkout|share|upload|accept|reject|unsubscribe|wire|refund|deactivate|terminate)\b", re.I)
+
+# What a click would do, read from the element itself rather than only its wording: an icon-only
+# button or an unlabelled submit still posts a form.
+_CLICK_INFO_JS = r"""
+e => {
+  const t = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const tag = e.tagName;
+  const type = (e.getAttribute('type') || '').toLowerCase();
+  let label = tag === 'INPUT' ? '' : t(e.innerText);
+  for (const a of ['value', 'aria-label', 'title']) if (e.getAttribute(a)) label += ' ' + e.getAttribute(a);
+  const lb = e.getAttribute('aria-labelledby');
+  if (lb) for (const id of lb.split(/\s+/)) { const n = document.getElementById(id); if (n) label += ' ' + t(n.innerText); }
+  if (e.querySelectorAll) e.querySelectorAll('img[alt], svg title').forEach(n => { label += ' ' + t(n.getAttribute('alt') || n.textContent); });
+  const isSubmit = (tag === 'BUTTON' && (type === 'submit' || (!type && !!e.form))) || (tag === 'INPUT' && (type === 'submit' || type === 'image'));
+  if (isSubmit && !t(label)) label = 'Submit';
+  const form = isSubmit ? (e.form || null) : null;
+  const method = form ? ((e.getAttribute('formmethod') || form.getAttribute('method') || 'get').toLowerCase()) : '';
+  const link = tag === 'A' && e.hasAttribute('href') && !e.hasAttribute('download');
+  return {label: t(label), posts: isSubmit && method === 'post', link, action: form ? (e.getAttribute('formaction') || form.action || '') : ''};
+}
+"""
 
 _STABLE_KEY = re.compile(r"[A-Za-z0-9_.-]{1,30}")
 _STABLE_VALUE = re.compile(r"[A-Za-z_-]{1,30}")  # words only; ids, dates, tokens and hashes carry digits
@@ -96,10 +120,13 @@ _SNAPSHOT_JS = r"""
       const l = document.querySelector('label[for="' + el.id + '"]');
       if (l) label = l.innerText;
     }
-    const name = (label || el.innerText || el.value || el.getAttribute('placeholder') || el.getAttribute('name') || el.getAttribute('title') || '').trim().slice(0, 120);
+    // A form field's typed value is never its name (a password field with no label would show the password).
+    const isField = el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT';
+    const shown = (el.tagName === 'INPUT' && ['button', 'submit', 'reset'].includes(el.type)) ? el.value : '';
+    const name = (label || (isField ? '' : el.innerText) || shown || el.getAttribute('placeholder') || el.getAttribute('name') || el.getAttribute('title') || '').trim().slice(0, 4000);
     out.push({ref, tag: el.tagName.toLowerCase(), role: el.getAttribute('role') || el.type || '', name,
                value: el.type === 'password' ? (el.value ? '********' : '') :
-                      (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') ? String(el.value).slice(0, 120) : '',
+                      isField ? String(el.value).slice(0, 4000) : '',
                href: el.getAttribute('href') || ''});
   }
   return {title: document.title, url: location.href, elements: out, text: (document.body ? document.body.innerText : '')};
@@ -118,6 +145,7 @@ class BrowserTier(Tier):
         self._page = None
         self._pages: list = []  # every page of the context in open order; index = tab number
         self._checked: tuple[bool, str] | None = None
+        self._ctx: ToolContext | None = None  # the step whose policy the request filter applies
 
     # ---------------------------------------------------------------- lifecycle
     def available(self) -> tuple[bool, str]:
@@ -141,12 +169,16 @@ class BrowserTier(Tier):
         return self._checked
 
     def _ensure(self, ctx: ToolContext):
+        self._ctx = ctx
         if self._page is None:
             from playwright.sync_api import sync_playwright
 
             self._pw = sync_playwright().start()
             self._browser = self._pw.chromium.launch(headless=self.settings["tiers"]["browser"].get("headless", True))
             context = self._browser.new_context(accept_downloads=True)
+            # Every request (navigation, redirect, popup, image, fetch) is checked against the host
+            # allowlist before it leaves the browser. The after-the-fact page check stays as a second line.
+            context.route("**/*", self._filter_request)
             self._pages = []
             context.on("page", lambda pg: pg not in self._pages and self._pages.append(pg))
             self._page = context.new_page()
@@ -165,6 +197,27 @@ class BrowserTier(Tier):
             self._pages = []
 
     # ---------------------------------------------------------------- helpers
+    def _filter_request(self, route, request) -> None:
+        url = request.url
+        if url.startswith(("data:", "blob:", "about:")):
+            route.continue_()
+            return
+        ctx = self._ctx
+        nav = request.is_navigation_request()
+        if not nav and self.settings["tiers"]["browser"].get("allow_offlist_subresources", False):
+            route.continue_()
+            return
+        try:
+            if ctx is None:
+                raise PolicyViolation("no active step")
+            ctx.policy.check_url(url)
+        except PolicyViolation as e:
+            if ctx is not None:
+                ctx.audit.event("browser_request_blocked", step=ctx.step_id, url=url[:500], navigation=nav, reason=str(e)[:300])
+            route.abort("blockedbyclient")
+            return
+        route.continue_()
+
     def _guard_host(self, page, ctx: ToolContext) -> str | None:
         """After navigation, refuse pages that left the allowlist."""
         url = page.url
@@ -307,11 +360,15 @@ class BrowserTier(Tier):
         return None
 
     def _approve_if_risky(self, el, ctx: ToolContext, verb: str) -> str | None:
-        label = " ".join(
-            x for x in [el.inner_text() if el.evaluate("e => e.tagName") not in ("INPUT",) else "", el.get_attribute("value") or "", el.get_attribute("aria-label") or ""] if x
-        ).strip()
-        if not RISKY.search(label):
+        info = el.evaluate(_CLICK_INFO_JS)
+        label = info.get("label") or "(unlabelled element)"
+        # Gate a click that posts a form (state-changing, whatever its wording) and any wording on the list.
+        # GET forms (search, filters) are reads and stay ungated.
+        worded = bool(RISKY.search(label) or (not info.get("link") and RISKY_BUTTON.search(label)))
+        if not (info.get("posts") or worded):
             return None
+        if info.get("posts") and not worded:
+            label = f"{label} (posts a form to {info.get('action') or 'this page'})"
         req = ApprovalRequest(step_id=ctx.step_id, action_class="submit", summary=f"Browser wants to {verb} '{label}' on {el.page.url}")
         decision = ctx.approver.request(req)
         ctx.audit.event("approval", step=ctx.step_id, action_class="submit", label=label, approved=decision.approved, by=decision.by, note=decision.note)
@@ -339,12 +396,18 @@ class BrowserTier(Tier):
         page = self._ensure(ctx)
         data = page.evaluate(_SNAPSHOT_JS)
         lines = [f"title: {data['title']}", f"url: {data['url']}", "interactive elements (use the ref):"]
+        # Redact vault values on the full strings first, then shorten and quote. Cutting or
+        # repr-escaping first leaves a fragment or an escaped form the redactor cannot match.
+        def clean(v: str, n: int) -> str:
+            return str(redact(str(v or ""), ctx.audit))[:n]
+
         for e in data["elements"]:
-            extra = f" value={e['value']!r}" if e["value"] else ""
-            extra += f" href={e['href']}" if e["href"] else ""
-            lines.append(f"  [{e['ref']}] {e['tag']}{('/' + e['role']) if e['role'] else ''} {e['name']!r}{extra}")
+            value = clean(e["value"], 120)
+            extra = f" value={value!r}" if value else ""
+            extra += f" href={clean(e['href'], 500)}" if e["href"] else ""
+            lines.append(f"  [{e['ref']}] {e['tag']}{('/' + e['role']) if e['role'] else ''} {clean(e['name'], 120)!r}{extra}")
         lines.append("visible text:")
-        lines.append(data["text"][:8000])
+        lines.append(clean(data["text"], 8000))
         ctx.audit.event("browser_action", step=ctx.step_id, action="snapshot", url=data["url"], elements=len(data["elements"]))
         return ToolOutput(wrap_untrusted(data["url"], "\n".join(lines), 12000))
 
@@ -386,8 +449,28 @@ class BrowserTier(Tier):
             if err:
                 return ToolOutput(err, is_error=True)
             return ToolOutput(f"clicked {inp.get('ref') or 'the recorded element'}; a new tab opened (tab {tab}) at {popup.url} and is now current. Take a new browser_snapshot.")
+        frame = None
+        if inp.get("frame"):
+            try:
+                frame = self._scope(page, inp, ctx, wait_s=0)
+            except Exception:
+                frame = None
+        frame_url = frame.url if frame is not None else ""
         el.click()
         page.wait_for_load_state("domcontentloaded")
+        if frame is not None:
+            # A click inside an iframe (a form submit) navigates that frame, not the page, and the
+            # request filter can delay the start. Wait for the frame to move on before the next
+            # step looks for its children, or that step acts on frames about to be replaced.
+            left = 1500
+            while left > 0 and not frame.is_detached() and frame.url == frame_url:
+                page.wait_for_timeout(50)
+                left -= 50
+            if not frame.is_detached():
+                try:
+                    frame.wait_for_load_state("domcontentloaded")
+                except Exception:
+                    pass
         ctx.audit.event("browser_action", step=ctx.step_id, action="click", ref=inp.get("ref") or "targets", url=page.url)
         err = self._guard_host(page, ctx)
         if err:

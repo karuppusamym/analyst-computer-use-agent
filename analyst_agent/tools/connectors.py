@@ -55,7 +55,7 @@ def _read_file(inp: dict, ctx: ToolContext) -> ToolOutput:
 def _copy_file(inp: dict, ctx: ToolContext) -> ToolOutput:
     src = ctx.policy.check_path(inp["source"])
     dst = ctx.policy.check_path(inp["destination"], write=True)
-    if dst.exists() and not inp.get("overwrite_output", False):
+    if dst.exists():
         return ToolOutput(f"Error: {dst} exists; the agent never overwrites files", is_error=True)
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)

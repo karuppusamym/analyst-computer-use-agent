@@ -27,6 +27,8 @@ MEMBERS = (
     "scroll", "type", "key", "hold_key", "wait",
 )
 READ_ONLY = {"screenshot", "zoom", "cursor_position", "wait"}
+# Actions that reach the window under the pointer (checked with sw.window_at, not only the foreground window).
+POINTER_MEMBERS = {"left_click", "right_click", "middle_click", "double_click", "triple_click", "left_click_drag", "scroll", "left_mouse_down", "left_mouse_up"}
 MAX_TOKENS_IMG = 4784
 PATCH = 28
 
@@ -134,18 +136,40 @@ class ComputerTier(Tier):
         return png
 
     # ---- safety
-    def _guard(self, ctx: ToolContext) -> tuple[bool, str, tuple[str, str]]:
-        title, exe = sw.foreground_window()
+    def _allowed(self, title: str, exe: str, ctx: ToolContext) -> bool:
         titles = self.cfg.get("allowed_window_titles", []) or []
         if any(fnmatch.fnmatch(title.lower(), pat.lower()) for pat in titles):
-            return True, "", (title, exe)
+            return True
         try:
             if exe:
                 ctx.policy.check_app(exe)
-                return True, "", (title, exe)
+                return True
         except PolicyViolation:
             pass
+        return False
+
+    def _guard(self, ctx: ToolContext) -> tuple[bool, str, tuple[str, str]]:
+        title, exe = sw.foreground_window()
+        if self._allowed(title, exe, ctx):
+            return True, "", (title, exe)
         return False, f"Error: refused - foreground window '{title}' ({exe or 'unknown exe'}) is not on the allowlist", (title, exe)
+
+    def _guard_points(self, member: str, inp: dict, ctx: ToolContext, size, s: float) -> tuple[bool, str, list]:
+        """A click lands on whatever window is under the pointer, not on the foreground one:
+        check the window at every point the action touches (drag start and end included)."""
+        if member not in POINTER_MEMBERS:
+            return True, "", []
+        pts = [(inp[k], True) for k in ("start_coordinate", "coordinate") if inp.get(k)]
+        if not pts:
+            pts = [(list(sw.cursor_pos()), False)]  # a click with no coordinate lands where the pointer is
+        seen = []
+        for c, scaled in pts:
+            x, y = to_screen(c, s, size) if (s and scaled) else (int(c[0]), int(c[1]))
+            title, exe = sw.window_at(x, y)
+            seen.append((title, exe))
+            if not self._allowed(title, exe, ctx):
+                return False, f"Error: refused - the window under {list(c)} is '{title}' ({exe or 'unknown exe'}), which is not on the allowlist", seen
+        return True, "", seen
 
     # ---- execution
     def execute(self, block: dict, ctx: ToolContext) -> ToolOutput:
@@ -163,6 +187,10 @@ class ComputerTier(Tier):
                 ok, msg, foreground = self._guard(ctx)
                 if not ok:
                     ctx.audit.event("computer_action_refused", member=member, input=inp, foreground=foreground, step=ctx.step_id)
+                    return ToolOutput(msg, is_error=True)
+                ok, msg, under = self._guard_points(member, inp, ctx, size, s)
+                if not ok:
+                    ctx.audit.event("computer_action_refused", member=member, input=inp, foreground=foreground, under_pointer=under, step=ctx.step_id)
                     return ToolOutput(msg, is_error=True)
             ctx.audit.event("computer_action", member=member, input=inp, foreground=foreground, step=ctx.step_id, dry_run=bool(self.cfg.get("dry_run")))
             if self.cfg.get("dry_run") and member not in READ_ONLY:

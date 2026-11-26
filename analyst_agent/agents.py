@@ -54,7 +54,7 @@ PLAN_SCHEMA = {
                     "instructions": {"type": "string"},
                     "checks": {"type": "array", "items": _CHECK_SCHEMA},
                     "approval": {"type": "string", "enum": ["none", "required"]},
-                    "action_class": {"type": "string", "description": "send, submit, delete, pay, upload_external, change_settings, or none"},
+                    "action_class": {"type": "string", "enum": ["none", "send", "submit", "delete", "pay", "upload_external", "change_settings"]},
                 },
                 "required": ["id", "intent", "tier", "instructions", "checks", "approval", "action_class"],
                 "additionalProperties": False,
@@ -149,6 +149,7 @@ Rules:
 - Finish with a final message whose last line is `RESULT: done` or `RESULT: blocked - <reason>`, preceded by a short summary of what you produced (file paths, counts, totals)."""
 
 _NOT_EXECUTED = "Not executed: an earlier computer action in this turn failed."
+_STOPPED = "Not executed: the kill switch was pressed before this action."
 _PAUSED = "Not executed: the session was paused for a human takeover before this action."
 _LOOK_FIRST = "Not executed: a human acted on the desktop while you were paused. Take a screenshot first, then decide what to do."
 
@@ -190,6 +191,7 @@ class Executor:
     def __init__(self, client: ModelClient, role: str = "executor"):
         self.client = client
         self.role = role
+        self.stop_flag = None  # callable: was the kill switch pressed? (checked before every tool call)
         self.paused = None  # callable: is a human takeover pending? (checked before every tool call)
         self.must_look = False  # after a takeover: the next computer action must be a screenshot
 
@@ -218,6 +220,7 @@ class Executor:
         or (True, note) where a non-empty note goes into the next model turn."""
         limits = ctx.settings["limits"]
         self.paused = paused
+        self.stop_flag = stop_flag
         tools = tier.api_tools()
         progress = ""
         files: list[str] = []
@@ -273,6 +276,7 @@ class Executor:
         png: bytes | None = None
         computer_failed = False
         held = False
+        stopped = False
         last_computer_idx = None
         for block in uses:
             in_toolset = block.get("toolset_name") == "computer"
@@ -280,6 +284,12 @@ class Executor:
             result: dict[str, Any] = {"type": "tool_result", "tool_use_id": block["id"]}
             if in_toolset:
                 result["toolset_name"] = "computer"
+            if stopped or (self.stop_flag and self.stop_flag()):
+                stopped = True  # kill switch: nothing more runs in this batch
+                result.update(is_error=True, content=_STOPPED)
+                results.append(result)
+                computer_failed = computer_failed or is_computer
+                continue
             if held or (self.paused and self.paused()):
                 held = True  # a human takeover started: nothing more runs in this batch
                 result.update(is_error=True, content=_PAUSED)

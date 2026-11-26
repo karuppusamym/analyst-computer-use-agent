@@ -380,9 +380,12 @@ class OidcClient:
     def identity_from_claims(self, claims: dict) -> Identity:
         name = ""
         for c in [self.cfg.get("username_claim", "preferred_username"), "email", "sub"]:
-            if claims.get(c):
-                name = str(claims[c])
-                break
+            if not claims.get(c):
+                continue
+            if c == "email" and claims.get("email_verified") is not True and not self.cfg.get("allow_unverified_email", False):
+                continue  # an unverified address can be set to anyone's by the user at some providers
+            name = str(claims[c])
+            break
         if not name:
             raise AuthError("ID token has no usable user name claim")
         groups = _as_list(claims.get(self.cfg.get("groups_claim", "groups")))
@@ -457,7 +460,11 @@ class Authenticator:
         self.cookie_secure = bool(portal_cfg.get("cookie_secure", False))
         self.users = UserStore(self.workspace_root / acfg.get("users_file", "portal_users.json"))
         self.oidc: OidcClient | None = None
-        self._failures: dict[str, list[float]] = {}
+        self._failures: dict[tuple[str, str], list[float]] = {}  # (user name, peer ip) -> failure times
+        self._ip_failures: dict[str, list[float]] = {}  # peer ip -> failure times, any user name
+        self._revoked: dict[str, float] = {}  # session nonce -> its expiry, for signed-out cookies
+        self.revoked_path = self.workspace_root / portal_cfg.get("state_dir", "portal_state") / "revoked_sessions.json"
+        self._load_revoked()
         # SSO group names worth keeping in the session cookie (those the team config maps);
         # set by the portal. None = keep none.
         self.session_groups: set[str] | None = None
@@ -482,8 +489,9 @@ class Authenticator:
         payload = {"n": secrets.token_urlsafe(16), "exp": int(time.time() + self.ttl)}
         if ident:
             payload.update({"u": ident.name, "r": ident.role, "src": ident.source})
-            if ident.source == "oidc" and ident.groups and self.session_groups:
-                payload["g"] = sorted({g for g in ident.groups if g in self.session_groups})[:100]
+            keep = set(self.session_groups or ()) | set(self.acfg.get("oidc", {}).get("group_roles", {}))
+            if ident.source == "oidc" and ident.groups and keep:
+                payload["g"] = sorted({g for g in ident.groups if g in keep})[:100]
         return self.signer.sign(payload)
 
     def cookie_header(self, name: str, value: str, max_age: int | None = None, samesite: str = "Strict") -> str:
@@ -522,24 +530,67 @@ class Authenticator:
                 if rec is None:
                     return None  # user removed: session ends
                 role = rec.get("role", role)
-            elif self.mode == "oidc" and session.get("src") == "oidc" and isinstance(session.get("g"), list):
-                groups = tuple(str(g) for g in session["g"])  # signed at sign-in; see new_session
+            elif self.mode == "oidc" and session.get("src") == "oidc":
+                if isinstance(session.get("g"), list):
+                    groups = tuple(str(g) for g in session["g"])  # signed at sign-in; see new_session
+                # The role follows the current config on every request, not the one frozen at sign-in.
+                role = role_for(session["u"], list(groups), self.acfg.get("oidc", {}))
+                if role is None:
+                    return None
             return Identity(session["u"], role if role in ROLES else "analyst", session.get("src", self.mode), groups)
         return None
 
-    # ---- local login with a simple lockout
-    def login_local(self, name: str, password: str) -> Identity | None:
+    # ---- signed-out sessions
+    def _load_revoked(self) -> None:
+        try:
+            data = json.loads(self.revoked_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        now = time.time()
+        self._revoked = {str(n): float(e) for n, e in (data.items() if isinstance(data, dict) else []) if float(e) > now}
+
+    def is_revoked(self, session: dict | None) -> bool:
+        return bool(session) and session.get("n") in self._revoked
+
+    def revoke(self, session: dict | None) -> None:
+        """Sign-out ends the session for every copy of its cookie, until the cookie would expire anyway."""
+        if not session or not session.get("n"):
+            return
+        from .state import atomic_write_json
+
         now = time.time()
         with self._fail_lock:
-            recent = [t for t in self._failures.get(name, []) if t > now - 300]
-            self._failures[name] = recent
-            if len(recent) >= 5:
+            self._revoked = {n: e for n, e in self._revoked.items() if e > now}
+            self._revoked[session["n"]] = float(session.get("exp") or now + self.ttl)
+            snapshot = dict(self._revoked)
+        atomic_write_json(self.revoked_path, snapshot)
+
+    # ---- local login: lockouts per (user name, address) and per address
+    USER_FAILS, IP_FAILS, WINDOW_S = 5, 20, 300
+
+    def login_local(self, name: str, password: str, peer: str = "") -> Identity | None:
+        now = time.time()
+        key = (name, peer)
+        with self._fail_lock:
+            cut = now - self.WINDOW_S
+            if len(self._failures) > 10000 or len(self._ip_failures) > 10000:  # bound the memory a flood can use
+                self._failures = {k: [t for t in v if t > cut] for k, v in self._failures.items() if any(t > cut for t in v)}
+                self._ip_failures = {k: [t for t in v if t > cut] for k, v in self._ip_failures.items() if any(t > cut for t in v)}
+            ip_recent = [t for t in self._ip_failures.get(peer, []) if t > cut]
+            self._ip_failures[peer] = ip_recent
+            if len(ip_recent) >= self.IP_FAILS:
+                # Checked before the password hash, so a flood from one address costs no hashing.
+                raise AuthError("too many failed sign-ins from this address; wait 5 minutes")
+            recent = [t for t in self._failures.get(key, []) if t > cut]
+            self._failures[key] = recent
+            if len(recent) >= self.USER_FAILS:
+                # Per user name and address: someone elsewhere can't lock the real user out.
                 raise AuthError("too many failed sign-ins for this user; wait 5 minutes")
         ident = self.users.authenticate(name, password)
-        if ident is None:
-            with self._fail_lock:
-                self._failures.setdefault(name, []).append(now)
-        else:
-            with self._fail_lock:
-                self._failures.pop(name, None)
+        with self._fail_lock:
+            if ident is None:
+                self._failures.setdefault(key, []).append(now)
+                self._ip_failures.setdefault(peer, []).append(now)
+            else:
+                self._failures.pop(key, None)
         return ident

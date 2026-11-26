@@ -142,7 +142,28 @@ python -m analyst_agent eval compare -2 -1
 - `eval history` prints a trend table: pass/fail/skip counts, success rate and its change from the run before, unapproved outbound actions, cost per success and the pilot gate.
 - `eval compare <A> <B>` lists tasks that **regressed** (pass to fail) or **improved** (fail to pass), tasks newly skipped or newly graded, status changes, changed models and changed pilot metrics. Name a run by its id, a unique prefix of it, or a negative index (`-1` is the latest). It exits with 1 when anything regressed, so CI can gate on it.
 - `--unattended` declines every approval and reports it. Nothing is ever auto-approved.
-- `--resume <session>` continues from the last checkpoint.
+- `--resume <session>` continues from the last checkpoint. It refuses when the request, the parameters or a verified step's content differ from the checkpointed run, so a step is never skipped because only its id matches.
+- **Guard rails added by the 25 Nov 2026 safety review:**
+  - File tools can't read or write the agent's own control files: the vault, `portal_secret.key`, `portal_users.json`, `portal_state/`, `portal_audit/`, schedule state and the audit folder. Only each session's `audit/<session>/scratch` folder stays open.
+  - `action_class` is lower-cased and common synonyms are mapped (`email` becomes `send`). Any class that is neither `none` nor a known class needs approval.
+  - The kill switch is checked between the calls of a scripted sequence, after an approval, and before each tool call in a batch.
+  - A replanned set of steps goes to plan approval again.
+  - The browser checks every request against the host allowlist before it is sent: navigations, redirects, popups and, unless `tiers.browser.allow_offlist_subresources` is true, images, scripts and fetches too.
+  - URLs with a backslash, a space or control character, a user-name part, or a scheme other than http/https are refused.
+  - A browser click that posts a form needs approval, whatever the button says, and so does an icon-only or unlabelled submit button. GET forms (search, filters) stay ungated. More words count on buttons: post, publish, approve, reply, buy, order, share, upload and others. Navigation links are not gated by these words.
+  - Desktop clicks, drags and scrolls are checked against the window under the pointer, not only the foreground window. Typing stops as soon as another window comes to the front.
+  - Teach mode treats a field as secret once it has ever been secret, so a "show password" toggle doesn't expose the value. One-time-code, OTP, PIN and MFA fields count as secrets too.
+  - On the desktop, a vault secret's `apps` patterns are matched against the exe. A window title only counts when the exe is unknown, or for an exe that doesn't show untrusted content: browsers, mail, chat and Office documents never qualify by title.
+  - The HashiCorp and Key Vault backends follow redirects only to the same scheme, host and port, so a token is never sent anywhere else.
+- **Portal hardening (same review):**
+  - Session ids are lower case with no trailing dot, so one session can't be reached under two spellings on Windows.
+  - Connections time out after `portal.request_timeout_s` (30 s), and at most `portal.max_threads` (64) are served at once. Further connections get a 503.
+  - Sign-in is locked after 5 failures per user name and address, and after 20 failures per address. The per-address check runs before the password hash.
+  - Signing out revokes the cookie everywhere it was copied. The list is kept in `portal_state/revoked_sessions.json`, so it survives a restart.
+  - With OIDC:
+    - The role is worked out from the current config on every request.
+    - The `email` claim is used as the user name only when `email_verified` is true; `portal.auth.oidc.allow_unverified_email` turns that check off.
+  - With teams configured, a reviewer publishes or rejects only drafts of playbooks that one of their teams covers.
 - Each run writes its audit log, screenshots, checkpoint and a "what I checked" report to `workspace/audit/<session>/`. Outputs go to `workspace/output/`.
 
 Run `python samples/make_samples.py` to regenerate the sample data (ERP/CRM, budget and GL actuals, PO/receipt/invoice, payments and vendor master, customer master exports, and `warehouse.sqlite`). It is seeded and plants issues with known counts, so the eval graders assert exact numbers; the original pilot files come out byte-identical.
@@ -316,7 +337,7 @@ Run `python samples/make_samples.py` to regenerate the sample ERP/CRM exports an
 ### Credentials (`vault`)
 
 - `vault set` prompts for the value twice (getpass); it is never read from the command line. `--allow-host` (browser) and `--allow-app` (exe or window title, for the desktop tiers) are repeatable fnmatch patterns. A secret with no allowlist cannot be used.
-- Backends, set by `vault.backend` in the config: `dpapi` (default) uses Windows DPAPI for the current user via ctypes and stores `workspace/vault/vault.json`. The allowlists are bound into the encryption entropy, so editing them in the file breaks decryption. `env` is read-only: `AGENT_SECRET_<NAME>` plus `AGENT_SECRET_<NAME>__HOSTS` / `__APPS`. `keyring` works only if that package is installed.
+- Backends, set by `vault.backend` in the config: `dpapi` (default) uses Windows DPAPI for the current user via ctypes and stores `workspace/vault/vault.json`. The allowlists are bound into the encryption entropy, so editing them in the file breaks decryption. `env` is read-only: `AGENT_SECRET_<NAME>` plus `AGENT_SECRET_<NAME>__HOSTS` / `__APPS`. `keyring` works only if that package is installed. The keyring entry stores the value together with a digest of the allowlists, sharing and expiry, so editing them in `vault.json` gets the value refused, as with DPAPI. Entries written before this change are refused too; set them again with `vault set <name>`.
 - Playbook steps and the model refer to secrets as `{{secret:name}}`. Only `browser_fill`, the pixel tier's `type` and `uia_set_text` resolve them, at the moment of typing, and only when the target host or window is on both the secret's allowlist and the policy allowlist.
 - Values are replaced with `[REDACTED:name]` in audit events, tool results sent to the model, reports and checkpoints. The audit log records `secret_used` (name, target, step) without the value. Browser snapshots mask password fields.
 - **Limit:** screenshots are not redacted. A secret typed into a visible plain-text field can appear in a screenshot.

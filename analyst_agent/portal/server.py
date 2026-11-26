@@ -14,6 +14,7 @@ import json
 import re
 import secrets
 import sys
+import threading
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -295,6 +296,8 @@ class PortalApp:
                 jar = SimpleCookie()
             raw = jar[SESSION_COOKIE].value if SESSION_COOKIE in jar else None
             sent = self.auth.signer.unsign(raw)
+            if sent is not None and self.auth.is_revoked(sent):
+                sent = None  # signed out: this cookie no longer means anyone
             session = sent
             cookies: list[str] = []
             peer = hd.client_address[0]
@@ -474,7 +477,7 @@ class PortalApp:
             return self._error(ctx, 404, "password sign-in is not enabled")
         name = ctx.form.get("username", "").strip()
         try:
-            ident = self.auth.login_local(name, ctx.form.get("password", ""))
+            ident = self.auth.login_local(name, ctx.form.get("password", ""), ctx.peer)
         except AuthError as e:
             self.audit.event("login_locked", user_name=name, peer=ctx.peer)
             return self.r_login_form(ctx, str(e), 429)
@@ -487,6 +490,7 @@ class PortalApp:
 
     def r_logout(self, ctx: Ctx) -> Response:
         self.audit.event("logout", by=ctx.ident.name)
+        self.auth.revoke(ctx.sent_session)
         ctx.cookies[:] = [self.auth.cookie_header(SESSION_COOKIE, self.auth.new_session(None))]
         return self._redirect("/login")
 
@@ -792,8 +796,10 @@ class PortalApp:
     # ------------------------------------------------------------------ approvals
     def r_approvals(self, ctx: Ctx) -> Response:
         history = self.inbox.history()
-        if not ctx.ident.can("reviewer"):
-            history = [x for x in history if self.can_see(ctx.ident, x.session_id)]
+        if not ctx.ident.can("admin"):
+            # A decision is listed only to someone who can see its session or could have decided it
+            # (team-limited reviewers see their teams' playbooks only; with no teams, every reviewer).
+            history = [x for x in history if self.can_see(ctx.ident, x.session_id) or self.may_decide(ctx.ident, x.session_id)]
         return self._page(ctx, 200, "Approvals", V.approvals_page(self._visible_pending(ctx.ident), history, ctx.ident, ctx.csrf, may_decide=lambda item: self.rights(ctx.ident, item)), "approvals", poll="/api/state")
 
     def r_decide(self, ctx: Ctx, aid: str) -> Response:
@@ -850,6 +856,14 @@ class PortalApp:
 
     def r_playbook_review(self, ctx: Ctx) -> Response:
         entry_id, decision, note = ctx.form.get("id", ""), ctx.form.get("decision", ""), ctx.form.get("note", "").strip()[:1000]
+        if not ctx.ident.can("admin"):
+            # Teams limit playbook review the same way they limit approvals: a reviewer publishes
+            # or rejects only drafts of playbooks one of their teams lists.
+            entry = find_entry(self.playbooks_dir, entry_id)
+            name = (entry.playbook.name if entry is not None and entry.playbook is not None else str(((entry.raw if entry else None) or {}).get("name") or "")) or None
+            if entry is not None and not self.teams.may_review(ctx.ident.name, name, ctx.ident.groups):
+                self.audit.event("playbook_review_forbidden", draft=entry_id, playbook=name, by=ctx.ident.name, decision=decision)
+                return self._error(ctx, 403, f"you don't review playbook {name or '(unnamed)'} in any of your teams")
         try:
             if decision == "approve":
                 dest = approve_draft(self.playbooks_dir, entry_id, ctx.ident.name, note, reviewer_is_admin=ctx.ident.can("admin"))
@@ -867,6 +881,7 @@ class PortalApp:
 class _Handler(BaseHTTPRequestHandler):
     server_version = "AnalystPortal/1"
     sys_version = ""
+    timeout = 30  # seconds a connection may sit idle or trickle its body (socket timeout)
 
     def do_GET(self):  # noqa: N802
         self.server.app.handle(self, "GET")
@@ -882,8 +897,39 @@ class _Handler(BaseHTTPRequestHandler):
             sys.stderr.write("portal %s - %s\n" % (self.address_string(), fmt % args))
 
 
+class _BoundedServer(ThreadingHTTPServer):
+    """One thread per connection, but at most `max_threads` at once; extra connections get a 503."""
+
+    def __init__(self, *a, max_threads: int = 64, **kw):
+        self.max_threads = max_threads
+        self._slots = threading.BoundedSemaphore(max_threads)
+        super().__init__(*a, **kw)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            try:
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\nRetry-After: 5\r\n\r\n")
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
 def make_server(app: PortalApp, host: str = "127.0.0.1", port: int = 8765) -> ThreadingHTTPServer:
-    srv = ThreadingHTTPServer((host, port), _Handler)
+    cfg = getattr(app, "cfg", None) or {}
+    _Handler.timeout = int(cfg.get("request_timeout_s", 30))
+    srv = _BoundedServer((host, port), _Handler, max_threads=int(cfg.get("max_threads", 64)))
     srv.daemon_threads = True
     srv.app = app  # type: ignore[attr-defined]
     return srv

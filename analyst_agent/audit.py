@@ -46,7 +46,7 @@ class Redactor:
         from urllib.parse import quote, quote_plus
 
         with self._lock:
-            for form in {value, quote(value, safe=""), quote_plus(value), escape(value), json.dumps(value)[1:-1]}:
+            for form in {value, quote(value, safe=""), quote_plus(value), escape(value), json.dumps(value)[1:-1], repr(value)[1:-1]}:
                 if form:
                     self._values[form] = name
 
